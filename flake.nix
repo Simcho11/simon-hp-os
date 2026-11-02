@@ -40,6 +40,7 @@
           ./goran/installer/simon-apps.nix
           ./goran/installer/simon-update.nix
           ./goran/desktop/microsoft365-webapps.nix
+          ./goran/installer/simon-local.nix
           ./goran/desktop/cosmic-niri.nix
           ./goran/desktop/hp-os.nix
           ./goran/desktop/search-iq.nix
