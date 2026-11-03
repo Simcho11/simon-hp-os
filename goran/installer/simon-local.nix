@@ -46,6 +46,9 @@ let
     };
   };
 in {
+  # Zed: the IDE for the local-AI coding demo (its agent uses the local Ollama model).
+  home.packages = [ pkgs.zed-editor ];
+
   xdg.dataFile."applications/microsoft365-calendar.desktop".source =
     "${calendar}/share/applications/microsoft365-calendar.desktop";
 
