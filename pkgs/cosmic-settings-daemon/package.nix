@@ -11,6 +11,7 @@
   libinput,
   udev,
   openssl,
+  zstd,
   nixosTests,
   nix-update-script,
   withBatterySounds ? true,
@@ -58,6 +59,7 @@ in {
     libinput
     libpulseaudio
     openssl
+    zstd
     udev
   ];
 
