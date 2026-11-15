@@ -20,6 +20,10 @@ let
             programs.${flag}.enable = true;
             programs.hp-os-fleet.enable = true;
             programs.hp-cde-lockscreen.enable = true;
+            programs.dank-material-shell.package = import ../../goran/desktop/dms-package.nix {
+              inherit pkgs;
+              dank-material-shell = flake.inputs.dank-material-shell;
+            };
           };
         })
       ];
@@ -28,5 +32,5 @@ let
   in assert lib.hasInfix "disable-osd.py" launcher.text;
      assert lib.hasInfix "dms-hp-cde-lock.py" launcher.text;
      assert lib.hasInfix "run --session" launcher.text;
-     { inherit system flag; drvPath = launcher.drvPath; launcher = launcher.text; };
+     { inherit system flag; drvPath = launcher.drvPath; dmsDrvPath = hm.config.programs.dank-material-shell.package.drvPath; launcher = launcher.text; };
 in lib.concatMap (system: map (check system) [ "hp-os" "goran-hp-os" ]) [ "x86_64-linux" "aarch64-linux" ]
