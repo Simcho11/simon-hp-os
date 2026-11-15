@@ -1,19 +1,7 @@
 { config, pkgs, lib, dank-material-shell, dms-plugin-registry, ... }:
 let
   system = pkgs.stdenv.hostPlatform.system;
-  dms = dank-material-shell.packages.${system}.default.overrideAttrs (old: {
-    patches = (old.patches or []) ++ [ ./dms-brightness/manager.patch ];
-    postPatch = (old.postPatch or "") + ''
-      cp ${./dms-brightness/goran_panel.go} internal/server/brightness/goran_panel.go
-      cp ${./dms-brightness/goran_panel_test.go} internal/server/brightness/goran_panel_test.go
-    '';
-    doCheck = true;
-    checkPhase = ''
-      runHook preCheck
-      go test ./internal/server/brightness
-      runHook postCheck
-    '';
-  });
+  dms = import ./dms-package.nix { inherit pkgs dank-material-shell; };
   themePath = "${config.xdg.configHome}/DankMaterialShell/themes/hp-os.json";
   initialSettings = builtins.toJSON {
     currentThemeName = "custom";

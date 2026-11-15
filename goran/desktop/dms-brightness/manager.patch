@@ -1,6 +1,6 @@
 --- a/internal/server/brightness/types.go
 +++ b/internal/server/brightness/types.go
-@@ -44,6 +44,7 @@
+@@ -48,6 +48,7 @@
  }
  
  type Manager struct {
@@ -10,10 +10,10 @@
  	nativeBackend Backend
 --- a/internal/server/brightness/manager.go
 +++ b/internal/server/brightness/manager.go
-@@ -17,6 +17,11 @@
- 	m := &Manager{
- 		stopChan:    make(chan struct{}),
- 		exponential: exponential,
+@@ -21,6 +21,11 @@
+ 		exponential:       exponential,
+ 		subscribers:       pubsub.Broker[State]{BufSize: 16},
+ 		updateSubscribers: pubsub.Broker[DeviceUpdate]{BufSize: 16},
 +	}
 +
 +	m.goranBackend = newGoranPanelBackend()
@@ -22,10 +22,10 @@
  	}
  
  	go m.initLogind()
-@@ -137,6 +142,10 @@
- 		}
+@@ -150,6 +155,10 @@
  	}
  
+ 	allDevices = append(allDevices, m.softwareDevices(allDevices)...)
 +	if m.goranBackend != nil {
 +		allDevices = m.goranBackend.appendDevice(allDevices)
 +	}
@@ -33,13 +33,13 @@
  	sortDevices(allDevices)
  
  	m.stateMutex.Lock()
-@@ -190,6 +199,15 @@
+@@ -203,6 +212,15 @@
  		m.stateMutex.Unlock()
  		log.Debugf("Device not found in state: %s", deviceID)
  		return fmt.Errorf("device not found: %s", deviceID)
 +	}
 +
-+	// Publish the hardware-confirmed helper state, including its minimum clamp.
++	// Publish hardware-confirmed state, including the OLED minimum clamp.
 +	if deviceID == goranPanelID && m.goranBackend != nil {
 +		m.stateMutex.Unlock()
 +		err := m.goranBackend.SetBrightnessWithExponent(deviceID, percent, exponential, exponent)
