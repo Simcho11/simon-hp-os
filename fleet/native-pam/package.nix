@@ -25,8 +25,8 @@ PY
   patchelf --replace-needed libpam.so.0 /usr/lib/aarch64-linux-gnu/libpam.so.0 \
     --force-rpath --set-rpath "$rpath:${pkgs.lib.getLib pcre}/lib:${homeDirectory}/.local/state/hp-os/native-pam/current" "$binary"
   patchelf --print-needed "$binary" | grep -Fx /usr/lib/aarch64-linux-gnu/libpam.so.0
-  mkdir -p "$out/share/native-pam"
-  ${pkgs.lib.optionalString (command != null) ''ln -s "$out/bin/${command}" "$out/share/native-pam/runner"''}
-  ln -s "$binary" "$out/share/native-pam/binary"
-  ln -s ${pkgs.lib.getLib pcre}/lib/libpcre2-8.so.0 "$out/share/native-pam/pcre"
+  mkdir -p "$out/share/hp-os-native-pam"
+  ${pkgs.lib.optionalString (command != null) ''ln -s "$out/bin/${command}" "$out/share/hp-os-native-pam/runner"''}
+  ln -s "$binary" "$out/share/hp-os-native-pam/binary"
+  ln -s ${pkgs.lib.getLib pcre}/lib/libpcre2-8.so.0 "$out/share/hp-os-native-pam/pcre"
 ''

@@ -8,7 +8,7 @@ from bridge import prepare
 
 
 def check(root, args=()):
-    manifest = Path(root) / 'share/native-pam'
+    manifest = Path(root) / 'share' / ('dms-native-pam' if args else 'hp-os-native-pam')
     binary = manifest / 'binary'
     needed = subprocess.check_output(['patchelf', '--print-needed', str(binary)], text=True).splitlines()
     if '/usr/lib/aarch64-linux-gnu/libpam.so.0' not in needed or 'libpam.so.0' in needed:
