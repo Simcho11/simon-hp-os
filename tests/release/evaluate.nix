@@ -14,6 +14,7 @@ let
 in assert pkgs.lib.versionAtLeast ghostty.version "1.4";
 assert ghostty.drvPath == f.packages.${system}.ghostty.drvPath;
 {
+  nativePam = import ../native-pam-eval.nix { inherit source system; };
   packages = builtins.mapAttrs (_: p: p.drvPath) f.packages.${system};
   homePackages = builtins.listToAttrs (builtins.map (p: { name = p.name; value = p.drvPath; }) hm.config.home.packages);
   checks = builtins.mapAttrs (_: p: p.drvPath) f.checks.${system};
