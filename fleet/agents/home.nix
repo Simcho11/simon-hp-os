@@ -198,6 +198,10 @@ in
       Service = {
         Type = "oneshot";
         RemainAfterExit = true;
+        # The harness home is normally created by the first `dsh` run. The
+        # ensure script skips a host with no harness home, so create it first
+        # when this module supplies the CLI.
+        ExecStartPre = "${pkgs.coreutils}/bin/install -d -m 0700 ${cfg.deepseek.home}";
         Environment = [
           "DSH_BIN=${dshBin}"
           "DSH_HOME=${cfg.deepseek.home}"
