@@ -54,9 +54,12 @@ Emacs PGTK without copying personal mail credentials or the private Emacs setup.
 
 Goran's DeepSeek Harness desktop command depends on a separate ARM64 package
 profile. Its web interface depends on a user server, model endpoint configuration
-and application state. Open WebUI runs a Docker container configured for Goran's
-NVIDIA-hosted Qwen endpoints. These runtimes require separate AMD service setup;
-copying their desktop files would create launchers without their dependencies.
+and application state. The shared `fleet/agents` module supplies the harness
+command line and terminal UI; the desktop and web launchers stay with the host
+because they need the local Qwen endpoints. Open WebUI runs a Docker container
+configured for Goran's NVIDIA-hosted Qwen endpoints. These runtimes require
+separate AMD service setup; copying their desktop files would create launchers
+without their dependencies.
 Windows 365 uses the public RDPiO flake and user authentication. Its package is
 host-integrated independently of this package list. Goran's DMS wallpaper
 launchers require the corresponding DMS plugins, supplied by the session module.
@@ -125,3 +128,41 @@ For a focused installation, build `.#fleet-mosh` on ARM64 or x86-64. Its config 
 file from the host mapping. Host addresses and identity remain outside this
 public module. `fleet-mosh-server` is available as an explicit server executable;
 ordinary `mosh` users can select it with `--server=fleet-mosh-server`.
+
+## Agent command-line tools
+
+`fleet/agents` wires the agent CLIs that every desktop should start the same
+way. The module packages nothing. A consumer supplies the packages it already
+builds, so the fleet keeps one copy of each package:
+
+```nix
+programs.hp-os-fleet.agents.packages = {
+  pi = pi-engine;            # Pi coding agent
+  piHarness = pi-harness;    # wrappers, settings, models
+  deepseek = dsh;            # DeepSeek Harness CLI
+  antigravity = antigravity-cli;  # provides `agy`, plus a `gemini` alias
+  grok = grok-cli;           # Grok Build CLI
+};
+```
+
+The module then supplies:
+
+- `dsh-tui` and `dst`, with a user service that installs the terminal UI
+  profile (`@deepseek-harness-tui/dsh-tui` 0.20.1) into the harness state
+  directory.
+- A `gemini` alias for `agy`.
+- A Home Manager activation step that runs `pi-harness switch` when the
+  provider keys exist.
+
+Any package left `null` stays host-managed. With no packages the module is
+inert, so a host that already owns the CLIs needs no opt-out.
+
+Provider API keys are never part of this public flake. `pi-harness switch` reads
+single-line key files from `agents.pi.secretRoot`, which defaults to
+`~/.config/pi/secrets`. Provision `deepseek-api-key`, `kimi-k3-api-key`, and
+`glm-coding-pro-api-key` with mode 0600, then either let activation run
+`pi-harness switch` or run it by hand with `--secret-root`.
+
+Set `agents.deepseek.home` when the host also runs a differently versioned
+harness web service, so neither version migrates the other's sessions. Set
+`agents.pi.switchOnActivation = false` when the host manages Pi settings itself.

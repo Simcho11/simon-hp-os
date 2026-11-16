@@ -28,10 +28,13 @@
         ];
       };
     in {
-      checks = import ./tests/omdrop/fleet-checks.nix {
-        inherit nixpkgs home-manager owly;
-        standaloneGui = system: self.packages.${system}.omdrop-gui;
-      };
+      checks = nixpkgs.lib.foldl' nixpkgs.lib.recursiveUpdate { } [
+        (import ./tests/omdrop/fleet-checks.nix {
+          inherit nixpkgs home-manager owly;
+          standaloneGui = system: self.packages.${system}.omdrop-gui;
+        })
+        (import ./tests/agents-eval.nix { inherit nixpkgs home-manager; })
+      ];
       apps.x86_64-linux.update-chrome-channels = let
         p = nixpkgs.legacyPackages.x86_64-linux;
         updater = p.writeShellApplication {
