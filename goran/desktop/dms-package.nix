@@ -15,6 +15,12 @@ let
     cp ${./dms-brightness/goran_panel_test.go} internal/server/brightness/goran_panel_test.go
   '';
   postFixup = (old.postFixup or "") + pkgs.lib.optionalString nativePam ''
+    # PAM dlopens its modules from a library loaded by the Go executable.
+    # The executable's RPATH supplies that transitive search path as well.
+    elf="$out/bin/.dms-wrapped"
+    rpath=$(${pkgs.patchelf}/bin/patchelf --print-rpath "$elf")
+    ${pkgs.patchelf}/bin/patchelf --force-rpath \
+      --set-rpath "$rpath:${pkgs.lib.getLib pkgs.pcre2}/lib:${homeDirectory}/.local/state/hp-os/native-pam/current" "$elf"
     mkdir -p "$out/share/native-pam"
     ln -s ${nativeBase}/share/native-pam/binary "$out/share/native-pam/binary"
     ln -s ${nativeBase}/share/native-pam/pcre "$out/share/native-pam/pcre"
