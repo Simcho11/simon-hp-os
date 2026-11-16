@@ -15,4 +15,5 @@ let
 in
 assert (gate != null) == (system == "aarch64-linux");
 assert gate == null || builtins.elem "writeBoundary" gate.before;
+assert gate == null || builtins.length home.config.home.packages == 1;
 { inherit system; guarded = gate != null; }

@@ -2,6 +2,7 @@
 let
   cfg = config.programs.hp-os-fleet.nativePam;
   guard = pkgs.writeShellScriptBin "desktop-native-pam-check" ''
+    set -euo pipefail
     export PATH="${lib.makeBinPath [ pkgs.patchelf pkgs.coreutils ]}:$PATH"
     checked=0
     for command in hp-os dms; do
