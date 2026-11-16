@@ -18,7 +18,13 @@ let
     mkdir -p "$out/share/native-pam"
     ln -s ${nativeBase}/share/native-pam/binary "$out/share/native-pam/binary"
     ln -s ${nativeBase}/share/native-pam/pcre "$out/share/native-pam/pcre"
-    ln -s "$out/bin/dms" "$out/share/native-pam/runner"
+    # The production wrapper prepends -c before argv[1]. Dux recognizes its
+    # internal qs entry point only at argv[1]. Preserve the identical Qt
+    # environment and executable while letting the probe select its QML path.
+    cp "$out/bin/dms" "$out/bin/dms-pam-probe"
+    substituteInPlace "$out/bin/dms-pam-probe" \
+      --replace-fail " -c $out/share/quickshell/dms" ""
+    ln -s "$out/bin/dms-pam-probe" "$out/share/native-pam/runner"
   '';
   doCheck = true;
   checkPhase = ''
