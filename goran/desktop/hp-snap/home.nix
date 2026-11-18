@@ -150,6 +150,17 @@ in {
         ${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"} \
         ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-glass-tray-v2"}
     '';
+    # Windows Office apps open beside the other desktop apps, on every account (included by
+    # login-backdrop.py). The desktop-switching shortcuts reach HP-OS from ../niri.nix.
+    xdg.configFile."hp-os/niri/config.d/64-hp-office.kdl".text = ''
+      // Managed by Home Manager (goran/desktop/hp-snap/home.nix).
+      window-rule {
+          match app-id="^hp-office-(powerpoint|word|excel|setup)$" title=".+"
+          open-floating true
+          default-column-width { fixed 1300; }
+          default-window-height { fixed 900; }
+      }
+    '';
     # Windows use the whole screen above the Dock: small edge widgets don't reserve a strip beside them.
     home.activation.hpSnapWindowSpace = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
       run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./window-space.json} \

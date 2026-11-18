@@ -8,6 +8,11 @@ house_include = 'include "config.d/49-hp-snap.kdl"'
 if (root/'config.d/49-hp-snap.kdl').exists() and house_include not in (line.strip() for line in text.splitlines()):
     text = text.rstrip() + '\n' + house_include + '\n'
     write(main, text)
+# Every account's rule for the Windows Office apps (home.nix).
+office_include = 'include "config.d/64-hp-office.kdl"'
+if (root/'config.d/64-hp-office.kdl').exists() and office_include not in (line.strip() for line in text.splitlines()):
+    text = text.rstrip() + '\n' + office_include + '\n'
+    write(main, text)
 # Fcitx's "Wayland Diagnose" pop-up is advice for people configuring input methods by hand. HP-OS sets
 # these variables on purpose, so nobody should be greeted by it (the same as "Do not show again").
 fcitx_notices = pathlib.Path(os.environ.get('XDG_CONFIG_HOME', str(pathlib.Path.home()/'.config')))/'fcitx5/conf/notifications.conf'

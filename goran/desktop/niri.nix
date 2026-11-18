@@ -203,8 +203,8 @@ in {
       Mod+K     { focus-window-up; }
       Mod+L     { focus-column-right; }
       Mod+Ctrl+Left  { move-column-left; }
-      Mod+Ctrl+Down  { move-window-down; }
-      Mod+Ctrl+Up    { move-window-up; }
+      Mod+Ctrl+Down  { focus-workspace-down; }
+      Mod+Ctrl+Up    { focus-workspace-up; }
       Mod+Ctrl+Right { move-column-right; }
       Mod+Ctrl+H     { move-column-left; }
       Mod+Ctrl+J     { move-window-down; }
@@ -223,8 +223,8 @@ in {
       Mod+Shift+K     { focus-monitor-up; }
       Mod+Shift+L     { focus-monitor-right; }
       Mod+Shift+Ctrl+Left  { move-column-to-monitor-left; }
-      Mod+Shift+Ctrl+Down  { move-column-to-monitor-down; }
-      Mod+Shift+Ctrl+Up    { move-column-to-monitor-up; }
+      Mod+Shift+Ctrl+Down  { move-window-to-workspace-down; }
+      Mod+Shift+Ctrl+Up    { move-window-to-workspace-up; }
       Mod+Shift+Ctrl+Right { move-column-to-monitor-right; }
       Mod+Shift+Ctrl+H     { move-column-to-monitor-left; }
       Mod+Shift+Ctrl+J     { move-column-to-monitor-down; }
@@ -320,6 +320,14 @@ in {
       open-floating true
       default-column-width { fixed 1280; }
       default-window-height { fixed 746; }
+    }
+
+    // Windows Office apps should open beside the other desktop apps.
+    window-rule {
+      match app-id="^hp-office-(powerpoint|word|excel|setup)$" title=".+"
+      open-floating true
+      default-column-width { fixed 1300; }
+      default-window-height { fixed 900; }
     }
 
     // Apply DMS theme geometry and colors after the baseline defaults.
