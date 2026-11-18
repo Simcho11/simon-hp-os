@@ -1,0 +1,908 @@
+diff --git a/niri-config/src/binds.rs b/niri-config/src/binds.rs
+index 0be7596..768a6d4 100644
+--- a/niri-config/src/binds.rs
++++ b/niri-config/src/binds.rs
+@@ -148,6 +148,11 @@ pub enum Action {
+     CloseWindow,
+     #[knuffel(skip)]
+     CloseWindowById(u64),
++    MinimizeWindow,
++    #[knuffel(skip)]
++    MinimizeWindowById(u64),
++    #[knuffel(skip)]
++    SnapshotWindow { id: u64, path: String },
+     FullscreenWindow,
+     #[knuffel(skip)]
+     FullscreenWindowById(u64),
+@@ -429,6 +434,9 @@ impl From<niri_ipc::Action> for Action {
+             niri_ipc::Action::ToggleKeyboardShortcutsInhibit {} => {
+                 Self::ToggleKeyboardShortcutsInhibit
+             }
++            niri_ipc::Action::SnapshotWindow { id, path } => Self::SnapshotWindow { id, path },
++            niri_ipc::Action::MinimizeWindow { id: None } => Self::MinimizeWindow,
++            niri_ipc::Action::MinimizeWindow { id: Some(id) } => Self::MinimizeWindowById(id),
+             niri_ipc::Action::CloseWindow { id: None } => Self::CloseWindow,
+             niri_ipc::Action::CloseWindow { id: Some(id) } => Self::CloseWindowById(id),
+             niri_ipc::Action::FullscreenWindow { id: None } => Self::FullscreenWindow,
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0aa3cb4..caa1a62 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -285,6 +285,26 @@ pub enum Action {
+     },
+     /// Enable or disable the keyboard shortcuts inhibitor (if any) for the focused surface.
+     ToggleKeyboardShortcutsInhibit {},
++    /// hp-snap patch: save a window's image to a file for previews, without the clipboard, a
++    /// notification or a ScreenshotCaptured event.
++    #[cfg_attr(feature = "clap", clap(about = "Save a window's image for previews (no clipboard)"))]
++    SnapshotWindow {
++        /// Id of the window.
++        #[cfg_attr(feature = "clap", arg(long))]
++        id: u64,
++        /// Where to write the PNG.
++        #[cfg_attr(feature = "clap", arg(long))]
++        path: String,
++    },
++    /// hp-snap patch: minimize a window.
++    #[cfg_attr(feature = "clap", clap(about = "Minimize the focused window"))]
++    MinimizeWindow {
++        /// Id of the window to minimize.
++        ///
++        /// If `None`, uses the focused window.
++        #[cfg_attr(feature = "clap", arg(long))]
++        id: Option<u64>,
++    },
+     /// Close a window.
+     #[cfg_attr(feature = "clap", clap(about = "Close the focused window"))]
+     CloseWindow {
+@@ -1390,6 +1410,14 @@ pub struct WindowLayout {
+     /// the distance from the corner of the black backdrop to the corner of the (centered) window
+     /// contents.
+     pub window_offset_in_tile: (f64, f64),
++    /// hp-snap patch: while the window is being interactively moved, its tile position within
++    /// the output it is over (logical pixels). `None` otherwise.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub interactive_move_tile_pos: Option<(f64, f64)>,
++    /// hp-snap patch: while the window is being interactively moved, the pointer position within
++    /// the output it is over (logical pixels). `None` otherwise.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub interactive_move_pointer_pos: Option<(f64, f64)>,
+ }
+ 
+ /// Output configuration change result.
+@@ -1687,6 +1715,18 @@ pub enum Event {
+         /// be converted to a `String` (e.g. contained invalid UTF-8 bytes).
+         path: Option<String>,
+     },
++    /// hp-snap patch (first version): a window asked to be minimized. No longer sent; kept so
++    /// tools built against that version still parse.
++    WindowMinimizeRequested {
++        /// Id of the window.
++        id: u64,
++    },
++    /// hp-snap patch: a window was minimized (its title-bar minimize button or the
++    /// `minimize-window` action). niri moved it to a stash workspace; activating it restores it.
++    WindowMinimized {
++        /// Id of the window.
++        id: u64,
++    },
+     /// The screencasts have changed.
+     CastsChanged {
+         /// The new screencast information.
+diff --git a/src/handlers/xdg_shell.rs b/src/handlers/xdg_shell.rs
+index 38440c9..b7760dc 100644
+--- a/src/handlers/xdg_shell.rs
++++ b/src/handlers/xdg_shell.rs
+@@ -406,6 +406,18 @@ impl XdgShellHandler for State {
+         });
+     }
+ 
++    // hp-snap patch: minimize (stock niri ignores the request).
++    fn minimize_request(&mut self, toplevel: ToplevelSurface) {
++        let window = self
++            .niri
++            .layout
++            .find_window_and_output(toplevel.wl_surface())
++            .map(|(mapped, _)| mapped.window.clone());
++        if let Some(window) = window {
++            self.minimize_window(&window);
++        }
++    }
++
+     fn maximize_request(&mut self, toplevel: ToplevelSurface) {
+         if let Some((mapped, _)) = self
+             .niri
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index f1ad493..6624226 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -803,6 +803,31 @@ impl State {
+                     mapped.toplevel().send_close();
+                 }
+             }
++            Action::SnapshotWindow { id, path } => {
++                let mut windows = self.niri.layout.windows();
++                let window = windows.find(|(_, m)| m.id().get() == id);
++                if let Some((Some(monitor), mapped)) = window {
++                    let output = monitor.output();
++                    self.backend.with_primary_renderer(|renderer| {
++                        if let Err(err) = self.niri.snapshot_window(renderer, output, mapped, path) {
++                            warn!("error taking a window snapshot: {err:?}");
++                        }
++                    });
++                }
++            }
++            Action::MinimizeWindow => {
++                let focus = self.niri.layout.focus().map(|m| m.window.clone());
++                if let Some(window) = focus {
++                    self.minimize_window(&window);
++                }
++            }
++            Action::MinimizeWindowById(id) => {
++                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
++                let window = window.map(|(_, m)| m.window.clone());
++                if let Some(window) = window {
++                    self.minimize_window(&window);
++                }
++            }
+             Action::CloseWindowById(id) => {
+                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                 if let Some((_, mapped)) = window {
+diff --git a/src/ipc/client.rs b/src/ipc/client.rs
+index 40a58ef..7f7ad29 100644
+--- a/src/ipc/client.rs
++++ b/src/ipc/client.rs
+@@ -506,6 +506,12 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
+                     Event::CastStopped { stream_id } => {
+                         println!("Cast stopped: stream id {stream_id}");
+                     }
++                    Event::WindowMinimizeRequested { id } => {
++                        println!("Window {id}: minimize requested");
++                    }
++                    Event::WindowMinimized { id } => {
++                        println!("Window {id}: minimized");
++                    }
+                 }
+             }
+         }
+@@ -709,6 +715,7 @@ fn print_window(window: &Window) {
+         window_size,
+         tile_pos_in_workspace_view,
+         window_offset_in_tile,
++        ..
+     } = window.layout;
+ 
+     println!("  Layout:");
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index db71da6..2ee06de 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -942,4 +942,16 @@ impl State {
+         state.apply(event.clone());
+         server.send_event(event);
+     }
++
++    /// hp-snap patch: report a minimized window to event-stream clients.
++    pub fn ipc_window_minimized(&mut self, id: u64) {
++        let Some(server) = &self.niri.ipc_server else {
++            return;
++        };
++        let mut state = server.event_stream_state.borrow_mut();
++
++        let event = Event::WindowMinimized { id };
++        state.apply(event.clone());
++        server.send_event(event);
++    }
+ }
+diff --git a/src/layout/closing_window.rs b/src/layout/closing_window.rs
+index ca28f59..7a6aab9 100644
+--- a/src/layout/closing_window.rs
++++ b/src/layout/closing_window.rs
+@@ -61,6 +61,9 @@ pub struct ClosingWindow {
+ 
+     /// Random seed for the shader.
+     random_seed: f32,
++
++    /// hp-snap patch: minimizing: vector from the window's centre to the dock.
++    minimize_delta: Option<Point<f64, Logical>>,
+ }
+ 
+ niri_render_elements! {
+@@ -154,9 +157,19 @@ impl ClosingWindow {
+             blocked_out_buffer_offset,
+             anim_state: AnimationState::new(blocker, anim),
+             random_seed: fastrand::f32(),
++            minimize_delta: None,
+         })
+     }
+ 
++    /// hp-snap patch: turn this into a minimize animation: shrink while flying to the dock.
++    pub fn set_minimize(&mut self, delta: Point<f64, Logical>, new_anim: Animation) {
++        self.minimize_delta = Some(delta);
++        match &mut self.anim_state {
++            AnimationState::Waiting { anim, .. } => *anim = new_anim,
++            AnimationState::Animating(anim) => *anim = new_anim,
++        }
++    }
++
+     pub fn advance_animations(&mut self) {
+         match &mut self.anim_state {
+             AnimationState::Waiting { blocker, anim } => {
+@@ -223,6 +236,33 @@ impl ClosingWindow {
+         let progress = anim.value();
+         let clamped_progress = anim.clamped_value().clamp(0., 1.);
+ 
++        if let Some(delta) = self.minimize_delta {
++            let p = clamped_progress;
++            let elem = TextureRenderElement::from_texture_buffer(
++                buffer.clone(),
++                Point::from((0., 0.)),
++                (1. - super::opening_window::smoothstep(0.55, 1., p)) as f32,
++                None,
++                None,
++                Kind::Unspecified,
++            );
++            let elem = PrimaryGpuTextureRenderElement(elem);
++            let center = self.geo_size.to_point().downscale(2.);
++            let elem = RescaleRenderElement::from_element(
++                elem,
++                (center - offset).to_physical_precise_round(scale),
++                (1. - (1. - super::opening_window::MINIMIZED_SCALE) * p).max(0.01),
++            );
++            let mut location = self.pos + offset + delta.upscale(p);
++            location.x -= view_rect.loc.x;
++            let elem = RelocateRenderElement::from_element(
++                elem,
++                location.to_physical_precise_round(scale),
++                Relocate::Relative,
++            );
++            return elem.into();
++        }
++
+         if Shaders::get(ctx.renderer)
+             .program(ProgramType::Close)
+             .is_some()
+diff --git a/src/layout/floating.rs b/src/layout/floating.rs
+index d102f40..a9f089e 100644
+--- a/src/layout/floating.rs
++++ b/src/layout/floating.rs
+@@ -688,6 +688,30 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         true
+     }
+ 
++    /// hp-snap patch: see Tile::start_restore_animation.
++    pub fn start_restore_animation(&mut self, id: &W::Id, delta: Point<f64, Logical>) -> bool {
++        let Some(idx) = self.idx_of(id) else {
++            return false;
++        };
++
++        self.tiles[idx].start_restore_animation(delta);
++        true
++    }
++
++    /// hp-snap patch: turn the closing animation just started into a minimize animation.
++    pub fn mark_last_closing_minimized(&mut self, delta: Point<f64, Logical>) {
++        let anim = Animation::new(
++            self.clock.clone(),
++            0.,
++            1.,
++            0.,
++            super::opening_window::minimize_anim_config(),
++        );
++        if let Some(closing) = self.closing_windows.last_mut() {
++            closing.set_minimize(delta, anim);
++        }
++    }
++
+     pub fn toggle_window_height(&mut self, id: Option<&W::Id>, forwards: bool) {
+         let Some(id) = id.or(self.active_window_id.as_ref()).cloned() else {
+             return;
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 5c4dd63..da50b75 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -70,7 +70,7 @@ use crate::render_helpers::{BakedBuffer, RenderCtx};
+ use crate::rubber_band::RubberBand;
+ use crate::utils::transaction::{Transaction, TransactionBlocker};
+ use crate::utils::{
+-    ensure_min_max_size_maybe_zero, output_matches_name, output_size,
++    ensure_min_max_size, ensure_min_max_size_maybe_zero, output_matches_name, output_size,
+     round_logical_in_physical_max1, ResizeEdge,
+ };
+ use crate::window::ResolvedWindowRules;
+@@ -351,6 +351,9 @@ pub struct Layout<W: LayoutElement> {
+     last_active_workspace_id: HashMap<String, WorkspaceId>,
+     /// Ongoing interactive move.
+     interactive_move: Option<InteractiveMoveState<W>>,
++    /// hp-snap patch: minimized windows and the workspace each was minimized from. A minimized
++    /// window lives on a stash workspace of its monitor until something activates it.
++    minimized: Vec<(W::Id, WorkspaceId)>,
+     /// Ongoing drag-and-drop operation.
+     dnd: Option<DndData<W>>,
+     /// Clock for driving animations.
+@@ -687,6 +690,31 @@ impl OverviewProgress {
+     }
+ }
+ 
++/// hp-snap patch: move a window to another workspace of its monitor without activating it,
++/// keeping whether it unmaximizes back to floating (a plain move forgets that, so a floating
++/// window maximized with its title-bar button would unmaximize into the tiled layout).
++fn move_keeping_restore_to_floating<W: LayoutElement>(
++    mon: &mut Monitor<W>,
++    window: &W::Id,
++    idx: usize,
++) {
++    let restore_to_floating = mon
++        .workspaces
++        .iter()
++        .flat_map(|ws| ws.tiles())
++        .find(|tile| tile.window().id() == window)
++        .is_some_and(|tile| tile.restore_to_floating);
++    mon.move_to_workspace(Some(window), idx, ActivateWindow::No);
++    if let Some(tile) = mon
++        .workspaces
++        .iter_mut()
++        .flat_map(|ws| ws.tiles_mut())
++        .find(|tile| tile.window().id() == window)
++    {
++        tile.restore_to_floating = restore_to_floating;
++    }
++}
++
+ impl<W: LayoutElement> Layout<W> {
+     pub fn new(clock: Clock, config: &Config) -> Self {
+         Self::with_options_and_workspaces(clock, config, Options::from_config(config))
+@@ -698,6 +726,7 @@ impl<W: LayoutElement> Layout<W> {
+             is_active: true,
+             last_active_workspace_id: HashMap::new(),
+             interactive_move: None,
++            minimized: Vec::new(),
+             dnd: None,
+             clock,
+             update_render_elements_time: Duration::ZERO,
+@@ -723,6 +752,7 @@ impl<W: LayoutElement> Layout<W> {
+             is_active: true,
+             last_active_workspace_id: HashMap::new(),
+             interactive_move: None,
++            minimized: Vec::new(),
+             dnd: None,
+             clock,
+             update_render_elements_time: Duration::ZERO,
+@@ -1114,6 +1144,8 @@ impl<W: LayoutElement> Layout<W> {
+         window: &W::Id,
+         transaction: Transaction,
+     ) -> Option<RemovedTile<W>> {
++        self.minimized.retain(|(id, _)| id != window);
++
+         if let Some(state) = &self.interactive_move {
+             match state {
+                 InteractiveMoveState::Starting { window_id, .. } => {
+@@ -1511,6 +1543,116 @@ impl<W: LayoutElement> Layout<W> {
+         ws_idx == mon.active_workspace_idx
+     }
+ 
++    /// hp-snap patch: whether the window is minimized.
++    pub fn is_minimized(&self, window: &W::Id) -> bool {
++        self.minimized.iter().any(|(id, _)| id == window)
++    }
++
++    /// hp-snap patch: where a window would be minimized to: (monitor index, source workspace
++    /// index, stash workspace index). The stash is a workspace on the same monitor holding only
++    /// minimized windows, else the last (empty) workspace.
++    pub fn minimize_target(&self, window: &W::Id) -> Option<(usize, usize, usize)> {
++        if self.is_minimized(window) {
++            return None;
++        }
++        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
++            if move_.tile.window().id() == window {
++                return None;
++            }
++        }
++        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
++            return None;
++        };
++        for (mon_idx, mon) in monitors.iter().enumerate() {
++            let Some(src) = mon.workspaces.iter().position(|ws| ws.has_window(window)) else {
++                continue;
++            };
++            let stash = mon
++                .workspaces
++                .iter()
++                .enumerate()
++                .position(|(idx, ws)| {
++                    idx != src
++                        && ws.has_windows()
++                        && ws.windows().all(|w| self.is_minimized(w.id()))
++                })
++                .unwrap_or(mon.workspaces.len() - 1);
++            if stash == src {
++                return None;
++            }
++            return Some((mon_idx, src, stash));
++        }
++        None
++    }
++
++    /// hp-snap patch: moves the window to its monitor's stash workspace without switching the
++    /// view, and remembers where it came from. The caller starts the close animation first.
++    pub fn minimize_window(&mut self, window: &W::Id) -> bool {
++        let Some((mon_idx, src, stash)) = self.minimize_target(window) else {
++            return false;
++        };
++        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
++            return false;
++        };
++        let mon = &mut monitors[mon_idx];
++        let ws_id = mon.workspaces[src].id();
++        self.minimized.push((window.clone(), ws_id));
++        move_keeping_restore_to_floating(mon, window, stash);
++        true
++    }
++
++    /// hp-snap patch: if the window is minimized, moves it back to the workspace it came from
++    /// (or the monitor's active one, if that is gone) and plays the open animation.
++    fn unminimize_window(&mut self, window: &W::Id) {
++        let Some(pos) = self.minimized.iter().position(|(id, _)| id == window) else {
++            return;
++        };
++        let (_, ws_id) = self.minimized.remove(pos);
++        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
++            return;
++        };
++        let Some(mon) = monitors.iter_mut().find(|mon| mon.has_window(window)) else {
++            return;
++        };
++        let target = mon
++            .workspaces
++            .iter()
++            .position(|ws| ws.id() == ws_id)
++            .unwrap_or(mon.active_workspace_idx);
++        move_keeping_restore_to_floating(mon, window, target);
++        // Grow out of the dock, back into place.
++        let ws = mon.workspaces.iter_mut().find(|ws| ws.has_window(window));
++        if let Some(ws) = ws {
++            let delta = ws.minimize_delta(window);
++            if delta.is_some_and(|delta| ws.start_restore_animation(window, delta)) {
++                return;
++            }
++        }
++        self.start_open_animation_for_window(window);
++    }
++
++    /// hp-snap patch: vector from the window's centre to the dock, for the minimize animation.
++    pub fn minimize_delta(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
++        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
++            return None;
++        };
++        monitors
++            .iter()
++            .flat_map(|mon| mon.workspaces.iter())
++            .find(|ws| ws.has_window(window))
++            .and_then(|ws| ws.minimize_delta(window))
++    }
++
++    /// hp-snap patch: turn the window's just-started close animation into a minimize animation.
++    pub fn mark_minimize_animation(&mut self, window: &W::Id, delta: Point<f64, Logical>) {
++        for ws in self.workspaces_mut() {
++            if ws.has_window(window) {
++                ws.mark_minimize_animation(window, delta);
++                return;
++            }
++        }
++    }
++
+     pub fn activate_window(&mut self, window: &W::Id) {
+         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+             if move_.tile.window().id() == window {
+@@ -1518,6 +1660,8 @@ impl<W: LayoutElement> Layout<W> {
+             }
+         }
+ 
++        self.unminimize_window(window);
++
+         let MonitorSet::Normal {
+             monitors,
+             active_monitor_idx,
+@@ -1670,8 +1814,14 @@ impl<W: LayoutElement> Layout<W> {
+         mut f: impl FnMut(&W, Option<&Output>, Option<WorkspaceId>, WindowLayout),
+     ) {
+         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+-            // We don't fill any positions for interactively moved windows.
+-            let layout = move_.tile.ipc_layout_template();
++            // We don't fill the regular positions for interactively moved windows.
++            let mut layout = move_.tile.ipc_layout_template();
++            // hp-snap patch: report where the moved window and the pointer are on their output,
++            // so external tools can preview window snapping during the drag.
++            let pos = move_.tile_render_location(self.overview_zoom());
++            layout.interactive_move_tile_pos = Some((pos.x, pos.y));
++            let ptr = move_.pointer_pos_within_output;
++            layout.interactive_move_pointer_pos = Some((ptr.x, ptr.y));
+             f(move_.tile.window(), Some(&move_.output), None, layout);
+         }
+ 
+@@ -3056,6 +3206,26 @@ impl<W: LayoutElement> Layout<W> {
+     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
+         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+             if window.is_none() || window == Some(move_.tile.window().id()) {
++                // hp-snap patch: a floating window being dragged accepts fixed-size changes (so
++                // a window dragged out of a snapped position can return to its normal size
++                // right away). The pointer keeps its relative position within the window.
++                if move_.is_floating {
++                    let win = move_.tile.window_mut();
++                    let current = win.expected_size().unwrap_or_else(|| win.size());
++                    let new = match change {
++                        SizeChange::SetFixed(v) => Some(v),
++                        SizeChange::AdjustFixed(d) => Some(current.w.saturating_add(d)),
++                        _ => None,
++                    };
++                    if let Some(new) = new {
++                        let min_size = win.min_size();
++                        let max_size = win.max_size();
++                        let new = ensure_min_max_size(new.clamp(1, 100000), min_size.w, max_size.w);
++                        let keep = ensure_min_max_size(current.h, min_size.h, max_size.h);
++                        let size = Size::from((new, keep));
++                        win.request_size_once(size, true); // animated, like a normal resize
++                    }
++                }
+                 return;
+             }
+         }
+@@ -3079,6 +3249,26 @@ impl<W: LayoutElement> Layout<W> {
+     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
+         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+             if window.is_none() || window == Some(move_.tile.window().id()) {
++                // hp-snap patch: a floating window being dragged accepts fixed-size changes (so
++                // a window dragged out of a snapped position can return to its normal size
++                // right away). The pointer keeps its relative position within the window.
++                if move_.is_floating {
++                    let win = move_.tile.window_mut();
++                    let current = win.expected_size().unwrap_or_else(|| win.size());
++                    let new = match change {
++                        SizeChange::SetFixed(v) => Some(v),
++                        SizeChange::AdjustFixed(d) => Some(current.h.saturating_add(d)),
++                        _ => None,
++                    };
++                    if let Some(new) = new {
++                        let min_size = win.min_size();
++                        let max_size = win.max_size();
++                        let new = ensure_min_max_size(new.clamp(1, 100000), min_size.h, max_size.h);
++                        let keep = ensure_min_max_size(current.w, min_size.w, max_size.w);
++                        let size = Size::from((keep, new));
++                        win.request_size_once(size, true); // animated, like a normal resize
++                    }
++                }
+                 return;
+             }
+         }
+diff --git a/src/layout/opening_window.rs b/src/layout/opening_window.rs
+index 5ba97a3..ada6252 100644
+--- a/src/layout/opening_window.rs
++++ b/src/layout/opening_window.rs
+@@ -22,6 +22,27 @@ pub struct OpenAnimation {
+     anim: Animation,
+     random_seed: f32,
+     buffer: OffscreenBuffer,
++    /// hp-snap patch: restoring from minimized: vector from the window's centre to the dock.
++    restore_delta: Option<Point<f64, Logical>>,
++}
++
++/// hp-snap patch: timing of the minimize and restore animations.
++pub fn minimize_anim_config() -> niri_config::Animation {
++    niri_config::Animation {
++        off: false,
++        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
++            duration_ms: 320,
++            curve: niri_config::animations::Curve::CubicBezier(0.4, 0., 0.2, 1.),
++        }),
++    }
++}
++
++/// hp-snap patch: scale of a minimized window when it reaches the dock.
++pub const MINIMIZED_SCALE: f64 = 0.08;
++
++pub fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
++    let t = ((x - edge0) / (edge1 - edge0)).clamp(0., 1.);
++    t * t * (3. - 2. * t)
+ }
+ 
+ niri_render_elements! {
+@@ -37,6 +58,15 @@ impl OpenAnimation {
+             anim,
+             random_seed: fastrand::f32(),
+             buffer: OffscreenBuffer::default(),
++            restore_delta: None,
++        }
++    }
++
++    /// hp-snap patch: grow out of the dock (`delta`: from the window's centre to the dock).
++    pub fn new_restore(anim: Animation, delta: Point<f64, Logical>) -> Self {
++        Self {
++            restore_delta: Some(delta),
++            ..Self::new(anim)
+         }
+     }
+ 
+@@ -63,6 +93,24 @@ impl OpenAnimation {
+             .render(renderer, scale, elements)
+             .context("error rendering to offscreen buffer")?;
+ 
++        if let Some(delta) = self.restore_delta {
++            // Reverse of minimize: start small at the dock, grow and fly back into place.
++            let rest = 1. - clamped_progress;
++            let elem = elem.with_alpha(smoothstep(0., 0.45, clamped_progress) as f32 * alpha);
++            let center = geo_size.to_point().downscale(2.);
++            let elem = RescaleRenderElement::from_element(
++                elem,
++                center.to_physical_precise_round(scale),
++                (1. - (1. - MINIMIZED_SCALE) * rest).max(0.01),
++            );
++            let elem = RelocateRenderElement::from_element(
++                elem,
++                (location + delta.upscale(rest)).to_physical_precise_round(scale),
++                Relocate::Relative,
++            );
++            return Ok((elem.into(), data));
++        }
++
+         if Shaders::get(renderer).program(ProgramType::Open).is_some() {
+             // OffscreenBuffer renders with Transform::Normal and the scale that we passed, so we
+             // can assume that below.
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 007bcaf..04e1bf6 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -1548,6 +1548,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             .any(|col| col.start_open_animation(id))
+     }
+ 
++    /// hp-snap patch: see Tile::start_restore_animation.
++    pub fn start_restore_animation(&mut self, id: &W::Id, delta: Point<f64, Logical>) -> bool {
++        for tile in self.columns.iter_mut().flat_map(|col| col.tiles.iter_mut()) {
++            if tile.window().id() == id {
++                tile.start_restore_animation(delta);
++                return true;
++            }
++        }
++        false
++    }
++
++    /// hp-snap patch: turn the closing animation just started into a minimize animation.
++    pub fn mark_last_closing_minimized(&mut self, delta: Point<f64, Logical>) {
++        let anim = Animation::new(
++            self.clock.clone(),
++            0.,
++            1.,
++            0.,
++            super::opening_window::minimize_anim_config(),
++        );
++        if let Some(closing) = self.closing_windows.last_mut() {
++            closing.set_minimize(delta, anim);
++        }
++    }
++
+     pub fn focus_left(&mut self) -> bool {
+         if self.active_column_idx == 0 {
+             return false;
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index 31265dd..eb82b4a 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3553,6 +3553,34 @@ fn restore_to_floating_persists_across_fullscreen_maximize() {
+     assert!(scrolling.tiles().next().is_none());
+ }
+ 
++// hp-snap patch: minimize and restore keep a maximized ex-floating window's way back to floating.
++#[test]
++fn minimize_restore_keeps_restore_to_floating() {
++    let ops = [
++        Op::AddOutput(1),
++        Op::AddWindow {
++            params: TestWindowParams::new(1),
++        },
++        Op::ToggleWindowFloating { id: None },
++        Op::MaximizeWindowToEdges { id: None },
++    ];
++
++    let mut layout = check_ops(ops);
++    assert!(layout.minimize_window(&1));
++    assert!(layout.is_minimized(&1));
++    layout.activate_window(&1);
++    assert!(!layout.is_minimized(&1));
++
++    // Back on its workspace, still maximized in the scrolling layout.
++    let scrolling = layout.active_workspace().unwrap().scrolling();
++    assert!(scrolling.tiles().next().is_some());
++
++    // Unmaximize should return the window back to floating.
++    check_ops_on_layout(&mut layout, [Op::MaximizeWindowToEdges { id: None }]);
++    let scrolling = layout.active_workspace().unwrap().scrolling();
++    assert!(scrolling.tiles().next().is_none());
++}
++
+ #[test]
+ fn unmaximize_during_fullscreen_does_not_float() {
+     let ops = [
+diff --git a/src/layout/tile.rs b/src/layout/tile.rs
+index 86c7eba..c1e7d30 100644
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -558,6 +558,20 @@ impl<W: LayoutElement> Tile<W> {
+         offset
+     }
+ 
++    /// hp-snap patch: restore from minimized: grow out of the dock.
++    pub fn start_restore_animation(&mut self, delta: Point<f64, Logical>) {
++        self.open_animation = Some(OpenAnimation::new_restore(
++            Animation::new(
++                self.clock.clone(),
++                0.,
++                1.,
++                0.,
++                super::opening_window::minimize_anim_config(),
++            ),
++            delta,
++        ));
++    }
++
+     pub fn start_open_animation(&mut self) {
+         self.open_animation = Some(OpenAnimation::new(Animation::new(
+             self.clock.clone(),
+@@ -868,6 +882,8 @@ impl<W: LayoutElement> Tile<W> {
+             window_size: self.window().size().into(),
+             tile_pos_in_workspace_view: None,
+             window_offset_in_tile: self.window_loc().into(),
++            interactive_move_tile_pos: None,
++            interactive_move_pointer_pos: None,
+         }
+     }
+ 
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 49548a8..4212327 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -1753,6 +1753,35 @@ impl<W: LayoutElement> Workspace<W> {
+         self.scrolling.start_open_animation(id) || self.floating.start_open_animation(id)
+     }
+ 
++    /// hp-snap patch: vector from the window's centre to the dock: the bottom centre of the
++    /// screen (the middle of the strip the dock reserves, if it reserves one).
++    pub fn minimize_delta(&self, id: &W::Id) -> Option<Point<f64, Logical>> {
++        let (tile, pos, _) = self
++            .tiles_with_render_positions()
++            .find(|(tile, _, _)| tile.window().id() == id)?;
++        let center = pos + tile.tile_size().to_point().downscale(2.);
++        let bottom = self.working_area.loc.y + self.working_area.size.h;
++        let h = self.view_size.h;
++        let y = if h - bottom > 8. { (bottom + h) / 2. } else { h - 24. };
++        let target = Point::from((self.view_size.w / 2., y));
++        Some(target - center)
++    }
++
++    /// hp-snap patch: see FloatingSpace::mark_last_closing_minimized.
++    pub fn mark_minimize_animation(&mut self, id: &W::Id, delta: Point<f64, Logical>) {
++        if self.floating.has_window(id) {
++            self.floating.mark_last_closing_minimized(delta);
++        } else {
++            self.scrolling.mark_last_closing_minimized(delta);
++        }
++    }
++
++    /// hp-snap patch: see Tile::start_restore_animation.
++    pub fn start_restore_animation(&mut self, id: &W::Id, delta: Point<f64, Logical>) -> bool {
++        self.scrolling.start_restore_animation(id, delta)
++            || self.floating.start_restore_animation(id, delta)
++    }
++
+     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
+         // This logic is consistent with tiles_with_render_positions().
+         if self.is_floating_visible() {
+diff --git a/src/niri.rs b/src/niri.rs
+index ec40e01..7c6f314 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -989,6 +989,49 @@ impl State {
+         self.niri.queue_redraw_all();
+     }
+ 
++    /// hp-snap patch: minimize a window. Plays the close animation where the window is, then
++    /// parks it on a stash workspace without moving the view; activating it brings it back.
++    pub fn minimize_window(&mut self, window: &Window) {
++        let Some((mapped, mon)) = self
++            .niri
++            .layout
++            .windows()
++            .find(|(_, m)| m.window == *window)
++            .map(|(mon, m)| (m, mon))
++        else {
++            return;
++        };
++        if self.niri.layout.minimize_target(&mapped.window).is_none() {
++            return;
++        }
++        let id = mapped.id().get();
++        let output = mon.map(|mon| mon.output().clone());
++
++        let delta = self.niri.layout.minimize_delta(window);
++
++        self.store_unmap_snapshot(window, output.as_ref());
++
++        let transaction = crate::utils::transaction::Transaction::new();
++        let blocker = transaction.blocker();
++        self.backend.with_primary_renderer(|renderer| {
++            self.niri
++                .layout
++                .start_close_animation_for_window(renderer, window, blocker);
++        });
++        drop(transaction);
++        // Shrink into the dock instead of the plain close animation.
++        if let Some(delta) = delta {
++            self.niri.layout.mark_minimize_animation(window, delta);
++        }
++
++        if self.niri.layout.minimize_window(window) {
++            self.ipc_window_minimized(id);
++        }
++
++        // FIXME: granular
++        self.niri.queue_redraw_all();
++    }
++
+     pub fn confirm_mru(&mut self) {
+         if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
+             self.focus_window(&window);
+@@ -5582,6 +5625,45 @@ impl Niri {
+         path: Option<String>,
+     ) -> anyhow::Result<()> {
+         let _span = tracy_client::span!("Niri::screenshot_window");
++        let (size, pixels) = self.window_pixels(renderer, output, mapped, show_pointer)?;
++        self.save_screenshot(size, pixels, write_to_disk, path)
++            .context("error saving screenshot")
++    }
++
++    /// hp-snap patch: a window's image for previews (the Dock's hover cards): written to `path` as
++    /// PNG (via a temporary file, so readers never see half an image), without touching the
++    /// clipboard, without a notification and without a ScreenshotCaptured event.
++    pub fn snapshot_window(
++        &self,
++        renderer: &mut GlesRenderer,
++        output: &Output,
++        mapped: &Mapped,
++        path: String,
++    ) -> anyhow::Result<()> {
++        let _span = tracy_client::span!("Niri::snapshot_window");
++        let (size, pixels) = self.window_pixels(renderer, output, mapped, false)?;
++        thread::spawn(move || {
++            let mut buf = vec![];
++            let w = std::io::Cursor::new(&mut buf);
++            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
++                warn!("error encoding window snapshot: {err:?}");
++                return;
++            }
++            let tmp = format!("{path}.tmp");
++            if let Err(err) = std::fs::write(&tmp, buf).and_then(|()| std::fs::rename(&tmp, &path)) {
++                warn!("error saving window snapshot: {err:?}");
++            }
++        });
++        Ok(())
++    }
++
++    fn window_pixels(
++        &self,
++        renderer: &mut GlesRenderer,
++        output: &Output,
++        mapped: &Mapped,
++        show_pointer: bool,
++    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+ 
+         let scale = Scale::from(output.current_scale().fractional_scale());
+         let alpha =
+@@ -5636,8 +5718,7 @@ impl Niri {
+             elements,
+         )?;
+ 
+-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
+-            .context("error saving screenshot")
++        Ok((geo.size, pixels))
+     }
+ 
+     pub fn save_screenshot(

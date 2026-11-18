@@ -1,0 +1,104 @@
+{
+  "hpos": {
+    "material": "liquid",
+    "liquidStrength": 100,
+    "liquidHighlight": 60,
+    "liquidSelection": true,
+    "materialIntensity": 1.5,
+    "quality": "balanced",
+    "reducedTransparency": false,
+    "appCenterAnimation": "frost"
+  },
+  "iris": {
+    "dock": {
+      "material": "inherit"
+    },
+    "widgets": {
+      "material": "glass"
+    },
+    "appearance": {
+      "surfaces": {
+        "cards": {
+          "material": ""
+        },
+        "controlCenter": {
+          "material": ""
+        },
+        "panels": {
+          "material": ""
+        },
+        "spotlight": {
+          "material": ""
+        },
+        "orbit": {
+          "material": ""
+        },
+        "menus": {
+          "material": ""
+        },
+        "gallery": {
+          "material": ""
+        },
+        "osd": {
+          "material": ""
+        }
+      },
+      "glass": {
+        "blur": 100,
+        "edgeColour": "scene",
+        "edgeLight": 34,
+        "edgeLine": 10,
+        "edgeWidth": 1.5,
+        "mode": "compositor",
+        "tint": 58
+      }
+    },
+    "bar": {
+      "composition": "cluster",
+      "position": "bottom",
+      "layout": "right",
+      "pieces": [
+        "date",
+        "time",
+        "network",
+        "battery",
+        "sound",
+        "notifications",
+        "controls"
+      ],
+      "piecesSide": "end",
+      "auxiliary": "none",
+      "trailing": "none",
+      "clockStyle": "dateTime",
+      "blockStyle": "plain",
+      "bubbleTiles": false,
+      "strip": "clear",
+      "fullStart": [
+        "workspaces",
+        "window"
+      ],
+      "fullCenter": [
+        "island"
+      ],
+      "fullEnd": [
+        "tray",
+        "notifications",
+        "sound",
+        "controls"
+      ],
+      "leftModules": [],
+      "centerModules": [],
+      "rightModules": [],
+      "satelliteGap": 6,
+      "satelliteScale": 100,
+      "margin": 20,
+      "height": 40
+    },
+    "tray": {
+      "columns": 4,
+      "face": "apps",
+      "hidePassive": false,
+      "labels": false
+    }
+  }
+}

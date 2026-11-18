@@ -1,0 +1,116 @@
+--- a/scripts/accounts.py
++++ b/scripts/accounts.py
+@@ -24,8 +24,28 @@
+         data = call(path, "org.freedesktop.DBus.Properties", "GetAll", "(s)", (USER,))[0]
+         if not data.get("SystemAccount"):
+             result.append({"username": data["UserName"], "name": data["RealName"],
++                           "uid": data["Uid"], "local": data.get("LocalAccount", False),
+                            "administrator": data["AccountType"] == 1, "locked": data["Locked"]})
+     return result
++
++def delete_account(request):
++    accounts = users()
++    target = next((user for user in accounts if user["username"] == request.get("username")
++                   and user["uid"] == request.get("uid")), None)
++    if not target or not target["local"] or target["uid"] < 1000:
++        raise ValueError("Select a local login account.")
++    uid = target["uid"]
++    if uid == os.getuid():
++        raise ValueError("Sign in with a different administrator account to delete this account.")
++    if target["administrator"] and not any(user["local"] and user["administrator"]
++            and not user["locked"] and user["uid"] != uid for user in accounts):
++        raise ValueError("Keep at least one enabled local administrator.")
++    sessions = BUS.call_sync("org.freedesktop.login1", "/org/freedesktop/login1",
++                             "org.freedesktop.login1.Manager", "ListSessions", None, None,
++                             Gio.DBusCallFlags.NONE, 10000, None).unpack()[0]
++    if any(session[1] == uid for session in sessions):
++        raise ValueError("Sign this account out of all sessions before deleting it.")
++    call(ROOT, SERVICE, "DeleteUser", "(xb)", (uid, False))
+ 
+ def password_hash(password):
+     if not isinstance(password, str) or not password or "\0" in password:
+@@ -44,6 +64,9 @@
+     action = request.get("action")
+     if action == "list":
+         return {"ok": True, "users": users()}
++    if action == "delete":
++        delete_account(request)
++        return {"ok": True, "deleted": request["username"], "users": users()}
+     username = request.get("username", "")
+     if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+         raise ValueError("Use a username beginning with a lowercase letter, followed by lowercase letters, numbers, underscores or hyphens.")
+--- a/modules/settings/AccountsConfig.qml
++++ b/modules/settings/AccountsConfig.qml
+@@ -39,6 +39,7 @@
+     property var users: []
+     property string message: ""
+     property var pending: ({})
++    property var deletion: null
+     property string selectedUser: ""
+     function request(data) {
+         if (backend.running) return
+@@ -61,7 +62,13 @@
+                 try {
+                     const result = JSON.parse(text)
+                     if (result.users) root.users = result.users
+-                    root.message = result.ok ? Translation.tr("Account information updated.") : result.error
++                    if (result.deleted) {
++                        root.selectedUser = ""
++                        root.deletion = null
++                        username.text = ""
++                        fullName.text = ""
++                    }
++                    root.message = result.deleted ? Translation.tr("Account deleted. Home folder kept.") : result.ok ? Translation.tr("Account information updated.") : result.error
+                 } catch (error) {
+                     root.message = Translation.tr("Unable to read account information.")
+                 }
+@@ -84,6 +91,8 @@
+                     Layout.fillWidth: true
+                     implicitHeight: 48
+                     onClicked: {
++                        if (backend.running) return
++                        root.deletion = null
+                         root.selectedUser = modelData.username
+                         username.text = modelData.username
+                         fullName.text = modelData.name
+@@ -136,11 +145,39 @@
+                     verticalAlignment: Text.AlignVCenter
+                 }
+             }
++            Button {
++                readonly property var account: root.users.find(u => u.username === root.selectedUser)
++                visible: !!account && account.local && account.username !== Quickshell.env("USER") && !root.deletion
++                enabled: !backend.running
++                text: Translation.tr("Delete account…")
++                onClicked: root.deletion = account
++            }
++            ColumnLayout {
++                Layout.fillWidth: true
++                visible: !!root.deletion
++                IrisText {
++                    Layout.fillWidth: true
++                    wrapMode: Text.WordWrap
++                    text: root.deletion ? Translation.tr("Delete the login account %1? Its home folder and files will be kept.").arg(root.deletion.username) : ""
++                }
++                RowLayout {
++                    Button {
++                        text: Translation.tr("Cancel")
++                        enabled: !backend.running
++                        onClicked: root.deletion = null
++                    }
++                    Button {
++                        text: Translation.tr("Delete account")
++                        enabled: !backend.running && !!root.deletion
++                        onClicked: root.request({ action: "delete", username: root.deletion.username, uid: root.deletion.uid })
++                    }
++                }
++            }
+             RippleButton {
+                 visible: !!root.selectedUser
+                 Layout.fillWidth: true
+                 implicitHeight: 42
+-                onClicked: { root.selectedUser = ""; username.text = ""; fullName.text = ""; password.text = ""; confirmation.text = "" }
++                onClicked: { root.deletion = null; root.selectedUser = ""; username.text = ""; fullName.text = ""; password.text = ""; confirmation.text = "" }
+                 contentItem: IrisText { text: Translation.tr("Add another person"); horizontalAlignment: Text.AlignHCenter }
+             }
+         }

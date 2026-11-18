@@ -1,0 +1,182 @@
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index 95eaff6..bf8ee0a 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -3516,7 +3516,18 @@ impl State {
+             }
+         }
+ 
+-        self.update_pointer_contents();
++        // An IPC desktop swipe animates the surface under a stationary cursor.
++        // Keep delivering its axis stream to the surface that started it, even
++        // when a window or the next page slides underneath the pointer.
++        let desktop_scroll = matches!(source, AxisSource::Finger | AxisSource::Continuous)
++            && !self.niri.is_locked()
++            && self.niri.output_under_cursor().is_some_and(|output| {
++                self.niri.layout.monitor_for_output(&output)
++                    .is_some_and(|monitor| monitor.desktop_touchpad_swipe_active())
++            });
++        if !desktop_scroll {
++            self.update_pointer_contents();
++        }
+ 
+         let device_scroll_factor = {
+             let config = self.niri.config.borrow();
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index dfdad6c..a5cc509 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -35,7 +35,7 @@ use crate::backend::IpcOutputMap;
+ use crate::input::pick_window_grab::PickWindowGrab;
+ use crate::layout::workspace::WorkspaceId;
+ use crate::niri::State;
+-use crate::utils::{version, with_toplevel_role};
++use crate::utils::{get_monotonic_time, version, with_toplevel_role};
+ use crate::window::Mapped;
+ 
+ // If an event stream client fails to read events fast enough that we accumulate more than this
+@@ -333,7 +333,7 @@ fn apply_desktop_swipe(state: &mut State, name: &str, owner: u64, phase: Desktop
+         return false;
+     };
+     let cancel = niri.is_locked() || niri.layout.is_overview_open();
+-    let now = niri.clock.now_unadjusted();
++    let now = get_monotonic_time();
+     let Some(monitor) = niri.layout.monitor_for_output_mut(&output) else {
+         return false;
+     };
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 992e801..1549648 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -1893,6 +1893,15 @@ impl<W: LayoutElement> Monitor<W> {
+             self.workspace_size_with_gap(1.).h
+         };
+ 
++        let desktop_bounds = gesture.desktop_swipe_owner.map(|_| {
++            let center = gesture.center_idx;
++            let previous = self.adjacent_workspace(center, false);
++            let next = self.adjacent_workspace(center, true);
++            let start = self.visible_render_index(gesture.start_idx)
++                - self.visible_render_index(center as f64);
++            (center, previous, next, start)
++        });
++
+         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
+             return None;
+         };
+@@ -1908,13 +1917,24 @@ impl<W: LayoutElement> Monitor<W> {
+         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
+         rubber_band.limit /= zoom;
+ 
+-        gesture.tracker.push(delta_y, timestamp);
+-
+-        let pos = gesture.tracker.pos() / total_height;
+-
+-        let (min, max) = gesture.min_max(self.workspaces.len());
+-        let new_idx = gesture.start_idx + pos;
+-        let new_idx = rubber_band.clamp(min, max, new_idx);
++        let new_idx = if let Some((center, previous, next, start)) = desktop_bounds {
++            // Measure travel in visible pages so the hidden minimize workspace
++            // cannot change the scroll speed between two adjacent desktops.
++            let min = if previous == center { 0. } else { -1. };
++            let max = if next == center { 0. } else { 1. };
++            let position = gesture.tracker.pos();
++            let requested = start + (position + delta_y) / total_height;
++            // Limit overscroll travel so reversing at an edge responds immediately.
++            let limited = requested.clamp(min - 0.10, max + 0.10);
++            gesture.tracker.push((limited - start) * total_height - position, timestamp);
++            let relative = rubber_band.clamp(min, max, start + gesture.tracker.pos() / total_height);
++            let span = if relative < 0. { (center - previous).max(1) } else { (next - center).max(1) };
++            center as f64 + relative * span as f64
++        } else {
++            let (min, max) = gesture.min_max(self.workspaces.len());
++            gesture.tracker.push(delta_y, timestamp);
++            rubber_band.clamp(min, max, gesture.start_idx + gesture.tracker.pos() / total_height)
++        };
+ 
+         if gesture.current_idx == new_idx {
+             return Some(false);
+@@ -2009,6 +2029,11 @@ impl<W: LayoutElement> Monitor<W> {
+         true
+     }
+ 
++    pub fn desktop_touchpad_swipe_active(&self) -> bool {
++        matches!(&self.workspace_switch, Some(WorkspaceSwitch::Gesture(gesture))
++            if gesture.desktop_swipe_owner.is_some() && gesture.is_touchpad)
++    }
++
+     pub fn desktop_swipe_begin(&mut self, owner: u64, touchpad: bool) -> bool {
+         if matches!(self.workspace_switch, Some(WorkspaceSwitch::Gesture(_))) {
+             return false;
+@@ -2068,12 +2093,24 @@ impl<W: LayoutElement> Monitor<W> {
+             self.workspace_size_with_gap(1.).h
+         };
+ 
++        let desktop_release = gesture.desktop_swipe_owner.map(|_| {
++            let center = gesture.center_idx;
++            let distance = self.visible_render_index(gesture.current_idx)
++                - self.visible_render_index(center as f64);
++            let neighbor = self.adjacent_workspace(center, distance > 0.);
++            (center, neighbor, distance)
++        });
++
+         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
+             return false;
+         };
+ 
+         // Take into account any idle time between the last event and now.
+-        let now = self.clock.now_unadjusted();
++        let now = if desktop_release.is_some() {
++            crate::utils::get_monotonic_time()
++        } else {
++            self.clock.now_unadjusted()
++        };
+         gesture.tracker.push(0., now);
+ 
+         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
+@@ -2081,21 +2118,37 @@ impl<W: LayoutElement> Monitor<W> {
+ 
+         let mut velocity = gesture.tracker.velocity() / total_height;
+         let current_pos = gesture.tracker.pos() / total_height;
+-        let pos = gesture.tracker.projected_end_pos() / total_height;
+-
+         let (min, max) = gesture.min_max(self.workspaces.len());
+-        let new_idx = gesture.start_idx + pos;
+-
+-        let new_idx = new_idx.clamp(min, max);
++        let current_idx = gesture.current_idx;
+         let new_idx = if cancel {
+             velocity = 0.;
+             self.active_workspace_idx
++        } else if let Some((center, neighbor, distance)) = desktop_release {
++            // Favor the visible position over variable IPC event timing. A
++            // fling contributes at most a small fraction of one workspace.
++            let bonus = if distance.abs() >= 0.10 && velocity.signum() == distance.signum() {
++                (velocity * 0.10).clamp(-0.20, 0.20)
++            } else {
++                0.
++            };
++            let target = if (distance + bonus).abs() >= 0.42 {
++                neighbor
++            } else {
++                center
++            };
++            velocity = velocity.clamp(-2.5, 2.5) * neighbor.abs_diff(center).max(1) as f64;
++            if velocity.signum() != (target as f64 - current_idx).signum() {
++                velocity = 0.;
++            }
++            target
+         } else {
+-            new_idx.round() as usize
++            let projected = gesture.start_idx + gesture.tracker.projected_end_pos() / total_height;
++            projected.clamp(min, max).round() as usize
+         };
+ 
+-        velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
+-        let current_idx = gesture.current_idx;
++        if desktop_release.is_none() {
++            velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
++        }
+ 
+         let new_idx = if self.workspaces[new_idx].is_minimize_stash {
+             self.adjacent_workspace(new_idx, new_idx > self.active_workspace_idx)

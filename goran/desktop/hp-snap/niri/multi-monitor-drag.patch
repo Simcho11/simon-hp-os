@@ -1,0 +1,80 @@
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 5554012..772fd89 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -5024,6 +5024,7 @@ impl<W: LayoutElement> Layout<W> {
+         &self,
+         ctx: RenderCtx<R>,
+         output: &Output,
++        output_geometry: &dyn Fn(&Output) -> Option<Rectangle<i32, Logical>>,
+         push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement<R>>),
+     ) {
+         if self.update_render_elements_time != self.clock.now() {
+@@ -5035,6 +5036,35 @@ impl<W: LayoutElement> Layout<W> {
+         };
+ 
+         if &move_.output != output {
++            // hp-snap patch: a window dragged across monitors shows on every monitor it overlaps
++            // (like Windows), not only the one under the pointer. Its render elements are built
++            // at its own output's scale; place and rescale them for this output.
++            let zoom = self.overview_zoom();
++            if zoom != 1. {
++                return;
++            }
++            let (Some(from), Some(to)) = (output_geometry(&move_.output), output_geometry(output))
++            else {
++                return;
++            };
++            let delta = (from.loc - to.loc).to_f64();
++            let pos = move_.tile_render_location(zoom) + delta;
++            let visible = Rectangle::new(pos, move_.tile.tile_size())
++                .intersection(Rectangle::from_size(to.size.to_f64()));
++            if visible.is_none() {
++                return;
++            }
++            let from_scale = move_.output.current_scale().fractional_scale();
++            let to_scale = output.current_scale().fractional_scale();
++            let factor = to_scale / from_scale;
++            // Rendered at `pos * factor` in the tile's scale and shrunk/grown by `factor` around
++            // that point, the tile lands at `pos` in this output's scale, at this output's size.
++            let location = pos.upscale(factor);
++            let origin = location.to_physical_precise_round(Scale::from(from_scale));
++            let xray_pos = XrayPos::new(location, zoom);
++            move_.tile.render(ctx, location, xray_pos, true, &mut |elem| {
++                push(RescaleRenderElement::from_element(elem, origin, factor));
++            });
+             return;
+         }
+ 
+diff --git a/src/niri.rs b/src/niri.rs
+index 01231ed..fa760ae 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -4409,7 +4409,12 @@ impl Niri {
+         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
+         if mon.render_above_top_layer() {
+             self.layout
+-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
++                .render_interactive_move_for_output(
++                    ctx.r(),
++                    output,
++                    &|output| self.global_space.output_geometry(output),
++                    &mut |elem| push(elem.into()),
++                );
+ 
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 
+@@ -4432,7 +4437,12 @@ impl Niri {
+             push_normal_from_layer!(Layer::Top);
+ 
+             self.layout
+-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
++                .render_interactive_move_for_output(
++                    ctx.r(),
++                    output,
++                    &|output| self.global_space.output_geometry(output),
++                    &mut |elem| push(elem.into()),
++                );
+ 
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 

@@ -1,0 +1,334 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index caa1a62..8655345 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -65,6 +65,10 @@ pub mod state;
+ #[derive(Debug, Serialize, Deserialize, Clone)]
+ #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+ pub enum Request {
++    /// Query whether the compositor supports direct desktop workspace gestures.
++    DesktopSwipeSupported,
++    /// Drive a workspace swipe. The compositor cancels it if this connection closes.
++    DesktopSwipe(DesktopSwipe),
+     /// Request the version string for the running niri instance.
+     Version,
+     /// Request information about connected outputs.
+@@ -121,6 +125,18 @@ pub enum Request {
+     Casts,
+ }
+ 
++/// A phase of an interactive swipe from the desktop surface.
++#[derive(Debug, Serialize, Deserialize, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub enum DesktopSwipe {
++    /// Start on this output using native touchpad or touchscreen scaling.
++    Begin { output: String, touchpad: bool },
++    /// Move by this amount in logical input units.
++    Update { delta: f64 },
++    /// Settle to a workspace, or return to the one where the swipe began.
++    End { cancel: bool },
++}
++
+ /// Reply from niri to client.
+ ///
+ /// Every request gets one reply.
+@@ -1334,6 +1350,9 @@ pub struct Window {
+     pub pid: Option<i32>,
+     /// Id of the workspace this window is on, if any.
+     pub workspace_id: Option<u64>,
++    /// Home workspace of a natively minimized window.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub minimized_from_workspace_id: Option<u64>,
+     /// Whether this window is currently focused.
+     ///
+     /// There can be either one focused window or zero (e.g. when a layer-shell surface has focus).
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index a835327..252375a 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -4,6 +4,7 @@ use std::ffi::OsStr;
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::{Path, PathBuf};
+ use std::rc::Rc;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::{env, io, process};
+ 
+@@ -17,7 +18,7 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
+ use niri_config::OutputName;
+ use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
+ use niri_ipc::{
+-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
++    Action, DesktopSwipe, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
+     Timestamp, WindowLayout, Workspace,
+ };
+ use smithay::desktop::layer_map_for_output;
+@@ -187,6 +188,7 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
+ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> anyhow::Result<()> {
+     let (read, mut write) = stream.split();
+     let mut read = BufReader::new(read);
++    let mut swipe = DesktopSwipeClient::new(ctx.event_loop.clone());
+ 
+     loop {
+         // Don't keep buf around to avoid clients wasting RAM by filling it with bogus data.
+@@ -209,6 +211,7 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
+         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+ 
+         let reply = match request {
++            Ok(Request::DesktopSwipe(phase)) => swipe.handle(phase).await,
+             Ok(request) => process(&ctx, request).await,
+             Err(err) => Err(err),
+         };
+@@ -268,8 +271,90 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
+     }
+ }
+ 
++struct DesktopSwipeClient {
++    owner: u64,
++    event_loop: LoopHandle<'static, State>,
++    output: Option<String>,
++}
++
++impl DesktopSwipeClient {
++    fn new(event_loop: LoopHandle<'static, State>) -> Self {
++        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
++        Self { owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed), event_loop, output: None }
++    }
++
++    async fn handle(&mut self, phase: DesktopSwipe) -> Reply {
++        let output = match &phase {
++            DesktopSwipe::Begin { output, .. } if self.output.is_none() => output.clone(),
++            DesktopSwipe::Begin { .. } => return Err("desktop swipe already active".into()),
++            _ => match self.output.clone() {
++                Some(output) => output,
++                None => return Ok(Response::Handled),
++            },
++        };
++        let begin = matches!(phase, DesktopSwipe::Begin { .. });
++        let end = matches!(phase, DesktopSwipe::End { .. });
++        // Remember the output before awaiting Begin so disconnects always cancel it.
++        if begin {
++            self.output = Some(output.clone());
++        }
++        let owner = self.owner;
++        let (tx, rx) = async_channel::bounded(1);
++        self.event_loop.insert_idle(move |state| {
++            let applied = apply_desktop_swipe(state, &output, owner, phase);
++            let _ = tx.try_send(applied);
++        });
++        let applied = rx.recv().await.unwrap_or(false);
++        if end || (begin && !applied) {
++            self.output = None;
++        }
++        if begin && !applied {
++            Err("desktop swipe unavailable on this output".into())
++        } else {
++            Ok(Response::Handled)
++        }
++    }
++}
++
++impl Drop for DesktopSwipeClient {
++    fn drop(&mut self) {
++        if let Some(output) = self.output.take() {
++            let owner = self.owner;
++            self.event_loop.insert_idle(move |state| {
++                apply_desktop_swipe(state, &output, owner, DesktopSwipe::End { cancel: true });
++            });
++        }
++    }
++}
++
++fn apply_desktop_swipe(state: &mut State, name: &str, owner: u64, phase: DesktopSwipe) -> bool {
++    let niri = &mut state.niri;
++    let Some(output) = niri.global_space.outputs().find(|output| output.name() == name).cloned() else {
++        return false;
++    };
++    let cancel = niri.is_locked() || niri.layout.is_overview_open();
++    let now = niri.clock.now_unadjusted();
++    let Some(monitor) = niri.layout.monitor_for_output_mut(&output) else {
++        return false;
++    };
++    let changed = match phase {
++        DesktopSwipe::Begin { touchpad, .. } => !cancel && monitor.desktop_swipe_begin(owner, touchpad),
++        DesktopSwipe::Update { delta } if !cancel && delta.is_finite() => {
++            monitor.desktop_swipe_update(owner, delta.clamp(-1200., 1200.), now)
++        }
++        DesktopSwipe::Update { .. } => monitor.desktop_swipe_end(owner, true),
++        DesktopSwipe::End { cancel: requested } => monitor.desktop_swipe_end(owner, cancel || requested),
++    };
++    if changed {
++        niri.queue_redraw(&output);
++    }
++    changed
++}
++
+ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+     let response = match request {
++        Request::DesktopSwipeSupported => Response::Handled,
++        Request::DesktopSwipe(_) => unreachable!("desktop swipes are connection-scoped"),
+         Request::ReturnError => return Err(String::from("example compositor error")),
+         Request::Version => Response::Version(version()),
+         Request::Outputs => {
+@@ -532,6 +617,7 @@ fn ipc_workspaces<W: crate::layout::LayoutElement>(
+ fn make_ipc_window(
+     mapped: &Mapped,
+     workspace_id: Option<WorkspaceId>,
++    minimized_from_workspace_id: Option<WorkspaceId>,
+     layout: WindowLayout,
+ ) -> niri_ipc::Window {
+     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
+@@ -540,6 +626,7 @@ fn make_ipc_window(
+         app_id: role.app_id.clone(),
+         pid: mapped.credentials().map(|c| c.pid),
+         workspace_id: workspace_id.map(|id| id.get()),
++        minimized_from_workspace_id: minimized_from_workspace_id.map(|id| id.get()),
+         is_focused: mapped.is_focused(),
+         is_floating: mapped.is_floating(),
+         is_urgent: mapped.is_urgent(),
+@@ -721,7 +808,8 @@ impl State {
+         let mut focused_id = None;
+         layout.with_windows(|mapped, _, ws_id, window_layout| {
+             let id = mapped.id().get();
+-            let ws_id = ws_id.filter(|_| !layout.is_minimized(&mapped.window));
++            let minimized_from = layout.minimized_origin(&mapped.window);
++            let ws_id = ws_id.filter(|_| minimized_from.is_none());
+             seen.insert(id);
+ 
+             if mapped.is_focused() {
+@@ -729,21 +817,23 @@ impl State {
+             }
+ 
+             let Some(ipc_win) = state.windows.get(&id) else {
+-                let window = make_ipc_window(mapped, ws_id, window_layout);
++                let window = make_ipc_window(mapped, ws_id, minimized_from, window_layout);
+                 events.push(Event::WindowOpenedOrChanged { window });
+                 return;
+             };
+ 
+             let workspace_id = ws_id.map(|id| id.get());
+             let mut changed =
+-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
++                ipc_win.workspace_id != workspace_id
++                    || ipc_win.minimized_from_workspace_id != minimized_from.map(|id| id.get())
++                    || ipc_win.is_floating != mapped.is_floating();
+ 
+             changed |= with_toplevel_role(mapped.toplevel(), |role| {
+                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
+             });
+ 
+             if changed {
+-                let window = make_ipc_window(mapped, ws_id, window_layout);
++                let window = make_ipc_window(mapped, ws_id, minimized_from, window_layout);
+                 events.push(Event::WindowOpenedOrChanged { window });
+                 return;
+             }
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 72cffdc..977fff4 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1564,7 +1564,11 @@ impl<W: LayoutElement> Layout<W> {
+ 
+     /// hp-snap patch: whether the window is minimized.
+     pub fn is_minimized(&self, window: &W::Id) -> bool {
+-        self.minimized.iter().any(|(id, _)| id == window)
++        self.minimized_origin(window).is_some()
++    }
++
++    pub fn minimized_origin(&self, window: &W::Id) -> Option<WorkspaceId> {
++        self.minimized.iter().find_map(|(id, origin)| (id == window).then_some(*origin))
+     }
+ 
+     /// Locate the window before creating a private holding workspace on its monitor.
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index cb92cdc..992e801 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -114,6 +114,8 @@ pub struct WorkspaceSwitchGesture {
+     tracker: SwipeTracker,
+     /// Whether the gesture is controlled by the touchpad.
+     is_touchpad: bool,
++    // The IPC connection that owns a desktop swipe. Native gestures leave this empty.
++    desktop_swipe_owner: Option<u64>,
+     /// Whether the gesture is clamped to +-1 workspace around the center.
+     is_clamped: bool,
+ 
+@@ -1829,6 +1831,7 @@ impl<W: LayoutElement> Monitor<W> {
+             animation: None,
+             tracker: SwipeTracker::new(),
+             is_touchpad,
++            desktop_swipe_owner: None,
+             is_clamped: !self.overview_open,
+             dnd_last_event_time: None,
+             dnd_nonzero_start_time: None,
+@@ -1861,6 +1864,7 @@ impl<W: LayoutElement> Monitor<W> {
+             animation: None,
+             tracker: SwipeTracker::new(),
+             is_touchpad: false,
++            desktop_swipe_owner: None,
+             is_clamped: false,
+             dnd_last_event_time: Some(self.clock.now_unadjusted()),
+             dnd_nonzero_start_time: None,
+@@ -2005,7 +2009,48 @@ impl<W: LayoutElement> Monitor<W> {
+         true
+     }
+ 
++    pub fn desktop_swipe_begin(&mut self, owner: u64, touchpad: bool) -> bool {
++        if matches!(self.workspace_switch, Some(WorkspaceSwitch::Gesture(_))) {
++            return false;
++        }
++        self.workspace_switch_gesture_begin(touchpad);
++        if let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch {
++            gesture.desktop_swipe_owner = Some(owner);
++        }
++        true
++    }
++
++    pub fn desktop_swipe_update(&mut self, owner: u64, delta: f64, now: Duration) -> bool {
++        let Some(WorkspaceSwitch::Gesture(gesture)) = &self.workspace_switch else {
++            return false;
++        };
++        if gesture.desktop_swipe_owner != Some(owner) {
++            return false;
++        }
++        self.workspace_switch_gesture_update(delta, now, gesture.is_touchpad)
++            .unwrap_or(false)
++    }
++
++    pub fn desktop_swipe_end(&mut self, owner: u64, cancel: bool) -> bool {
++        if !matches!(&self.workspace_switch, Some(WorkspaceSwitch::Gesture(gesture))
++            if gesture.desktop_swipe_owner == Some(owner))
++        {
++            return false;
++        }
++        self.finish_workspace_switch(None, cancel)
++    }
++
+     pub fn workspace_switch_gesture_end(&mut self, is_touchpad: Option<bool>) -> bool {
++        if matches!(&self.workspace_switch, Some(WorkspaceSwitch::Gesture(gesture))
++            if gesture.desktop_swipe_owner.is_some())
++        {
++            // A native input stream ending must not commit another client's swipe.
++            return false;
++        }
++        self.finish_workspace_switch(is_touchpad, false)
++    }
++
++    fn finish_workspace_switch(&mut self, is_touchpad: Option<bool>, cancel: bool) -> bool {
+         let Some(WorkspaceSwitch::Gesture(gesture)) = &self.workspace_switch else {
+             return false;
+         };
+@@ -2042,7 +2087,12 @@ impl<W: LayoutElement> Monitor<W> {
+         let new_idx = gesture.start_idx + pos;
+ 
+         let new_idx = new_idx.clamp(min, max);
+-        let new_idx = new_idx.round() as usize;
++        let new_idx = if cancel {
++            velocity = 0.;
++            self.active_workspace_idx
++        } else {
++            new_idx.round() as usize
++        };
+ 
+         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
+         let current_idx = gesture.current_idx;

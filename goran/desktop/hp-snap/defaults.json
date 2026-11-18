@@ -1,0 +1,31 @@
+{
+  "dock": {
+    "pinnedApps": [
+      "org.kde.dolphin",
+      "hp-os-trash",
+      "hp-os-settings"
+    ]
+  },
+  "hpos": {
+    "appearance": "light"
+  },
+  "settingsUi": {
+    "easyMode": true
+  },
+  "iris": {
+    "appearance": {
+      "settingsHost": "window"
+    }
+  },
+  "lock": {
+    "materialShapeChars": false
+  },
+  "background": {
+    "widgets": {
+      "editGrid": {
+        "size": 8,
+        "snap": true
+      }
+    }
+  }
+}

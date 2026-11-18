@@ -1,0 +1,761 @@
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -46,6 +46,7 @@
+ use touch_swipe_tracker::{GestureEvent, SwipeDirection};
+ 
+ use self::move_grab::MoveGrab;
++use self::overview_workspace_grab::OverviewWorkspaceGrab;
+ use self::pick_color_grab::PickColorGrab;
+ use self::pick_window_grab::PickWindowGrab;
+ use self::resize_grab::ResizeGrab;
+@@ -62,6 +63,7 @@
+ 
+ pub mod backend_ext;
+ pub mod move_grab;
++pub(crate) mod overview_workspace_grab;
+ pub mod pick_color_grab;
+ pub mod pick_window_grab;
+ pub mod resize_grab;
+@@ -2901,6 +2903,17 @@
+             self.niri.tablet_cursor_location = None;
+ 
+             let is_overview_open = self.niri.layout.is_overview_open();
++
++            if button == Some(MouseButton::Left) && !pointer.is_grabbed() {
++                let location = pointer.current_location();
++                if let Some((output, control)) = self.niri.overview_workspace_control_at(location) {
++                    let start = PointerGrabStartData { focus: None, button: button_code, location };
++                    let grab = OverviewWorkspaceGrab::new(start, output, control);
++                    pointer.set_grab(self, grab, serial, Focus::Clear);
++                    self.niri.queue_redraw_all();
++                    return;
++                }
++            }
+ 
+             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
+                 if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+@@ -5090,7 +5103,10 @@
+     fn grab_can_be_cancelled_with_esc(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
+         let grab = grab.as_any();
+ 
+-        grab.is::<PickWindowGrab>() || grab.is::<PickColorGrab>() || Self::is_dnd_grab(grab)
++        grab.is::<PickWindowGrab>()
++            || grab.is::<PickColorGrab>()
++            || grab.is::<OverviewWorkspaceGrab>()
++            || Self::is_dnd_grab(grab)
+     }
+ }
+ 
+--- /dev/null
++++ b/src/input/overview_workspace_grab.rs
+@@ -0,0 +1,212 @@
++use smithay::backend::input::ButtonState;
++use smithay::input::pointer::{
++    AxisFrame, ButtonEvent, CursorImageStatus, CursorIcon, GestureHoldBeginEvent,
++    GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
++    GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
++    GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
++};
++use smithay::input::SeatHandler;
++use smithay::output::Output;
++use smithay::utils::{Logical, Point};
++
++use crate::layout::workspace::WorkspaceId;
++use crate::niri::State;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum WorkspaceControl {
++    Add,
++    Remove(WorkspaceId),
++    Reorder(WorkspaceId),
++}
++
++pub(crate) struct OverviewWorkspaceGrab {
++    start: GrabStartData<State>,
++    output: Output,
++    control: WorkspaceControl,
++    dragging: bool,
++}
++
++impl OverviewWorkspaceGrab {
++    pub fn new(start: GrabStartData<State>, output: Output, control: WorkspaceControl) -> Self {
++        Self { start, output, control, dragging: false }
++    }
++
++    fn finish(&self, state: &mut State, location: Point<f64, Logical>) {
++        if !state.niri.overview_workspace_controls_enabled() {
++            return;
++        }
++        let Some((output, local)) = state.niri.output_under(location) else {
++            return;
++        };
++        if output != &self.output {
++            return;
++        }
++
++        if self.dragging {
++            let (WorkspaceControl::Remove(id) | WorkspaceControl::Reorder(id)) = self.control else {
++                return;
++            };
++            let target = state.niri.overview_workspace_drop_target(output, local, id);
++            if let Some((target, _)) = target {
++                if let Some(mon) = state.niri.layout.monitor_for_output_mut(&self.output) {
++                    mon.overview_reorder_workspace(id, target);
++                }
++            }
++        } else if state.niri.overview_workspace_control_at(location)
++            .is_some_and(|(output, control)| output == self.output && control == self.control)
++        {
++            match self.control {
++                WorkspaceControl::Add => {
++                    state.niri.layout.focus_output(&self.output);
++                    if let Some(mon) = state.niri.layout.monitor_for_output_mut(&self.output) {
++                        mon.overview_add_workspace();
++                    }
++                }
++                WorkspaceControl::Remove(id) => {
++                    state.niri.layout.overview_remove_workspace(&self.output, id);
++                }
++                WorkspaceControl::Reorder(_) => {}
++            }
++        }
++    }
++}
++
++impl PointerGrab<State> for OverviewWorkspaceGrab {
++    fn motion(
++        &mut self,
++        state: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
++        event: &MotionEvent,
++    ) {
++        handle.motion(state, None, event);
++        if let WorkspaceControl::Remove(id) | WorkspaceControl::Reorder(id) = self.control {
++            let delta = event.location - self.start.location;
++            if !self.dragging && delta.x * delta.x + delta.y * delta.y >= 64. {
++                self.dragging = true;
++                state.niri.overview_workspace_drag = Some((self.output.clone(), id));
++                state.niri.cursor_manager.set_cursor_image(
++                    CursorImageStatus::Named(CursorIcon::Grabbing),
++                );
++            }
++        }
++    }
++
++    fn relative_motion(
++        &mut self,
++        state: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
++        event: &RelativeMotionEvent,
++    ) {
++        handle.relative_motion(state, None, event);
++    }
++
++    fn button(
++        &mut self,
++        state: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &ButtonEvent,
++    ) {
++        if event.button == self.start.button && event.state == ButtonState::Released {
++            self.finish(state, handle.current_location());
++            handle.unset_grab(self, state, event.serial, event.time, true);
++        }
++    }
++
++    fn axis(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        details: AxisFrame,
++    ) {
++        handle.axis(data, details);
++    }
++
++    fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
++        handle.frame(data);
++
++    }
++
++    fn gesture_swipe_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeBeginEvent,
++    ) {
++        handle.gesture_swipe_begin(data, event);
++    }
++
++    fn gesture_swipe_update(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeUpdateEvent,
++    ) {
++        handle.gesture_swipe_update(data, event);
++    }
++
++    fn gesture_swipe_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeEndEvent,
++    ) {
++        handle.gesture_swipe_end(data, event);
++    }
++
++    fn gesture_pinch_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchBeginEvent,
++    ) {
++        handle.gesture_pinch_begin(data, event);
++    }
++
++    fn gesture_pinch_update(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchUpdateEvent,
++    ) {
++        handle.gesture_pinch_update(data, event);
++    }
++
++    fn gesture_pinch_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchEndEvent,
++    ) {
++        handle.gesture_pinch_end(data, event);
++    }
++
++    fn gesture_hold_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureHoldBeginEvent,
++    ) {
++        handle.gesture_hold_begin(data, event);
++    }
++
++    fn gesture_hold_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureHoldEndEvent,
++    ) {
++        handle.gesture_hold_end(data, event);
++    }
++
++    fn start_data(&self) -> &GrabStartData<State> {
++        &self.start
++    }
++
++    fn unset(&mut self, state: &mut State) {
++        state.niri.overview_workspace_drag = None;
++        state.niri.cursor_manager.set_cursor_image(CursorImageStatus::default_named());
++        state.niri.queue_redraw_all();
++    }
++}
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -797,7 +797,7 @@
+                         // The user could've closed a window while remaining on this workspace, on
+                         // another monitor. However, we will add an empty workspace in the end
+                         // instead.
+-                        if ws.has_windows_or_name() {
++                        if ws.is_retained() {
+                             workspaces.push(ws);
+                         }
+ 
+@@ -1215,7 +1215,7 @@
+                             let removed = ws.remove_tile(window, transaction);
+ 
+                             // Clean up empty workspaces that are not active and not last.
+-                            if !ws.has_windows_or_name()
++                            if !ws.is_retained()
+                                 && idx != mon.active_workspace_idx
+                                 && idx != mon.workspaces.len() - 1
+                                 && mon.workspace_switch.is_none()
+@@ -1233,8 +1233,8 @@
+                                 && mon.workspaces.len() == 2
+                                 && mon.workspace_switch.is_none()
+                             {
+-                                assert!(!mon.workspaces[0].has_windows_or_name());
+-                                assert!(!mon.workspaces[1].has_windows_or_name());
++                                assert!(!mon.workspaces[0].is_retained());
++                                assert!(!mon.workspaces[1].is_retained());
+                                 mon.workspaces.remove(1);
+                                 mon.active_workspace_idx = 0;
+                             }
+@@ -1249,7 +1249,7 @@
+                         let removed = ws.remove_tile(window, transaction);
+ 
+                         // Clean up empty workspaces.
+-                        if !ws.has_windows_or_name() {
++                        if !ws.is_retained() {
+                             workspaces.remove(idx);
+                         }
+ 
+@@ -1971,6 +1971,19 @@
+         monitors.iter()
+     }
+ 
++    pub(crate) fn overview_remove_workspace(&mut self, output: &Output, id: WorkspaceId) {
++        let Some(target) = self.monitor_for_output_mut(output)
++            .and_then(|monitor| monitor.overview_remove_workspace(id))
++        else {
++            return;
++        };
++        for (_, origin) in &mut self.minimized {
++            if *origin == id {
++                *origin = target;
++            }
++        }
++    }
++
+     pub fn monitors_mut(&mut self) -> impl Iterator<Item = &mut Monitor<W>> + '_ {
+         let monitors = if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+             &mut monitors[..]
+@@ -2675,7 +2688,7 @@
+             MonitorSet::NoOutputs { workspaces } => {
+                 for workspace in workspaces {
+                     assert!(
+-                        workspace.has_windows_or_name(),
++                        workspace.is_retained(),
+                         "with no outputs there cannot be empty unnamed workspaces"
+                     );
+ 
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -310,7 +310,7 @@
+         let mut active_workspace_idx = 0;
+ 
+         for (idx, ws) in workspaces.iter_mut().enumerate() {
+-            assert!(ws.has_windows_or_name());
++            assert!(ws.is_retained());
+ 
+             ws.set_output(Some(output.clone()));
+             ws.update_config(options.clone());
+@@ -352,7 +352,7 @@
+     }
+ 
+     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
+-        self.workspaces.retain(|ws| ws.has_windows_or_name());
++        self.workspaces.retain(|ws| ws.is_retained());
+ 
+         for ws in &mut self.workspaces {
+             ws.set_output(None);
+@@ -455,6 +455,93 @@
+         if let Some(switch) = &mut self.workspace_switch {
+             if idx as f64 <= switch.target_idx() {
+                 switch.offset(1);
++            }
++        }
++    }
++
++    pub(crate) fn overview_add_slot(&self) -> usize {
++        self.workspaces.len() - 1
++    }
++
++    pub(crate) fn overview_workspace_index(&self, id: WorkspaceId) -> Option<usize> {
++        self.workspaces.iter().position(|ws| ws.id() == id)
++    }
++
++    pub(crate) fn overview_can_manage(&self, idx: usize) -> bool {
++        !self.workspaces[idx].is_minimize_stash
++            && idx + 1 < self.workspaces.len()
++            && (!self.options.layout.empty_workspace_above_first || idx > 0)
++    }
++
++    pub(crate) fn overview_add_workspace(&mut self) {
++        let idx = self.workspaces.len() - 1;
++        self.add_workspace_at(idx);
++        self.workspaces[idx].keep_empty = true;
++        if idx == 0 && self.options.layout.empty_workspace_above_first {
++            self.add_workspace_top();
++            self.activate_workspace(1);
++        } else {
++            self.activate_workspace(idx);
++        }
++    }
++
++    pub(super) fn overview_remove_workspace(
++        &mut self,
++        id: WorkspaceId,
++    ) -> Option<WorkspaceId> {
++        let idx = self.workspaces.iter().position(|ws| ws.id() == id)?;
++        if !self.overview_can_manage(idx) {
++            return None;
++        }
++
++        let target_idx = self.visible_workspace_indices().rev()
++            .find(|&other| other < idx && self.overview_can_manage(other) && self.workspaces[other].is_retained())
++            .or_else(|| self.visible_workspace_indices()
++                .find(|&other| other > idx && self.overview_can_manage(other) && self.workspaces[other].is_retained()))
++            .unwrap_or(self.workspaces.len() - 1);
++        let target = self.workspaces[target_idx].id();
++        let was_active = self.active_workspace_idx == idx;
++        let mut removed = self.remove_workspace_by_idx(idx);
++        let target_idx = self.workspaces.iter().position(|ws| ws.id() == target)
++            .unwrap_or(self.active_workspace_idx);
++        let target = self.workspaces[target_idx].id();
++
++        let minimized = removed.minimized_from_here;
++        self.workspaces[target_idx].minimized_from_here += minimized;
++        if minimized != 0 && target_idx == self.workspaces.len() - 1 {
++            self.add_workspace_bottom();
++        }
++        if minimized != 0 && target_idx == 0 && self.options.layout.empty_workspace_above_first {
++            self.add_workspace_top();
++        }
++        let windows: Vec<_> = removed.windows().map(|window| window.id().clone()).collect();
++        for window in windows {
++            let tile = removed.remove_tile(&window, Transaction::new());
++            self.add_tile(
++                tile.tile,
++                MonitorAddWindowTarget::Workspace { id: target, column_idx: None },
++                ActivateWindow::No,
++                true,
++                tile.width,
++                tile.is_full_width,
++                tile.is_floating,
++            );
++        }
++        if was_active {
++            if let Some(idx) = self.overview_workspace_index(target) {
++                self.activate_workspace(idx);
++            }
++        }
++        Some(target)
++    }
++
++    pub(crate) fn overview_reorder_workspace(&mut self, id: WorkspaceId, target: WorkspaceId) {
++        let lookup = |id| self.workspaces.iter().position(|ws| ws.id() == id);
++        if let (Some(from), Some(to)) = (lookup(id), lookup(target)) {
++            if self.overview_can_manage(from) && self.overview_can_manage(to) {
++                let empty = !self.workspaces[from].has_windows();
++                self.workspaces[from].keep_empty |= empty;
++                self.move_workspace_to_idx(from, to);
+             }
+         }
+     }
+@@ -676,7 +763,7 @@
+                 continue;
+             }
+ 
+-            if !self.workspaces[idx].has_windows_or_name() {
++            if !self.workspaces[idx].is_retained() {
+                 self.workspaces.remove(idx);
+                 if self.active_workspace_idx > idx {
+                     self.active_workspace_idx -= 1;
+@@ -687,8 +774,8 @@
+         // Special case handling when empty_workspace_above_first is set and all workspaces
+         // are empty.
+         if self.options.layout.empty_workspace_above_first && self.workspaces.len() == 2 {
+-            assert!(!self.workspaces[0].has_windows_or_name());
+-            assert!(!self.workspaces[1].has_windows_or_name());
++            assert!(!self.workspaces[0].is_retained());
++            assert!(!self.workspaces[1].is_retained());
+             self.workspaces.remove(1);
+             self.active_workspace_idx = 0;
+         }
+@@ -783,7 +870,7 @@
+         // If empty_workspace_above_first is set and the first workspace is now no longer empty,
+         // add a new empty workspace on top.
+         if self.options.layout.empty_workspace_above_first
+-            && self.workspaces[0].has_windows_or_name()
++            && self.workspaces[0].is_retained()
+         {
+             self.add_workspace_top();
+         }
+@@ -2274,7 +2361,7 @@
+             {
+                 if idx != self.active_workspace_idx {
+                     assert!(
+-                        ws.has_windows_or_name(),
++                        ws.is_retained(),
+                         "non-active workspace can't be empty and unnamed except the last one"
+                     );
+                 }
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3993,3 +3993,48 @@
+         check_ops_with_options(options, ops);
+     }
+ }
++
++#[test]
++fn overview_add_reorder_and_remove_workspaces() {
++    let mut layout = check_ops([Op::AddOutput(1), Op::AddOutput(2)]);
++    let output = layout.outputs().next().unwrap().clone();
++    let monitor = layout.monitor_for_output_mut(&output).unwrap();
++
++    monitor.overview_add_workspace();
++    let first = monitor.active_workspace_ref().id();
++    monitor.overview_add_workspace();
++    let second = monitor.active_workspace_ref().id();
++    monitor.overview_reorder_workspace(second, first);
++    assert_eq!(monitor.workspaces[0].id(), second);
++    assert_eq!(monitor.workspaces[1].id(), first);
++    assert_eq!(monitor.active_workspace_ref().id(), second);
++    layout.verify_invariants();
++
++    for (id, floating) in [(1, false), (2, true), (3, false)] {
++        layout.add_window(
++            TestWindow::new(TestWindowParams::new(id)),
++            AddWindowTarget::Workspace(first),
++            None,
++            None,
++            false,
++            floating,
++            ActivateWindow::No,
++        );
++    }
++    assert!(layout.minimize_window(&3));
++    layout.overview_remove_workspace(&output, first);
++    let (_, destination) = layout.find_workspace_by_id(second).unwrap();
++    assert!(destination.has_window(&1));
++    assert!(destination.has_window(&2));
++    assert_eq!(layout.minimized_origin(&3), Some(second));
++    assert!(layout.find_workspace_by_id(first).is_none());
++    assert_eq!(layout.monitors().nth(1).unwrap().workspaces.len(), 1);
++    layout.verify_invariants();
++
++    layout.overview_remove_workspace(&output, second);
++    assert!(layout.find_workspace_by_id(second).is_none());
++    assert!(layout.has_window(&1));
++    assert!(layout.has_window(&2));
++    assert!(layout.is_minimized(&3));
++    layout.verify_invariants();
++}
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -49,6 +49,9 @@
+ 
+     // Retain an otherwise empty desktop until its last minimized window is restored or closed.
+     pub(super) minimized_from_here: usize,
++
++    // Workspaces created explicitly in the Overview survive when empty.
++    pub(super) keep_empty: bool,
+     /// The scrollable-tiling layout.
+     scrolling: ScrollingSpace<W>,
+ 
+@@ -263,6 +266,7 @@
+             floating,
+             is_minimize_stash: false,
+             minimized_from_here: 0,
++            keep_empty: false,
+             floating_is_active: FloatingActive::No,
+             original_output,
+             scale,
+@@ -329,6 +333,7 @@
+             floating,
+             is_minimize_stash: false,
+             minimized_from_here: 0,
++            keep_empty: false,
+             floating_is_active: FloatingActive::No,
+             output: None,
+             scale,
+@@ -363,8 +368,8 @@
+         self.name = None;
+     }
+ 
+-    pub fn has_windows_or_name(&self) -> bool {
+-        self.has_windows() || self.name.is_some() || self.minimized_from_here != 0
++    pub fn is_retained(&self) -> bool {
++        self.has_windows() || self.name.is_some() || self.minimized_from_here != 0 || self.keep_empty
+     }
+ 
+     pub fn scale(&self) -> smithay::output::Scale {
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -155,6 +155,7 @@
+ use crate::render_helpers::debug::push_opaque_regions;
+ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+ use crate::render_helpers::renderer::NiriRenderer;
++use crate::input::overview_workspace_grab::WorkspaceControl;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+ use crate::render_helpers::surface::push_elements_from_surface_tree;
+ use crate::render_helpers::texture::TextureBuffer;
+@@ -327,6 +328,7 @@
+     pub suppressed_keys: HashSet<Keycode>,
+     /// Button codes of the mouse buttons to suppress.
+     pub suppressed_buttons: HashSet<u32>,
++    pub(crate) overview_workspace_drag: Option<(Output, WorkspaceId)>,
+     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
+     pub bind_repeat_timer: Option<RegistrationToken>,
+     pub keyboard_focus: KeyboardFocus,
+@@ -2614,6 +2616,7 @@
+             popup_grab: None,
+             suppressed_keys: HashSet::new(),
+             suppressed_buttons: HashSet::new(),
++            overview_workspace_drag: None,
+             bind_cooldown_timers: HashMap::new(),
+             bind_repeat_timer: Option::default(),
+             presentation_state,
+@@ -3347,6 +3350,144 @@
+         self.window_under(pos)
+     }
+ 
++    pub(crate) fn overview_workspace_controls_enabled(&self) -> bool {
++        self.layout.is_overview_open()
++            && !self.is_locked()
++            && !self.exit_confirm_dialog.is_open()
++            && !self.screenshot_ui.is_open()
++            && !self.window_mru_ui.is_open()
++    }
++
++    fn overview_workspace_controls<'a>(
++        &'a self,
++        output: &Output,
++    ) -> impl Iterator<Item = (WorkspaceControl, Rectangle<f64, Logical>)> + 'a {
++        self.layout.monitor_for_output(output).into_iter().flat_map(|mon| {
++            mon.workspaces_with_render_geo_idx().flat_map(move |((idx, ws), geo)| {
++                let size = 28.;
++                let rect = |x, y| Rectangle::new(geo.loc + Point::from((x, y)), (size, size).into());
++                let (primary, grip) = if mon.overview_can_manage(idx) {
++                    let x = geo.size.w - size - 6.;
++                    (
++                        Some((WorkspaceControl::Remove(ws.id()), rect(x, 6.))),
++                        Some((WorkspaceControl::Reorder(ws.id()), rect(x - size - 4., 6.))),
++                    )
++                } else if idx == mon.overview_add_slot() {
++                    (
++                        Some((
++                            WorkspaceControl::Add,
++                            rect((geo.size.w - size) / 2., (geo.size.h - size) / 2.),
++                        )),
++                        None,
++                    )
++                } else {
++                    (None, None)
++                };
++                [primary, grip].into_iter().flatten()
++            })
++        })
++    }
++
++    pub(crate) fn overview_workspace_control_at(
++        &self,
++        pos: Point<f64, Logical>,
++    ) -> Option<(Output, WorkspaceControl)> {
++        if !self.overview_workspace_controls_enabled() {
++            return None;
++        }
++        let (output, local) = self.output_under(pos)?;
++        if self.contents_under(pos).layer.is_some() {
++            return None;
++        }
++        self.overview_workspace_controls(output)
++            .find_map(|(control, rect)| rect.contains(local).then_some((output.clone(), control)))
++    }
++
++    pub(crate) fn overview_workspace_drop_target(
++        &self,
++        output: &Output,
++        pos: Point<f64, Logical>,
++        source: WorkspaceId,
++    ) -> Option<(WorkspaceId, Rectangle<f64, Logical>)> {
++        let mon = self.layout.monitor_for_output(output)?;
++        let source_idx = mon.overview_workspace_index(source)?;
++        mon.workspaces_with_render_geo_idx()
++            .filter(|((idx, _), _)| mon.overview_can_manage(*idx))
++            .min_by(|(_, a), (_, b)| {
++                let distance = |geo: &Rectangle<f64, Logical>| (pos.y - geo.loc.y - geo.size.h / 2.).abs();
++                distance(a).total_cmp(&distance(b))
++            })
++            .and_then(|((idx, ws), geo)| {
++                if idx == source_idx {
++                    return None;
++                }
++                let y = if idx > source_idx { geo.loc.y + geo.size.h } else { geo.loc.y };
++                let line = Rectangle::new((geo.loc.x, y - 2.).into(), (geo.size.w, 4.).into());
++                Some((ws.id(), line))
++            })
++    }
++
++    fn render_overview_workspace_controls(
++        &self,
++        output: &Output,
++        push: &mut impl FnMut(SolidColorRenderElement),
++    ) {
++        if !self.overview_workspace_controls_enabled() {
++            return;
++        }
++        let pointer = self.seat.get_pointer().unwrap();
++        let hovered = self.output_under(pointer.current_location())
++            .filter(|(candidate, _)| *candidate == output)
++            .map(|(_, local)| local);
++        let mut rect = |geometry, color: [f32; 4]| {
++            push(SolidColorRenderElement::new(
++                smithay::backend::renderer::element::Id::new(),
++                geometry,
++                Default::default(),
++                color.into(),
++                Kind::Unspecified,
++            ));
++        };
++        for (control, bounds) in self.overview_workspace_controls(output) {
++            let center = bounds.loc + bounds.size.to_point().downscale(2.);
++            let mut stroke = |x, y, w, h| {
++                let geo = Rectangle::new(center + Point::from((x, y)), (w, h).into());
++                rect(geo, [0.97, 0.98, 1., 1.]);
++            };
++            match control {
++                WorkspaceControl::Add => {
++                    stroke(-7., -1., 14., 2.);
++                    stroke(-1., -7., 2., 14.);
++                }
++                WorkspaceControl::Reorder(_) => {
++                    for y in [-6., -1., 4.] {
++                        stroke(-6., y, 12., 2.);
++                    }
++                }
++                WorkspaceControl::Remove(_) => {
++                    for offset in -3..=3 {
++                        let offset = f64::from(offset) * 2.;
++                        stroke(offset - 1., offset - 1., 2., 2.);
++                        if offset != 0. {
++                            stroke(offset - 1., -offset - 1., 2., 2.);
++                        }
++                    }
++                }
++            }
++            let background = match (control, hovered.is_some_and(|p| bounds.contains(p))) {
++                (WorkspaceControl::Remove(_), true) => [0.60, 0.16, 0.20, 1.],
++                (_, true) => [0.14, 0.36, 0.56, 1.],
++                (_, false) => [0.15, 0.18, 0.23, 1.],
++            };
++            rect(bounds, background);
++        }
++        if let Some((_, id)) = self.overview_workspace_drag.as_ref().filter(|(source, _)| source == output) {
++            if let Some((_, line)) = hovered.and_then(|pos| self.overview_workspace_drop_target(output, pos, *id)) {
++                rect(line, [0.38, 0.73, 1., 1.]);
++            }
++        }
++    }
++
+     /// Returns contents under the given point.
+     ///
+     /// We don't have a proper global space for all windows, so this function converts window
+@@ -4474,6 +4615,7 @@
+                     &mut |elem| push(elem.into()),
+                 );
+ 
++            self.render_overview_workspace_controls(output, &mut |elem| push(elem.into()));
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 
+             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+@@ -4506,6 +4648,7 @@
+                     &mut |elem| push(elem.into()),
+                 );
+ 
++            self.render_overview_workspace_controls(output, &mut |elem| push(elem.into()));
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 
+             // Macro instead of closure to avoid borrowing push().

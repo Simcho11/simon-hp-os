@@ -1,0 +1,151 @@
+diff --git a/GlobalStates.qml b/GlobalStates.qml
+index 22ce84d..275ddf3 100644
+--- a/GlobalStates.qml
++++ b/GlobalStates.qml
+@@ -236,6 +236,7 @@ Singleton {
+     property string annotationEditorPath: ""
+     property string annotationEditorScreenName: ""
+     property bool screenLocked: false
++    property bool sessionLockSecure: false
+     property bool screenLockContainsCharacters: false
+     property bool screenUnlockFailed: false
+     property bool sessionOpen: false
+diff --git a/modules/common/functions/Session.qml b/modules/common/functions/Session.qml
+index 514520d..492db86 100644
+--- a/modules/common/functions/Session.qml
++++ b/modules/common/functions/Session.qml
+@@ -86,7 +86,45 @@ Singleton {
+         });
+     }
+ 
++    property string pendingHandoff: ""
++    readonly property bool lockSecure: GlobalStates.sessionLockSecure
++    onLockSecureChanged: if (lockSecure) finishHandoff()
++
++    function beginHandoff(action: string): bool {
++        if (Config.options?.panelFamily !== "hpos" || !CompositorService.isNiri)
++            return false
++        if (pendingHandoff.length > 0) return true
++        pendingHandoff = action
++        // Retain the current presentation until the compositor covers every output.
++        GlobalStates.screenLocked = true
++        if (lockSecure) finishHandoff()
++        else handoffTimeout.restart()
++        return true
++    }
++
++    Timer {
++        id: handoffTimeout
++        interval: 5000
++        onTriggered: {
++            root.pendingHandoff = ""
++            Quickshell.execDetached(["notify-send", Translation.tr("Could not confirm the screen lock")])
++        }
++    }
++
++    function finishHandoff(): void {
++        const action = pendingHandoff
++        if (!action) return
++        handoffTimeout.stop()
++        pendingHandoff = ""
++        GlobalStates.sessionOpen = false
++        if (action === "switch-user")
++            Quickshell.execDetached(["/usr/bin/python3", Quickshell.shellPath("scripts/switch-user.py")])
++        else if (action === "poweroff")
++            powerAction(["poweroff"])
++    }
++
+     function lock() {
++        if (beginHandoff("lock")) return
+         Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "lock", "activate"]);
+     }
+ 
+@@ -126,6 +164,7 @@ Singleton {
+     }
+ 
+     function poweroff() {
++        if (beginHandoff("poweroff")) return
+         closeAllWindows();
+         powerAction(["poweroff"])
+     }
+diff --git a/modules/iris/session/IrisSessionScreen.qml b/modules/iris/session/IrisSessionScreen.qml
+index c57fc0b..c2fcea6 100644
+--- a/modules/iris/session/IrisSessionScreen.qml
++++ b/modules/iris/session/IrisSessionScreen.qml
+@@ -33,6 +33,8 @@ Variants {
+         anchors { top: true; bottom: true; left: true; right: true }
+ 
+         function runAction(action: string): void {
++            if (["lock", "poweroff", "switch-user"].includes(action) && Session.beginHandoff(action))
++                return
+             GlobalStates.sessionOpen = false
+             switch (action) {
+             case "lock": Session.lock(); break
+diff --git a/modules/lock/Lock.qml b/modules/lock/Lock.qml
+index 2526efb..7219c33 100644
+--- a/modules/lock/Lock.qml
++++ b/modules/lock/Lock.qml
+@@ -365,6 +365,24 @@ Scope {
+         }
+     }
+     
++    Binding {
++        target: GlobalStates
++        property: "sessionLockSecure"
++        value: lock.secure
++    }
++
++    // logind delivers SDDM's authenticated unlock to the existing session.
++    Process {
++        running: Config.ready && Config.options?.panelFamily === "hpos"
++            && Quickshell.env("HP_OS_OWNED_SESSION") === "1"
++        command: ["/usr/bin/python3", Quickshell.shellPath("scripts/session-unlock.py")]
++        stdout: SplitParser {
++            onRead: data => {
++                if (data === "unlock" && lock.secure) root.finishUnlock()
++            }
++        }
++    }
++
+     WlSessionLock {
+         id: lock
+         locked: GlobalStates.screenLocked
+@@ -565,7 +583,10 @@ Scope {
+             }
+             if (GlobalStates.screenLocked || root._lockActivating)
+                 return;
+-            lockActivateDelay.restart();
++            if (Config.options?.panelFamily === "hpos" && CompositorService.isNiri)
++                GlobalStates.screenLocked = true;
++            else
++                lockActivateDelay.restart();
+         }
+ 
+         function prepareSleep(): string {
+diff --git a/scripts/session-unlock.py b/scripts/session-unlock.py
+new file mode 100644
+index 0000000..fe51db3
+--- /dev/null
++++ b/scripts/session-unlock.py
+@@ -0,0 +1,21 @@
++"""Forward logind Unlock events for this process's own graphical session."""
++import os
++
++from gi.repository import Gio, GLib
++
++bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
++service = "org.freedesktop.login1"
++session_path, = bus.call_sync(
++    service, "/org/freedesktop/login1", service + ".Manager", "GetSessionByPID",
++    GLib.Variant("(u)", (os.getpid(),)), GLib.VariantType.new("(o)"),
++    Gio.DBusCallFlags.NONE, 5000, None,
++).unpack()
++
++
++def on_unlock(*_args):
++    print("unlock", flush=True)
++
++
++bus.signal_subscribe(service, service + ".Session", "Unlock", session_path, None,
++                     Gio.DBusSignalFlags.NONE, on_unlock)
++GLib.MainLoop().run()

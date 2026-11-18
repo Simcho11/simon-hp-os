@@ -1,0 +1,75 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index bfc6dca..0c74ac3 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -69,6 +69,8 @@ pub enum Request {
+     DesktopSwipeSupported,
+     /// Query support for separate desktop page and stationary wallpaper surfaces.
+     DesktopPageLayersSupported,
++    /// Query support for fixed desktop indicators above all wallpaper surfaces.
++    DesktopRailStackingSupported,
+     /// Drive a workspace swipe. The compositor cancels it if this connection closes.
+     DesktopSwipe(DesktopSwipe),
+     /// Request the version string for the running niri instance.
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index a5cc509..c3c2ad5 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -353,7 +353,9 @@ fn apply_desktop_swipe(state: &mut State, name: &str, owner: u64, phase: Desktop
+ 
+ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+     let response = match request {
+-        Request::DesktopSwipeSupported | Request::DesktopPageLayersSupported => Response::Handled,
++        Request::DesktopSwipeSupported
++        | Request::DesktopPageLayersSupported
++        | Request::DesktopRailStackingSupported => Response::Handled,
+         Request::DesktopSwipe(_) => unreachable!("desktop swipes are connection-scoped"),
+         Request::ReturnError => return Err(String::from("example compositor error")),
+         Request::Version => Response::Version(version()),
+diff --git a/src/niri.rs b/src/niri.rs
+index 65bc2a8..3e0c2b9 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -4651,17 +4651,33 @@ impl Niri {
+         layer: Layer,
+         for_backdrop: bool,
+     ) -> impl Iterator<Item = (&'a MappedLayer, Rectangle<i32, Logical>)> {
+-        // LayerMap returns layers in reverse stacking order.
+-        layer_map.layers_on(layer).rev().filter_map(move |surface| {
+-            let mapped = self.mapped_layer_surfaces.get(surface)?;
++        // LayerMap returns layers in reverse stacking order. The input-transparent HP-OS
++        // desktop indicator stays above wallpaper even when a wallpaper client remaps.
++        let rail = if layer == Layer::Background && !for_backdrop {
++            layer_map
++                .layers_on(layer)
++                .rev()
++                .find(|surface| surface.namespace() == "quickshell:iris-workspace-rail")
++        } else {
++            None
++        };
++        rail.into_iter()
++            .chain(
++                layer_map
++                    .layers_on(layer)
++                    .rev()
++                    .filter(move |surface| Some(*surface) != rail),
++            )
++            .filter_map(move |surface| {
++                let mapped = self.mapped_layer_surfaces.get(surface)?;
+ 
+-            if for_backdrop != mapped.place_within_backdrop() {
+-                return None;
+-            }
++                if for_backdrop != mapped.place_within_backdrop() {
++                    return None;
++                }
+ 
+-            let geo = layer_map.layer_geometry(surface)?;
+-            Some((mapped, geo))
+-        })
++                let geo = layer_map.layer_geometry(surface)?;
++                Some((mapped, geo))
++            })
+     }
+ 
+     #[allow(clippy::too_many_arguments)]

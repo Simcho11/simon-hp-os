@@ -1,0 +1,293 @@
+diff --git a/src/layout/floating.rs b/src/layout/floating.rs
+index a9f089e..3f68678 100644
+--- a/src/layout/floating.rs
++++ b/src/layout/floating.rs
+@@ -1085,6 +1085,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         xray_pos: XrayPos,
+         view_rect: Rectangle<f64, Logical>,
+         focus_ring: bool,
++        skip: Option<&W::Id>,
+         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
+     ) {
+         let scale = Scale::from(self.scale);
+@@ -1099,6 +1100,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
+ 
+         let active = self.active_window_id.clone();
+         for (tile, tile_pos) in self.tiles_with_render_positions() {
++            if skip == Some(tile.window().id()) {
++                continue;
++            }
+             // For the active tile, draw the focus ring.
+             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
+ 
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 5030d8c..0821575 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -70,6 +70,8 @@ pub struct Monitor<W: LayoutElement> {
+     pub(super) previous_workspace_id: Option<WorkspaceId>,
+     /// In-progress switch between workspaces.
+     pub(super) workspace_switch: Option<WorkspaceSwitch>,
++    /// Output-local tile origin while carrying a window through a workspace animation.
++    carried_window: Option<(W::Id, Point<f64, Logical>)>,
+     /// Indication where an interactively-moved window is about to be placed.
+     pub(super) insert_hint: Option<InsertHint>,
+     /// Insert hint element for rendering.
+@@ -187,6 +189,7 @@ impl<'a, W: LayoutElement> Clone for MonitorAddWindowTarget<'a, W> {
+ 
+ niri_render_elements! {
+     MonitorInnerRenderElement<R> => {
++        Carried = super::tile::TileRenderElement<R>,
+         Workspace = CropRenderElement<WorkspaceRenderElement<R>>,
+         InsertHint = CropRenderElement<InsertHintRenderElement>,
+         UncroppedInsertHint = InsertHintRenderElement,
+@@ -344,6 +347,7 @@ impl<W: LayoutElement> Monitor<W> {
+             overview_open: false,
+             overview_progress: None,
+             workspace_switch: None,
++            carried_window: None,
+             clock,
+             base_options,
+             options,
+@@ -571,6 +575,7 @@ impl<W: LayoutElement> Monitor<W> {
+         let current_idx = self.workspace_render_idx();
+ 
+         if self.active_workspace_idx != idx {
++            self.carried_window = None;
+             self.previous_workspace_id = Some(self.workspaces[self.active_workspace_idx].id());
+         }
+ 
+@@ -911,48 +916,54 @@ impl<W: LayoutElement> Monitor<W> {
+     }
+ 
+     pub fn move_to_workspace_up(&mut self, focus: bool) {
+-        let source_workspace_idx = self.active_workspace_idx;
+-
+-        let new_idx = self.adjacent_workspace(source_workspace_idx, false);
+-        if new_idx == source_workspace_idx {
+-            return;
+-        }
+-        let new_id = self.workspaces[new_idx].id();
+-
+-        let workspace = &mut self.workspaces[source_workspace_idx];
+-        let Some(removed) = workspace.remove_active_tile(Transaction::new()) else {
+-            return;
+-        };
++        self.move_to_adjacent_workspace(false, focus);
++    }
+ 
+-        let activate = if focus {
+-            ActivateWindow::Yes
+-        } else {
+-            ActivateWindow::Smart
+-        };
++    pub fn move_to_workspace_down(&mut self, focus: bool) {
++        self.move_to_adjacent_workspace(true, focus);
++    }
+ 
+-        self.add_tile(
+-            removed.tile,
+-            MonitorAddWindowTarget::Workspace {
+-                id: new_id,
+-                column_idx: None,
+-            },
+-            activate,
+-            true,
+-            removed.width,
+-            removed.is_full_width,
+-            removed.is_floating,
+-        );
++    fn carried_tile(&self) -> Option<(&Tile<W>, Point<f64, Logical>)> {
++        if !matches!(self.workspace_switch, Some(WorkspaceSwitch::Animation(_)))
++            || self.overview_progress.is_some() {
++            return None;
++        }
++        let (id, origin) = self.carried_window.as_ref()?;
++        let ws = self.active_workspace_ref();
++        if ws.active_window()?.id() != id {
++            return None;
++        }
++        ws.tiles_with_render_positions()
++            .find(|(tile, _, visible)| *visible && tile.window().id() == id)
++            .map(|(tile, _, _)| (tile, *origin))
+     }
+ 
+-    pub fn move_to_workspace_down(&mut self, focus: bool) {
++    fn move_to_adjacent_workspace(&mut self, down: bool, focus: bool) {
+         let source_workspace_idx = self.active_workspace_idx;
+ 
+-        let new_idx = self.adjacent_workspace(source_workspace_idx, true);
++        let new_idx = self.adjacent_workspace(source_workspace_idx, down);
+         if new_idx == source_workspace_idx {
+             return;
+         }
+         let new_id = self.workspaces[new_idx].id();
+ 
++        let carry = if focus && self.overview_progress.is_none() {
++            self.active_window().and_then(|win| {
++                let id = win.id();
++                if let Some((tile, origin)) = self.carried_tile() {
++                    if tile.window().id() == id {
++                        return Some((id.clone(), origin));
++                    }
++                }
++                let ws = self.active_workspace_ref();
++                let (_, pos, _) = ws.tiles_with_render_positions()
++                    .find(|(tile, _, visible)| *visible && tile.window().id() == id)?;
++                let geo = self.workspaces_render_geo().nth(source_workspace_idx)?;
++                Some((id.clone(), geo.loc + pos))
++            })
++        } else {
++            None
++        };
+         let workspace = &mut self.workspaces[source_workspace_idx];
+         let Some(removed) = workspace.remove_active_tile(Transaction::new()) else {
+             return;
+@@ -976,6 +987,7 @@ impl<W: LayoutElement> Monitor<W> {
+             removed.is_full_width,
+             removed.is_floating,
+         );
++        self.carried_window = carry;
+     }
+ 
+     pub fn move_to_workspace(
+@@ -1165,6 +1177,7 @@ impl<W: LayoutElement> Monitor<W> {
+             Some(WorkspaceSwitch::Animation(anim)) => {
+                 if anim.is_done() {
+                     self.workspace_switch = None;
++                    self.carried_window = None;
+                     self.clean_up_workspaces();
+                 }
+             }
+@@ -1688,6 +1701,12 @@ impl<W: LayoutElement> Monitor<W> {
+     }
+ 
+     pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
++        let carry = self.carried_tile();
++        if let Some((tile, origin)) = carry {
++            if let Some(hit) = tile.hit(pos_within_output - origin) {
++                return Some((tile.window(), hit.offset_win_pos(origin)));
++            }
++        }
+         let (ws, geo) = self.workspace_under(pos_within_output)?;
+ 
+         if self.overview_progress.is_some() {
+@@ -1699,6 +1718,9 @@ impl<W: LayoutElement> Monitor<W> {
+             Some((win, hit.to_activate()))
+         } else {
+             let (win, hit) = ws.window_under(pos_within_output - geo.loc)?;
++            if carry.is_some_and(|(tile, _)| tile.window().id() == win.id()) {
++                return None;
++            }
+             Some((win, hit.offset_win_pos(geo.loc)))
+         }
+     }
+@@ -1848,6 +1870,18 @@ impl<W: LayoutElement> Monitor<W> {
+             )
+         };
+ 
++        // Draw in output space, above both scrolling pages, even on the first frame
++        // when the destination workspace can still be completely outside the viewport.
++        let carry = self.carried_tile();
++        if let Some((tile, origin)) = carry {
++            tile.render(ctx.r(), origin, XrayPos::default().offset(origin), focus_ring, &mut |elem| {
++                let elem = MonitorInnerRenderElement::Carried(elem);
++                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
++                push(RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative));
++            });
++        }
++        let skip = carry.map(|(tile, _)| tile.window().id());
++
+         for (ws, geo) in self.workspaces_with_render_geo() {
+             // Macro instead of closure because ws and insert hint have different elem types.
+             macro_rules! push {
+@@ -1864,7 +1898,7 @@ impl<W: LayoutElement> Monitor<W> {
+ 
+             let xray_pos = XrayPos::new(geo.loc, zoom);
+ 
+-            ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
++            ws.render_floating(ctx.r(), xray_pos, focus_ring, skip, push!());
+ 
+             if let Some(loc) = insert_hint_render_loc {
+                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
+@@ -1873,7 +1907,7 @@ impl<W: LayoutElement> Monitor<W> {
+                 }
+             }
+ 
+-            ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
++            ws.render_scrolling(ctx.r(), xray_pos, focus_ring, skip, push!());
+         }
+     }
+ 
+@@ -1923,6 +1957,7 @@ impl<W: LayoutElement> Monitor<W> {
+             dnd_last_event_time: None,
+             dnd_nonzero_start_time: None,
+         };
++        self.carried_window = None;
+         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+     }
+ 
+@@ -1956,6 +1991,7 @@ impl<W: LayoutElement> Monitor<W> {
+             dnd_last_event_time: Some(self.clock.now_unadjusted()),
+             dnd_nonzero_start_time: None,
+         };
++        self.carried_window = None;
+         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+     }
+ 
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 04e1bf6..1f68367 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -2928,6 +2928,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         mut ctx: RenderCtx<R>,
+         xray_pos: XrayPos,
+         focus_ring: bool,
++        skip: Option<&W::Id>,
+         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
+     ) {
+         let scale = Scale::from(self.scale);
+@@ -2977,7 +2978,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 // also used for input handling, and there we *do* want to apply it immediately.
+                 // So, let's just selectively ignore "visible" here when animating alpha.
+                 let visible = visible || tile.alpha_animation.is_some();
+-                if !visible {
++                if !visible || skip == Some(tile.window().id()) {
+                     continue;
+                 }
+ 
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 1ca7851..00f78d9 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -1644,11 +1644,12 @@ impl<W: LayoutElement> Workspace<W> {
+         ctx: RenderCtx<R>,
+         xray_pos: XrayPos,
+         focus_ring: bool,
++        skip: Option<&W::Id>,
+         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+     ) {
+         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
+         self.scrolling
+-            .render(ctx, xray_pos, scrolling_focus_ring, &mut |elem| {
++            .render(ctx, xray_pos, scrolling_focus_ring, skip, &mut |elem| {
+                 push(elem.into())
+             });
+     }
+@@ -1658,6 +1659,7 @@ impl<W: LayoutElement> Workspace<W> {
+         ctx: RenderCtx<R>,
+         xray_pos: XrayPos,
+         focus_ring: bool,
++        skip: Option<&W::Id>,
+         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+     ) {
+         if !self.is_floating_visible() {
+@@ -1667,7 +1669,7 @@ impl<W: LayoutElement> Workspace<W> {
+         let view_rect = Rectangle::from_size(self.view_size);
+         let floating_focus_ring = focus_ring && self.floating_is_active();
+         self.floating
+-            .render(ctx, xray_pos, view_rect, floating_focus_ring, &mut |elem| {
++            .render(ctx, xray_pos, view_rect, floating_focus_ring, skip, &mut |elem| {
+                 push(elem.into())
+             });
+     }

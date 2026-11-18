@@ -1,0 +1,21 @@
+diff --git a/src/niri.rs b/src/niri.rs
+index 88d35f4..6d48b76 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -4057,7 +4057,15 @@ impl Niri {
+     pub fn refresh_layout(&mut self) {
+         let layout_is_active = match &self.keyboard_focus {
+             KeyboardFocus::Layout { .. } => true,
+-            KeyboardFocus::LayerShell { .. } => false,
++            // hp-snap patch: the snap overlay (window-drag hints, layout picker, Fill Assist) takes the
++            // keyboard only for Esc/Ctrl and arrows; it is about the windows, so they keep looking
++            // active. Otherwise a dropped window drew inactive (lighter shadow, other ring colour) for
++            // the few frames before the overlay let go of the keyboard: a flash on every drop.
++            KeyboardFocus::LayerShell { surface } => self.layout.outputs().any(|output| {
++                layer_map_for_output(output)
++                    .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
++                    .is_some_and(|layer| layer.namespace() == "hp-snap-overlay")
++            }),
+ 
+             // Draw layout as active in these cases to reduce unnecessary window animations.
+             // There's no confusion because these are both fullscreen modes.

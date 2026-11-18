@@ -1,0 +1,76 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index a436331..1169b6a 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1414,7 +1414,15 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
+ 
+             let window_data = data.get::<&WindowData>().unwrap();
+             if window_data.attrs.role.is_popup() {
+-                popup_for = self.last_hovered.or(self.last_focused_toplevel);
++                popup_for = [self.last_hovered, self.last_focused_toplevel]
++                    .into_iter()
++                    .flatten()
++                    .find(|parent| {
++                        self.windows.get(parent).is_some_and(|parent_entity| {
++                            self.world.get::<&SurfaceRole>(*parent_entity)
++                                .is_ok_and(|role| role.xdg().is_some())
++                        })
++                    });
+             }
+             splash = window_data.attrs.role == WindowRole::Splash;
+ 
+@@ -1633,8 +1641,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
+         positioner.set_anchor_rect(
+             0,
+             0,
+-            (parent_window.attrs.dims.width as f64 / initial_scale) as i32,
+-            (parent_window.attrs.dims.height as f64 / initial_scale) as i32,
++            1.max((parent_window.attrs.dims.width as f64 / initial_scale) as i32),
++            1.max((parent_window.attrs.dims.height as f64 / initial_scale) as i32),
+         );
+         positioner
+             .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+diff --git a/src/server/tests.rs b/src/server/tests.rs
+index fa70c7d..0e8923c 100644
+--- a/src/server/tests.rs
++++ b/src/server/tests.rs
+@@ -1093,6 +1093,39 @@ fn toplevel_flow() {
+     assert!(f.testwl.get_surface_data(testwl_id).is_none());
+ }
+ 
++#[test]
++fn popup_anchor_for_one_pixel_parent_at_fractional_scale() {
++    let (mut f, compositor) = TestFixture::new_with_compositor();
++    let parent = Window::new(1);
++    let (_, parent_id) = f.create_toplevel(&compositor, parent);
++    let entity = f.satellite.windows[&parent];
++    {
++        let mut window = f.satellite.world.get::<&mut super::WindowData>(entity).unwrap();
++        window.attrs.dims.width = 1;
++        window.attrs.dims.height = 1;
++    }
++    f.satellite.world.get::<&mut super::SurfaceScaleFactor>(entity).unwrap().0 = 1.5;
++    let (_, popup_id) = f.create_popup(&compositor,
++        PopupBuilder::new(Window::new(2), parent, parent_id)
++            .scale(1.5).check_size_and_pos(false));
++    let state = &f.testwl.get_surface_data(popup_id).unwrap().popup().positioner_state;
++    assert_eq!(state.anchor_rect.as_ref().unwrap().size, testwl::Vec2 { x: 1, y: 1 });
++}
++
++#[test]
++fn popup_ignores_unmapped_hovered_parent() {
++    let (mut f, compositor) = TestFixture::new_with_compositor();
++    let parent = Window::new(1);
++    let (_, parent_id) = f.create_toplevel(&compositor, parent);
++    let stale = Window::new(2);
++    let _stale_surface = f.create_toplevel(&compositor, stale);
++    f.satellite.unmap_window(stale);
++    f.run();
++    f.satellite.last_hovered = Some(stale);
++    f.satellite.last_focused_toplevel = Some(parent);
++    f.create_popup(&compositor, PopupBuilder::new(Window::new(3), parent, parent_id));
++}
++
+ #[test]
+ fn popup_flow_simple() {
+     let (mut f, compositor) = TestFixture::new_with_compositor();

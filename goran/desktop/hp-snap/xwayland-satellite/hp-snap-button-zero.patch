@@ -1,0 +1,8 @@
+--- a/src/xstate/mod.rs
++++ b/src/xstate/mod.rs
+@@ -584,1 +584,4 @@
+-                if button != 1 {
++                // Electron can send button 0 for a pointer-driven move/resize.
++                // The server still requires a real left-click Wayland serial,
++                // and the compositor validates that the grab is still active.
++                if button != 0 && button != 1 {

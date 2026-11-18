@@ -1,0 +1,187 @@
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index e35dc7f..0e64eb5 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -120,6 +120,11 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
+     }
+ }
+ 
++thread_local! {
++    /// hp-snap patch: scrolling during drag-and-drop, in notches, and when it last switched desktops.
++    static DND_SCROLL: std::cell::Cell<(f64, Duration)> = const { std::cell::Cell::new((0., Duration::ZERO)) };
++}
++
+ impl State {
+     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
+     where
+@@ -701,6 +706,15 @@ impl State {
+         }
+     }
+ 
++    /// hp-snap patch: switching desktops drops a desktop layer's on-demand keyboard focus. While a pointer
++    /// button is held (an icon carried across desktops on the HP-OS desktop page), keep it: losing keyboard
++    /// focus deactivates the client's window and Qt cancels every drag in a deactivated window.
++    fn clear_layer_focus_unless_dragging(&mut self) {
++        if !self.niri.seat.get_pointer().unwrap().is_grabbed() {
++            self.niri.layer_shell_on_demand_focus = None;
++        }
++    }
++
+     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
+         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
+             return;
+@@ -1509,7 +1523,7 @@ impl State {
+             Action::FocusWorkspaceDown => {
+                 self.niri.layout.switch_workspace_down();
+                 self.maybe_warp_cursor_to_focus();
+-                self.niri.layer_shell_on_demand_focus = None;
++                self.clear_layer_focus_unless_dragging();
+                 // FIXME: granular
+                 self.niri.queue_redraw_all();
+             }
+@@ -1518,7 +1532,7 @@ impl State {
+                     if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+                         mon.switch_workspace_down();
+                         self.maybe_warp_cursor_to_focus();
+-                        self.niri.layer_shell_on_demand_focus = None;
++                        self.clear_layer_focus_unless_dragging();
+                         self.niri.queue_redraw(&output);
+                     }
+                 }
+@@ -1526,7 +1540,7 @@ impl State {
+             Action::FocusWorkspaceUp => {
+                 self.niri.layout.switch_workspace_up();
+                 self.maybe_warp_cursor_to_focus();
+-                self.niri.layer_shell_on_demand_focus = None;
++                self.clear_layer_focus_unless_dragging();
+                 // FIXME: granular
+                 self.niri.queue_redraw_all();
+             }
+@@ -1535,7 +1549,7 @@ impl State {
+                     if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+                         mon.switch_workspace_up();
+                         self.maybe_warp_cursor_to_focus();
+-                        self.niri.layer_shell_on_demand_focus = None;
++                        self.clear_layer_focus_unless_dragging();
+                         self.niri.queue_redraw(&output);
+                     }
+                 }
+@@ -1565,7 +1579,7 @@ impl State {
+                         }
+                         self.maybe_warp_cursor_to_focus();
+                     }
+-                    self.niri.layer_shell_on_demand_focus = None;
++                    self.clear_layer_focus_unless_dragging();
+ 
+                     // FIXME: granular
+                     self.niri.queue_redraw_all();
+@@ -3157,6 +3171,44 @@ impl State {
+         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
+         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
+ 
++        // hp-snap patch: while something is carried by drag-and-drop (an HP-OS desktop icon taken to another
++        // desktop), the scroll wheel goes to the desktop above or below on the output under the pointer: one per
++        // notch (or short touchpad swipe), not faster than the pages settle. Handled here, before the pointer's
++        // grab, which holds the pointer's lock while it runs.
++        if self.niri.dnd_icon.is_some() {
++            let notches = vertical_amount_v120
++                .map(|v| v / 120.)
++                .unwrap_or_else(|| event.amount(Axis::Vertical).unwrap_or(0.) / 50.);
++            if notches != 0. {
++                let down = DND_SCROLL.with(|cell| {
++                    let (acc, last) = cell.get();
++                    if timestamp.saturating_sub(last) < Duration::from_millis(300) {
++                        cell.set((0., last));
++                        return None;
++                    }
++                    let acc = acc + notches;
++                    if acc.abs() >= 1. {
++                        cell.set((0., timestamp));
++                        Some(acc > 0.)
++                    } else {
++                        cell.set((acc, last));
++                        None
++                    }
++                });
++                if let Some(down) = down {
++                    let action = if down {
++                        Action::FocusWorkspaceDownUnderMouse
++                    } else {
++                        Action::FocusWorkspaceUpUnderMouse
++                    };
++                    self.niri
++                        .event_loop
++                        .insert_idle(move |state| state.do_action(action, false));
++                }
++            }
++            return;
++        }
++
+         let is_overview_open = self.niri.layout.is_overview_open();
+ 
+         // We should only handle scrolling in the overview if the pointer is not over a (top or
+diff --git a/src/input/move_grab.rs b/src/input/move_grab.rs
+index 8834b10..1668e56 100644
+--- a/src/input/move_grab.rs
++++ b/src/input/move_grab.rs
+@@ -34,6 +34,9 @@ pub struct MoveGrab {
+     new_location: Point<f64, Logical>,
+     event_timestamp: Option<Duration>,
+     relative_delta: Option<Point<f64, Logical>>,
++    /// hp-snap patch: scrolling while a window is carried, in notches, and when it last switched desktops.
++    desktop_scroll: f64,
++    desktop_scroll_at: Option<Duration>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -67,6 +70,8 @@ impl MoveGrab {
+             new_location: location,
+             event_timestamp: None,
+             relative_delta: None,
++            desktop_scroll: 0.,
++            desktop_scroll_at: None,
+         })
+     }
+ 
+@@ -364,6 +369,41 @@ impl PointerGrab<State> for MoveGrab {
+         handle: &mut PointerInnerHandle<'_, State>,
+         details: AxisFrame,
+     ) {
++        // hp-snap patch: while a window is carried, the scroll wheel goes to the desktop above or below on the
++        // output under the pointer (one per notch, or per short touchpad swipe), and the window comes along.
++        if self.gesture == GestureState::Move {
++            let notches = match details.v120 {
++                Some((_, v)) => f64::from(v) / 120.,
++                None => details.axis.1 / 50.,
++            };
++            if notches != 0. {
++                let now = get_monotonic_time();
++                let settled = self
++                    .desktop_scroll_at
++                    .map_or(true, |at| now.saturating_sub(at) >= Duration::from_millis(300));
++                if !settled {
++                    self.desktop_scroll = 0.;
++                } else {
++                    self.desktop_scroll += notches;
++                    if self.desktop_scroll.abs() >= 1. {
++                        let action = if self.desktop_scroll > 0. {
++                            niri_config::Action::FocusWorkspaceDownUnderMouse
++                        } else {
++                            niri_config::Action::FocusWorkspaceUpUnderMouse
++                        };
++                        self.desktop_scroll = 0.;
++                        self.desktop_scroll_at = Some(now);
++                        // After this frame: smithay holds the pointer's lock while a grab handles input, and
++                        // switching desktops asks the pointer about its grab, which would wait on that lock
++                        // forever (the whole session froze).
++                        data.niri
++                            .event_loop
++                            .insert_idle(move |state| state.do_action(action, false));
++                    }
++                }
++            }
++            return;
++        }
+         handle.axis(data, details);
+     }
+ 

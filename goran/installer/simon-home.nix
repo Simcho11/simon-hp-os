@@ -7,6 +7,8 @@
   home.stateVersion = "26.05";
   programs.home-manager.enable = true;
   programs.goran-hp-os.enable = true;
+  # Simon already has personal Niri rules, wallpapers and dock preferences.
+  programs.goran-hp-os.hpSnap.manageHouseDefaults = false;
 
   targets.genericLinux.gpu = {
     enable = true;

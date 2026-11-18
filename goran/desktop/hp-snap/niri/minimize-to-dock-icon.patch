@@ -1,0 +1,201 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0c74ac3..03c099a 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -73,6 +73,9 @@ pub enum Request {
+     DesktopRailStackingSupported,
+     /// Drive a workspace swipe. The compositor cancels it if this connection closes.
+     DesktopSwipe(DesktopSwipe),
++    /// hp-snap patch: where each app's dock icon is on an output, so minimizing a window flies
++    /// it into its own icon (and restoring grows it back out). Replaces that output's list.
++    SetDockIcons(DockIcons),
+     /// Request the version string for the running niri instance.
+     Version,
+     /// Request information about connected outputs.
+@@ -141,6 +144,28 @@ pub enum DesktopSwipe {
+     End { cancel: bool },
+ }
+ 
++/// hp-snap patch: the dock's icons on one output, in output-local logical coordinates.
++#[derive(Debug, Serialize, Deserialize, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct DockIcons {
++    /// Output name.
++    pub output: String,
++    /// The icons.
++    pub icons: Vec<DockIcon>,
++}
++
++/// hp-snap patch: one dock icon: the app it stands for and its centre.
++#[derive(Debug, Serialize, Deserialize, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct DockIcon {
++    /// The app id its windows report.
++    pub app_id: String,
++    /// Centre x.
++    pub x: f64,
++    /// Centre y.
++    pub y: f64,
++}
++
+ /// Reply from niri to client.
+ ///
+ /// Every request gets one reply.
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index c3c2ad5..2003345 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -357,6 +357,19 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+         | Request::DesktopPageLayersSupported
+         | Request::DesktopRailStackingSupported => Response::Handled,
+         Request::DesktopSwipe(_) => unreachable!("desktop swipes are connection-scoped"),
++        Request::SetDockIcons(dock) => {
++            let icons: Vec<(String, f64, f64)> = dock
++                .icons
++                .into_iter()
++                .filter(|icon| icon.x.is_finite() && icon.y.is_finite())
++                .map(|icon| (icon.app_id.to_lowercase(), icon.x, icon.y))
++                .collect();
++            let output = dock.output;
++            ctx.event_loop.insert_idle(move |state| {
++                state.niri.layout.set_dock_icons(output, icons);
++            });
++            Response::Handled
++        }
+         Request::ReturnError => return Err(String::from("example compositor error")),
+         Request::Version => Response::Version(version()),
+         Request::Outputs => {
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 977fff4..7491731 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -354,6 +354,10 @@ pub struct Layout<W: LayoutElement> {
+     /// hp-snap patch: minimized windows and the workspace each was minimized from. A minimized
+     /// window lives on a stash workspace of its monitor until something activates it.
+     minimized: Vec<(W::Id, WorkspaceId)>,
++    /// hp-snap patch: dock icon centres per output (app id, x, y), from the shell's dock.
++    dock_icons: HashMap<String, Vec<(String, f64, f64)>>,
++    /// hp-snap patch: the dock icon each minimized window flew into, to grow back out of it.
++    minimize_points: Vec<(W::Id, Point<f64, Logical>)>,
+     /// Ongoing drag-and-drop operation.
+     dnd: Option<DndData<W>>,
+     /// Clock for driving animations.
+@@ -727,6 +731,8 @@ impl<W: LayoutElement> Layout<W> {
+             last_active_workspace_id: HashMap::new(),
+             interactive_move: None,
+             minimized: Vec::new(),
++            dock_icons: HashMap::new(),
++            minimize_points: Vec::new(),
+             dnd: None,
+             clock,
+             update_render_elements_time: Duration::ZERO,
+@@ -753,6 +759,8 @@ impl<W: LayoutElement> Layout<W> {
+             last_active_workspace_id: HashMap::new(),
+             interactive_move: None,
+             minimized: Vec::new(),
++            dock_icons: HashMap::new(),
++            minimize_points: Vec::new(),
+             dnd: None,
+             clock,
+             update_render_elements_time: Duration::ZERO,
+@@ -1639,10 +1647,21 @@ impl<W: LayoutElement> Layout<W> {
+             .position(|ws| ws.id() == ws_id)
+             .unwrap_or(mon.active_workspace_idx);
+         move_keeping_restore_to_floating(mon, window, target);
+-        // Grow out of the dock, back into place.
++        // Grow out of the dock (out of the app's own icon, if the dock said where), back into place.
++        let point = self
++            .minimize_points
++            .iter()
++            .position(|(id, _)| id == window)
++            .map(|index| self.minimize_points.remove(index).1);
++        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
++            return;
++        };
++        let Some(mon) = monitors.iter_mut().find(|mon| mon.has_window(window)) else {
++            return;
++        };
+         let ws = mon.workspaces.iter_mut().find(|ws| ws.has_window(window));
+         if let Some(ws) = ws {
+-            let delta = ws.minimize_delta(window);
++            let delta = ws.minimize_delta(window, point);
+             if delta.is_some_and(|delta| ws.start_restore_animation(window, delta)) {
+                 return;
+             }
+@@ -1650,16 +1669,35 @@ impl<W: LayoutElement> Layout<W> {
+         self.start_open_animation_for_window(window);
+     }
+ 
+-    /// hp-snap patch: vector from the window's centre to the dock, for the minimize animation.
+-    pub fn minimize_delta(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
++    /// hp-snap patch: vector from the window's centre to the dock, for the minimize animation:
++    /// to the centre of its app's dock icon when the dock reported one on the window's output
++    /// (remembered for the restore), else to the dock's middle.
++    pub fn minimize_delta(&mut self, window: &W::Id, app_id: Option<&str>) -> Option<Point<f64, Logical>> {
+         let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+             return None;
+         };
+-        monitors
+-            .iter()
+-            .flat_map(|mon| mon.workspaces.iter())
+-            .find(|ws| ws.has_window(window))
+-            .and_then(|ws| ws.minimize_delta(window))
++        let mon = monitors.iter().find(|mon| mon.has_window(window))?;
++        let point = app_id.map(str::to_lowercase).and_then(|app_id| {
++            self.dock_icons.get(&mon.output_name().clone())?.iter()
++                .find(|(id, _, _)| *id == app_id)
++                .map(|&(_, x, y)| Point::from((x, y)))
++        });
++        let delta = mon.workspaces.iter().find(|ws| ws.has_window(window))
++            .and_then(|ws| ws.minimize_delta(window, point));
++        self.minimize_points.retain(|(id, _)| id != window);
++        if let Some(point) = point {
++            self.minimize_points.push((window.clone(), point));
++        }
++        delta
++    }
++
++    /// hp-snap patch: the dock's icon centres on an output (see Request::SetDockIcons).
++    pub fn set_dock_icons(&mut self, output: String, icons: Vec<(String, f64, f64)>) {
++        if icons.is_empty() {
++            self.dock_icons.remove(&output);
++        } else {
++            self.dock_icons.insert(output, icons);
++        }
+     }
+ 
+     /// hp-snap patch: turn the window's just-started close animation into a minimize animation.
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 7e19851..d29a05c 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -1764,11 +1764,14 @@ impl<W: LayoutElement> Workspace<W> {
+ 
+     /// hp-snap patch: vector from the window's centre to the dock: the bottom centre of the
+     /// screen (the middle of the strip the dock reserves, if it reserves one).
+-    pub fn minimize_delta(&self, id: &W::Id) -> Option<Point<f64, Logical>> {
++    pub fn minimize_delta(&self, id: &W::Id, icon: Option<Point<f64, Logical>>) -> Option<Point<f64, Logical>> {
+         let (tile, pos, _) = self
+             .tiles_with_render_positions()
+             .find(|(tile, _, _)| tile.window().id() == id)?;
+         let center = pos + tile.tile_size().to_point().downscale(2.);
++        if let Some(icon) = icon {
++            return Some(icon - center);
++        }
+         let bottom = self.working_area.loc.y + self.working_area.size.h;
+         let h = self.view_size.h;
+         let y = if h - bottom > 8. { (bottom + h) / 2. } else { h - 24. };
+diff --git a/src/niri.rs b/src/niri.rs
+index 3e0c2b9..63ef89e 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -1022,7 +1022,8 @@ impl State {
+         let id = mapped.id().get();
+         let output = mon.map(|mon| mon.output().clone());
+ 
+-        let delta = self.niri.layout.minimize_delta(window);
++        let app_id = crate::utils::with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
++        let delta = self.niri.layout.minimize_delta(window, app_id.as_deref());
+ 
+         self.store_unmap_snapshot(window, output.as_ref());
+ 

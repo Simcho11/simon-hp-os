@@ -1,0 +1,12 @@
+#!/bin/bash
+# shadow's post-create hook runs after the account database has been unlocked.
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ ${ACTION:-} == useradd && -n ${SUBJECT:-} ]] || exit 0
+entry=$(getent -s files passwd "$SUBJECT") || exit 0
+IFS=: read -r name _ uid _ _ directory shell <<< "$entry"
+[[ $uid -ge 1000 && $uid -le 60000 && "$directory" == "/home/$name" ]] || exit 0
+[[ "$shell" != */nologin && "$shell" != */false ]] || exit 0
+if getent group nix-users >/dev/null && ! id -nG "$name" | tr ' ' '\n' | grep -Fx nix-users >/dev/null; then
+    gpasswd -a "$name" nix-users
+fi

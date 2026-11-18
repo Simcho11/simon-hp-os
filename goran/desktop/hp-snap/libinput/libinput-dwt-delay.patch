@@ -1,0 +1,100 @@
+--- a/src/evdev-mt-touchpad.c
++++ b/src/evdev-mt-touchpad.c
+@@ -839,20 +839,12 @@
+ 
+ 	if (!tp->dwt.keyboard_active && t->state == TOUCH_UPDATE &&
+ 	    t->palm.state == PALM_TYPING) {
+-		/* If a touch has started before the first or after the last
+-		   key press, release it on timeout. Benefit: a palm rested
+-		   while typing on the touchpad will be ignored, but a touch
+-		   started once we stop typing will be able to control the
+-		   pointer (alas not tap, etc.).
+-		   */
+-		if (usec_is_zero(t->palm.time) ||
+-		    usec_cmp(t->palm.time, tp->dwt.keyboard_last_press_time) > 0) {
+-			t->palm.state = PALM_NONE;
+-			evdev_log_debug(
+-				tp->device,
+-				"palm: touch %d released, timeout after typing\n",
++		/* Resume this contact once typing suppression ends. */
++		t->palm.state = PALM_NONE;
++		tp_motion_history_reset(t);
++		evdev_log_debug(tp->device,
++				"palm: touch %d released after typing\n",
+ 				t->index);
+-		}
+ 	}
+ 
+ 	return false;
+@@ -2163,8 +2155,10 @@
+ 
+ 	if (tp->dwt.dwt_enabled &&
+ 	    long_any_bit_set(tp->dwt.key_mask, ARRAY_LENGTH(tp->dwt.key_mask))) {
+-		libinput_timer_set(&tp->dwt.keyboard_timer,
+-				   usec_add(now, tp->dwt.timeout));
++		usec_t timeout = tp->dwt.timeout;
++		if (usec_cmp(timeout, usec_from_millis(0)) == 0)
++			timeout = DEFAULT_KEYBOARD_ACTIVITY_TIMEOUT_1;
++		libinput_timer_set(&tp->dwt.keyboard_timer, usec_add(now, timeout));
+ 		tp->dwt.keyboard_last_press_time = now;
+ 		evdev_log_debug(tp->device, "palm: keyboard timeout refresh\n");
+ 		return;
+@@ -2240,11 +2234,16 @@
+ 	kbdev = libinput_event_get_keyboard_event(event);
+ 	key = libinput_event_keyboard_get_key(kbdev);
+ 
+-	/* Only trigger the timer on key down. */
++	/* A zero timeout suppresses input only while typing keys are held. */
+ 	if (libinput_event_keyboard_get_key_state(kbdev) !=
+ 	    LIBINPUT_KEY_STATE_PRESSED) {
+ 		long_clear_bit(tp->dwt.key_mask, key);
+ 		long_clear_bit(tp->dwt.mod_mask, key);
++		if (tp->dwt.keyboard_active && usec_cmp(tp->dwt.timeout, usec_from_millis(0)) == 0 &&
++		    !long_any_bit_set(tp->dwt.key_mask, ARRAY_LENGTH(tp->dwt.key_mask))) {
++			libinput_timer_cancel(&tp->dwt.keyboard_timer);
++			tp_keyboard_timeout(time, tp);
++		}
+ 		return;
+ 	}
+ 
+@@ -2277,13 +2276,17 @@
+ 
+ 		tp_stop_actions(tp, time);
+ 		tp->dwt.keyboard_active = true;
+-		timeout = DEFAULT_KEYBOARD_ACTIVITY_TIMEOUT_1;
++		timeout = usec_cmp(tp->dwt.timeout, DEFAULT_KEYBOARD_ACTIVITY_TIMEOUT_1) < 0
++				  ? tp->dwt.timeout
++				  : DEFAULT_KEYBOARD_ACTIVITY_TIMEOUT_1;
+ 	} else {
+ 		timeout = tp->dwt.timeout;
+ 	}
+ 
+ 	tp->dwt.keyboard_last_press_time = time;
+ 	long_set_bit(tp->dwt.key_mask, key);
++	if (usec_cmp(timeout, usec_from_millis(0)) == 0)
++		timeout = DEFAULT_KEYBOARD_ACTIVITY_TIMEOUT_1;
+ 	libinput_timer_set(&tp->dwt.keyboard_timer, usec_add(time, timeout));
+ }
+ 
+@@ -3216,8 +3219,7 @@
+ 	struct evdev_device *evdev = evdev_device(device);
+ 	struct tp_dispatch *tp = (struct tp_dispatch *)evdev->dispatch;
+ 
+-	if (usec_cmp(timeout, usec_from_millis(100)) < 0 ||
+-	    usec_cmp(timeout, usec_from_millis(5000)) > 0)
++	if (usec_cmp(timeout, usec_from_millis(5000)) > 0)
+ 		return LIBINPUT_CONFIG_STATUS_INVALID;
+ 
+ 	tp->dwt.timeout = timeout;
+--- a/src/libinput.c
++++ b/src/libinput.c
+@@ -4946,9 +4946,6 @@
+ LIBINPUT_EXPORT enum libinput_config_status
+ libinput_device_config_dwt_set_timeout(struct libinput_device *device, uint32_t millis)
+ {
+-	if (millis == 0)
+-		return LIBINPUT_CONFIG_STATUS_INVALID;
+-
+ 	if (!libinput_device_config_dwt_is_available(device))
+ 		return LIBINPUT_CONFIG_STATUS_UNSUPPORTED;
+ 

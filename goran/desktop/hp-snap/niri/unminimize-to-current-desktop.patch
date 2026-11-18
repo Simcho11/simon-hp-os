@@ -1,0 +1,67 @@
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 7491731..e9b477e 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1629,24 +1629,32 @@ impl<W: LayoutElement> Layout<W> {
+         Some(origin)
+     }
+ 
+-    /// hp-snap patch: if the window is minimized, moves it back to the workspace it came from
+-    /// (or the monitor's active one, if that is gone) and plays the open animation.
++    /// hp-snap patch: if the window is minimized, brings it back on the desktop in focus now (the
++    /// focused monitor's active workspace), not the one it was minimized from, and plays the
++    /// restore animation.
+     fn unminimize_window(&mut self, window: &W::Id) {
+-        let Some(ws_id) = self.take_minimized_origin(window) else {
++        if self.take_minimized_origin(window).is_none() {
+             return;
+-        };
+-        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
++        }
++        let MonitorSet::Normal {
++            monitors,
++            active_monitor_idx,
++            ..
++        } = &mut self.monitor_set
++        else {
+             return;
+         };
++        let focused_output = monitors.get(*active_monitor_idx).map(|mon| mon.output().clone());
+         let Some(mon) = monitors.iter_mut().find(|mon| mon.has_window(window)) else {
+             return;
+         };
+-        let target = mon
+-            .workspaces
+-            .iter()
+-            .position(|ws| ws.id() == ws_id)
+-            .unwrap_or(mon.active_workspace_idx);
++        let target = mon.active_workspace_idx;
+         move_keeping_restore_to_floating(mon, window, target);
++        // Minimized on another display: over to the one in focus, onto its current desktop.
++        let elsewhere = focused_output.filter(|output| mon.output() != output);
++        if let Some(output) = elsewhere {
++            self.move_to_output(Some(window), &output, None, ActivateWindow::No);
++        }
+         // Grow out of the dock (out of the app's own icon, if the dock said where), back into place.
+         let point = self
+             .minimize_points
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index 46a4a69..db40c2b 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3579,10 +3579,14 @@ fn minimized_window_does_not_take_a_desktop() {
+     layout.active_monitor().unwrap().clean_up_workspaces();
+     assert!(layout.find_workspace_by_id(origin).is_some());
+ 
++    // Restored on the desktop in focus now (desktop two), not the one it was minimized from.
++    let current = layout.active_workspace().unwrap().id();
++    assert_ne!(current, origin);
+     layout.activate_window(&1);
+     assert!(!layout.is_minimized(&1));
+-    assert_eq!(layout.active_workspace().unwrap().id(), origin);
++    assert_eq!(layout.active_workspace().unwrap().id(), current);
+     assert!(layout.active_workspace().unwrap().has_window(&1));
++    assert!(!layout.find_workspace_by_id(origin).is_some_and(|(_, ws)| ws.has_window(&1)));
+ }
+ 
+ // hp-snap patch: minimize and restore keep a maximized ex-floating window's way back to floating.

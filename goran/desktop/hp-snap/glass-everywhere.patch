@@ -1,0 +1,24 @@
+diff --git a/modules/iris/field/IrisLiquidLens.qml b/modules/iris/field/IrisLiquidLens.qml
+index cac0a91..ef5c857 100644
+--- a/modules/iris/field/IrisLiquidLens.qml
++++ b/modules/iris/field/IrisLiquidLens.qml
+@@ -117,7 +117,9 @@ Item {
+         property real refraction: (0.75 + 0.25 * root.swell) * IrisStyle.liquidStrength
+         property real pixelRatio: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1
+         property real presence: root.presence * root.reveal
++        // hp-snap: the same Liquid Glass highlight setting as the Dock and every other glass surface.
+         property real highlight: (1.05 + 0.35 * root.swell) * Math.min(1.5, IrisStyle.liquidStrength)
++            * IrisStyle.liquidHighlightStrength
+         // A still wallpaper's texture is the whole picture; the desktop shows it cropped to fill the screen
+         // (IrisWallpaperView's PreserveAspectCrop, centred), so the lens samples the same part.
+         property vector4d crop: {
+@@ -130,6 +132,8 @@ Item {
+             const f = ia / sa
+             return Qt.vector4d(0, (1 - f) / 2, 1, f)
+         }
+-        property vector4d tint: IrisStyle.light ? Qt.vector4d(1, 1, 1, 0.10) : Qt.vector4d(1, 1, 1, 0.06)
++        // hp-snap: and the same Opacity (hpos.materialIntensity, 0.5..1.5): more material, more tint.
++        readonly property real opacityScale: Math.max(0.5, Math.min(1.5, Number(Config.options?.hpos?.materialIntensity ?? 1)))
++        property vector4d tint: Qt.vector4d(1, 1, 1, (IrisStyle.light ? 0.10 : 0.06) * lens.opacityScale)
+     }
+ }

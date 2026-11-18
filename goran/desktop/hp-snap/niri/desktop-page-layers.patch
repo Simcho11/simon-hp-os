@@ -1,0 +1,138 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 8655345..bfc6dca 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -67,6 +67,8 @@ pub mod state;
+ pub enum Request {
+     /// Query whether the compositor supports direct desktop workspace gestures.
+     DesktopSwipeSupported,
++    /// Query support for separate desktop page and stationary wallpaper surfaces.
++    DesktopPageLayersSupported,
+     /// Drive a workspace swipe. The compositor cancels it if this connection closes.
+     DesktopSwipe(DesktopSwipe),
+     /// Request the version string for the running niri instance.
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 252375a..dfdad6c 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -353,7 +353,7 @@ fn apply_desktop_swipe(state: &mut State, name: &str, owner: u64, phase: Desktop
+ 
+ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+     let response = match request {
+-        Request::DesktopSwipeSupported => Response::Handled,
++        Request::DesktopSwipeSupported | Request::DesktopPageLayersSupported => Response::Handled,
+         Request::DesktopSwipe(_) => unreachable!("desktop swipes are connection-scoped"),
+         Request::ReturnError => return Err(String::from("example compositor error")),
+         Request::Version => Response::Version(version()),
+diff --git a/src/niri.rs b/src/niri.rs
+index d8c4118..65bc2a8 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -3411,7 +3411,12 @@ impl Niri {
+                     // Background and bottom layers move together with the workspaces.
+                     if matches!(layer, Layer::Background | Layer::Bottom) {
+                         let mon = self.layout.monitor_for_output(output)?;
+-                        let (_, geo) = mon.workspace_under(pos_within_output)?;
++                        let (workspace, geo) = mon.workspace_under(pos_within_output)?;
++                        if desktop_page_id(layer_surface.namespace())
++                            .is_some_and(|id| id != workspace.id().get())
++                        {
++                            return None;
++                        }
+                         layer_pos_within_output += geo.loc;
+                         // Don't need to deal with zoom here because in the overview background and
+                         // bottom layers don't receive input.
+@@ -4389,6 +4394,13 @@ impl Niri {
+         // Get layer-shell elements.
+         let layer_map = layer_map_for_output(output);
+ 
++        // The HP-OS shell places its wallpaper on the background layer and its
++        // per-page content on bottom. Keep the background at output coordinates
++        // in normal desktop mode, including wallpaper supplied by another client.
++        let fixed_wallpaper = !self.layout.is_overview_open()
++            && layer_map.layers_on(Layer::Background)
++                .any(|surface| matches!(surface.namespace(), "quickshell:background" | "quickshell:iris-background"));
++
+         // We use macros instead of closures to avoid borrowing issues (renderer and push() go
+         // into different functions).
+         macro_rules! push_popups_from_layer {
+@@ -4466,14 +4478,18 @@ impl Niri {
+             push_popups_from_layer!(Layer::Top);
+             push_normal_from_layer!(Layer::Top);
+ 
+-            push_popups_from_layer!(Layer::Bottom);
++            let page = Some(mon.active_workspace_ref().id().get() as usize);
++            let xray_pos = XrayPos::default();
++            push_popups_from_layer!(Layer::Bottom, page, xray_pos, &mut |elem| push(elem.into()));
+             push_popups_from_layer!(Layer::Background);
+-            push_normal_from_layer!(Layer::Bottom);
++            push_normal_from_layer!(Layer::Bottom, page, xray_pos, &mut |elem| push(elem.into()));
+             push_normal_from_layer!(Layer::Background);
+ 
+             // We don't expect more than one workspace when render_above_top_layer().
+-            if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
+-                push(ws.render_background().into());
++            if !fixed_wallpaper {
++                if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
++                    push(ws.render_background().into());
++                }
+             }
+         } else {
+             push_popups_from_layer!(Layer::Top);
+@@ -4504,7 +4520,9 @@ impl Niri {
+                 let ns = Some(ws.id().get() as usize);
+                 let xray_pos = XrayPos::new(geo.loc, zoom);
+                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+-                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
++                if !fixed_wallpaper {
++                    push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
++                }
+             }
+ 
+             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+@@ -4521,9 +4539,14 @@ impl Niri {
+                 let ns = Some(ws.id().get() as usize);
+                 let xray_pos = XrayPos::new(geo.loc, zoom);
+                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+-                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+-
+-                process!(geo)(ws.render_background());
++                if !fixed_wallpaper {
++                    push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
++                    process!(geo)(ws.render_background());
++                }
++            }
++            if fixed_wallpaper {
++                push_popups_from_layer!(Layer::Background);
++                push_normal_from_layer!(Layer::Background);
+             }
+         }
+ 
+@@ -4653,6 +4676,9 @@ impl Niri {
+         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+     ) {
+         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
++            if desktop_page_id(mapped.surface().namespace()).is_some_and(|id| Some(id as usize) != ns) {
++                continue;
++            }
+             let loc = geo.loc.to_f64();
+             let xray_pos = xray_pos.offset(loc);
+             mapped.render_normal(ctx.r(), ns, loc, xray_pos, push);
+@@ -4671,6 +4697,9 @@ impl Niri {
+         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+     ) {
+         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
++            if desktop_page_id(mapped.surface().namespace()).is_some_and(|id| Some(id as usize) != ns) {
++                continue;
++            }
+             let loc = geo.loc.to_f64();
+             let xray_pos = xray_pos.offset(loc);
+             mapped.render_popups(ctx.r(), ns, loc, xray_pos, push);
+@@ -6669,3 +6698,7 @@ niri_render_elements! {
+         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+     }
+ }
++
++fn desktop_page_id(namespace: &str) -> Option<u64> {
++    namespace.strip_prefix("quickshell:hpos-desktop-page-")?.parse().ok()
++}

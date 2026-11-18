@@ -1,0 +1,69 @@
+--- a/niri-config/src/input.rs
++++ b/niri-config/src/input.rs
+@@ -191,6 +191,8 @@
+     pub tap: bool,
+     #[knuffel(child)]
+     pub dwt: bool,
++    #[knuffel(child, unwrap(argument))]
++    pub dwt_timeout: Option<u32>,
+     #[knuffel(child)]
+     pub dwtp: bool,
+     #[knuffel(child, unwrap(argument))]
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -522,7 +522,19 @@
+         let includes = includes.take().0;
+         let include_errors = include_errors.take().0;
+         let config = part
+-            .map(|_| config.take())
++            .map(|_| {
++                let mut config = config.take();
++                // Store the HP-OS preference in a section stock Niri can also read.
++                config.environment.0.retain(|variable| {
++                    if variable.name != "HP_OS_TOUCHPAD_DWT_TIMEOUT_MS" {
++                        return true;
++                    }
++                    config.input.touchpad.dwt_timeout =
++                        variable.value.as_deref().and_then(|value| value.parse().ok());
++                    false
++                });
++                config
++            })
+             .map_err(move |err| ConfigIncludeError {
+                 main: err,
+                 includes: include_errors,
+@@ -989,6 +1001,7 @@
+                     off: false,
+                     tap: true,
+                     dwt: true,
++                    dwt_timeout: None,
+                     dwtp: true,
+                     drag: Some(
+                         true,
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -4710,6 +4710,24 @@
+         });
+         let _ = device.config_tap_set_enabled(c.tap);
+         let _ = device.config_dwt_set_enabled(c.dwt);
++        if device.config_dwt_is_available() {
++            use input::AsRaw;
++
++            unsafe extern "C" {
++                fn libinput_device_config_dwt_set_timeout(
++                    device: *mut std::ffi::c_void,
++                    millis: u32,
++                ) -> std::ffi::c_int;
++            }
++
++            // The pointer is borrowed from the live libinput device for this call.
++            unsafe {
++                libinput_device_config_dwt_set_timeout(
++                    device.as_raw_mut().cast(),
++                    c.dwt_timeout.unwrap_or(500).min(5000),
++                );
++            }
++        }
+         let _ = device.config_dwtp_set_enabled(c.dwtp);
+         let _ = device.config_tap_set_drag_lock_enabled(if c.drag_lock {
+             input::DragLockState::EnabledTimeout

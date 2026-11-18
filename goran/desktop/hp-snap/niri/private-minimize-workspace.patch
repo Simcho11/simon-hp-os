@@ -1,0 +1,588 @@
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index f166276..95eaff6 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -1404,11 +1404,16 @@ impl State {
+                 focus,
+             } => {
+                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+-                let window = window.map(|(_, m)| m.window.clone());
+-                if let Some(window) = window {
+-                    if let Some((output, index)) =
+-                        self.niri.find_output_and_workspace_index(reference)
+-                    {
++                if let Some((monitor, window)) = window {
++                    let window = window.window.clone();
++                    let target = match (&reference, monitor) {
++                        (niri_config::WorkspaceReference::Index(index), Some(mon)) => {
++                            let index = index.saturating_sub(1) as usize;
++                            Some((None, mon.workspace_idx_for_number(index)))
++                        }
++                        _ => self.niri.find_output_and_workspace_index(reference),
++                    };
++                    if let Some((output, index)) = target {
+                         let target_was_active = self
+                             .niri
+                             .layout
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 2ee06de..a835327 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -512,6 +512,23 @@ async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result
+     Ok(())
+ }
+ 
++fn ipc_workspaces<W: crate::layout::LayoutElement>(
++    layout: &crate::layout::Layout<W>,
++) -> impl Iterator<Item = (Option<&crate::layout::monitor::Monitor<W>>, usize, &crate::layout::workspace::Workspace<W>)> {
++    let mut rank = 0;
++    layout.workspaces().filter_map(move |(mon, idx, ws)| {
++        if idx == 0 {
++            rank = 0;
++        }
++        if ws.is_minimize_stash {
++            return None;
++        }
++        let idx = rank;
++        rank += 1;
++        Some((mon, idx, ws))
++    })
++}
++
+ fn make_ipc_window(
+     mapped: &Mapped,
+     workspace_id: Option<WorkspaceId>,
+@@ -603,7 +620,7 @@ impl State {
+         // Check for workspace changes.
+         let mut seen = HashSet::new();
+         let mut need_workspaces_changed = false;
+-        for (mon, ws_idx, ws) in layout.workspaces() {
++        for (mon, ws_idx, ws) in ipc_workspaces(layout) {
+             let id = ws.id().get();
+             seen.insert(id);
+ 
+@@ -645,7 +662,7 @@ impl State {
+             }
+ 
+             // Check if this workspace became active.
+-            let is_active = mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx);
++            let is_active = mon.is_some_and(|mon| mon.active_workspace_ref().id() == ws.id());
+             if is_active && !ipc_ws.is_active {
+                 events.push(Event::WorkspaceActivated { id, focused: false });
+             }
+@@ -659,8 +676,7 @@ impl State {
+         if need_workspaces_changed {
+             events.clear();
+ 
+-            let workspaces = layout
+-                .workspaces()
++            let workspaces = ipc_workspaces(layout)
+                 .map(|(mon, ws_idx, ws)| {
+                     let id = ws.id().get();
+                     Workspace {
+@@ -669,7 +685,7 @@ impl State {
+                         name: ws.name().cloned(),
+                         output: mon.map(|mon| mon.output_name().clone()),
+                         is_urgent: ws.is_urgent(),
+-                        is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
++                        is_active: mon.is_some_and(|mon| mon.active_workspace_ref().id() == ws.id()),
+                         is_focused: Some(id) == focused_ws_id,
+                         active_window_id: ws.active_window().map(|win| win.id().get()),
+                     }
+@@ -705,6 +721,7 @@ impl State {
+         let mut focused_id = None;
+         layout.with_windows(|mapped, _, ws_id, window_layout| {
+             let id = mapped.id().get();
++            let ws_id = ws_id.filter(|_| !layout.is_minimized(&mapped.window));
+             seen.insert(id);
+ 
+             if mapped.is_focused() {
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 003f2b0..61ec086 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1144,7 +1144,25 @@ impl<W: LayoutElement> Layout<W> {
+         window: &W::Id,
+         transaction: Transaction,
+     ) -> Option<RemovedTile<W>> {
+-        self.minimized.retain(|(id, _)| id != window);
++        let origin = self.take_minimized_origin(window);
++        let removed = self.remove_window_from_layout(window, transaction);
++        if origin.is_some() {
++            if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
++                for monitor in monitors {
++                    if monitor.workspace_switch.is_none() {
++                        monitor.clean_up_workspaces();
++                    }
++                }
++            }
++        }
++        removed
++    }
++
++    fn remove_window_from_layout(
++        &mut self,
++        window: &W::Id,
++        transaction: Transaction,
++    ) -> Option<RemovedTile<W>> {
+ 
+         if let Some(state) = &self.interactive_move {
+             match state {
+@@ -1343,7 +1361,8 @@ impl<W: LayoutElement> Layout<W> {
+         if let WorkspaceReference::Index(index) = reference {
+             self.active_monitor().and_then(|m| {
+                 let index = index.saturating_sub(1) as usize;
+-                m.workspaces.get_mut(index)
++                let idx = m.visible_workspace_indices().nth(index)?;
++                m.workspaces.get_mut(idx)
+             })
+         } else {
+             self.workspaces_mut().find(|ws| match &reference {
+@@ -1548,10 +1567,8 @@ impl<W: LayoutElement> Layout<W> {
+         self.minimized.iter().any(|(id, _)| id == window)
+     }
+ 
+-    /// hp-snap patch: where a window would be minimized to: (monitor index, source workspace
+-    /// index, stash workspace index). The stash is a workspace on the same monitor holding only
+-    /// minimized windows, else the last (empty) workspace.
+-    pub fn minimize_target(&self, window: &W::Id) -> Option<(usize, usize, usize)> {
++    /// Locate the window before creating a private holding workspace on its monitor.
++    pub fn minimize_target(&self, window: &W::Id) -> Option<(usize, usize)> {
+         if self.is_minimized(window) {
+             return None;
+         }
+@@ -1563,32 +1580,14 @@ impl<W: LayoutElement> Layout<W> {
+         let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+             return None;
+         };
+-        for (mon_idx, mon) in monitors.iter().enumerate() {
+-            let Some(src) = mon.workspaces.iter().position(|ws| ws.has_window(window)) else {
+-                continue;
+-            };
+-            let stash = mon
+-                .workspaces
+-                .iter()
+-                .enumerate()
+-                .position(|(idx, ws)| {
+-                    idx != src
+-                        && ws.has_windows()
+-                        && ws.windows().all(|w| self.is_minimized(w.id()))
+-                })
+-                .unwrap_or(mon.workspaces.len() - 1);
+-            if stash == src {
+-                return None;
+-            }
+-            return Some((mon_idx, src, stash));
+-        }
+-        None
++        monitors.iter().enumerate().find_map(|(mon_idx, mon)| {
++            let src = mon.workspaces.iter().position(|ws| ws.has_window(window))?;
++            Some((mon_idx, src))
++        })
+     }
+ 
+-    /// hp-snap patch: moves the window to its monitor's stash workspace without switching the
+-    /// view, and remembers where it came from. The caller starts the close animation first.
+     pub fn minimize_window(&mut self, window: &W::Id) -> bool {
+-        let Some((mon_idx, src, stash)) = self.minimize_target(window) else {
++        let Some((mon_idx, src)) = self.minimize_target(window) else {
+             return false;
+         };
+         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+@@ -1596,18 +1595,34 @@ impl<W: LayoutElement> Layout<W> {
+         };
+         let mon = &mut monitors[mon_idx];
+         let ws_id = mon.workspaces[src].id();
++        mon.workspaces[src].minimized_from_here += 1;
++        let stash = mon.workspaces.iter().position(|ws| ws.is_minimize_stash)
++            .unwrap_or_else(|| {
++                let idx = mon.workspaces.len() - 1;
++                mon.add_workspace_at(idx);
++                mon.workspaces[idx].is_minimize_stash = true;
++                idx
++            });
+         self.minimized.push((window.clone(), ws_id));
+         move_keeping_restore_to_floating(mon, window, stash);
+         true
+     }
+ 
++    fn take_minimized_origin(&mut self, window: &W::Id) -> Option<WorkspaceId> {
++        let index = self.minimized.iter().position(|(id, _)| id == window)?;
++        let (_, origin) = self.minimized.remove(index);
++        if let Some(workspace) = self.workspaces_mut().find(|ws| ws.id() == origin) {
++            workspace.minimized_from_here -= 1;
++        }
++        Some(origin)
++    }
++
+     /// hp-snap patch: if the window is minimized, moves it back to the workspace it came from
+     /// (or the monitor's active one, if that is gone) and plays the open animation.
+     fn unminimize_window(&mut self, window: &W::Id) {
+-        let Some(pos) = self.minimized.iter().position(|(id, _)| id == window) else {
++        let Some(ws_id) = self.take_minimized_origin(window) else {
+             return;
+         };
+-        let (_, ws_id) = self.minimized.remove(pos);
+         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+             return;
+         };
+@@ -2279,6 +2294,10 @@ impl<W: LayoutElement> Layout<W> {
+             }
+         }
+ 
++        if window.is_some_and(|id| self.is_minimized(id)) {
++            return;
++        }
++
+         let monitor = if let Some(window) = window {
+             match &mut self.monitor_set {
+                 MonitorSet::Normal { monitors, .. } => monitors
+@@ -3483,6 +3502,10 @@ impl<W: LayoutElement> Layout<W> {
+             }
+         }
+ 
++        if window.is_some_and(|id| self.is_minimized(id)) {
++            return;
++        }
++
+         if let MonitorSet::Normal {
+             monitors,
+             active_monitor_idx,
+@@ -4705,6 +4728,7 @@ impl<W: LayoutElement> Layout<W> {
+             (monitor, index)
+         };
+ 
++        let new_idx = monitor.workspace_idx_for_number(new_idx);
+         monitor.move_workspace_to_idx(old_idx, new_idx);
+     }
+ 
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 53c0606..cb92cdc 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -367,6 +367,41 @@ impl<W: LayoutElement> Monitor<W> {
+         &self.output_name
+     }
+ 
++    pub(crate) fn visible_workspace_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
++        self.workspaces.iter().enumerate()
++            .filter_map(|(idx, ws)| (!ws.is_minimize_stash).then_some(idx))
++    }
++
++    pub(crate) fn workspace_idx_for_number(&self, index: usize) -> usize {
++        self.visible_workspace_indices().nth(index).unwrap_or(self.workspaces.len() - 1)
++    }
++
++    fn adjacent_workspace(&self, idx: usize, down: bool) -> usize {
++        if down {
++            self.visible_workspace_indices().find(|&candidate| candidate > idx)
++        } else {
++            self.visible_workspace_indices().rev().find(|&candidate| candidate < idx)
++        }.unwrap_or(self.active_workspace_idx)
++    }
++
++    // Interpolate the visible position during a switch across an internal workspace.
++    fn visible_render_index(&self, index: f64) -> f64 {
++        let mut previous = None;
++        for (rank, idx) in self.visible_workspace_indices().enumerate() {
++            let idx = idx as f64;
++            let rank = rank as f64;
++            if index <= idx {
++                return match previous {
++                    Some((before, prev_rank)) => prev_rank + (index - before) / (idx - before),
++                    None => index - idx,
++                };
++            }
++            previous = Some((idx, rank));
++        }
++        let (last, rank) = previous.unwrap();
++        rank + index - last
++    }
++
+     pub fn active_workspace_idx(&self) -> usize {
+         self.active_workspace_idx
+     }
+@@ -439,6 +474,10 @@ impl<W: LayoutElement> Monitor<W> {
+         idx: usize,
+         config: Option<niri_config::Animation>,
+     ) {
++        if self.workspaces[idx].is_minimize_stash {
++            return;
++        }
++
+         // FIXME: also compute and use current velocity.
+         let current_idx = self.workspace_render_idx();
+ 
+@@ -785,7 +824,7 @@ impl<W: LayoutElement> Monitor<W> {
+     pub fn move_to_workspace_up(&mut self, focus: bool) {
+         let source_workspace_idx = self.active_workspace_idx;
+ 
+-        let new_idx = source_workspace_idx.saturating_sub(1);
++        let new_idx = self.adjacent_workspace(source_workspace_idx, false);
+         if new_idx == source_workspace_idx {
+             return;
+         }
+@@ -819,7 +858,7 @@ impl<W: LayoutElement> Monitor<W> {
+     pub fn move_to_workspace_down(&mut self, focus: bool) {
+         let source_workspace_idx = self.active_workspace_idx;
+ 
+-        let new_idx = min(source_workspace_idx + 1, self.workspaces.len() - 1);
++        let new_idx = self.adjacent_workspace(source_workspace_idx, true);
+         if new_idx == source_workspace_idx {
+             return;
+         }
+@@ -910,7 +949,7 @@ impl<W: LayoutElement> Monitor<W> {
+     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
+         let source_workspace_idx = self.active_workspace_idx;
+ 
+-        let new_idx = source_workspace_idx.saturating_sub(1);
++        let new_idx = self.adjacent_workspace(source_workspace_idx, false);
+         if new_idx == source_workspace_idx {
+             return;
+         }
+@@ -931,7 +970,7 @@ impl<W: LayoutElement> Monitor<W> {
+     pub fn move_column_to_workspace_down(&mut self, activate: bool) {
+         let source_workspace_idx = self.active_workspace_idx;
+ 
+-        let new_idx = min(source_workspace_idx + 1, self.workspaces.len() - 1);
++        let new_idx = self.adjacent_workspace(source_workspace_idx, true);
+         if new_idx == source_workspace_idx {
+             return;
+         }
+@@ -980,10 +1019,9 @@ impl<W: LayoutElement> Monitor<W> {
+             // During a DnD scroll, select the prev apparent workspace.
+             Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
+                 let current = gesture.current_idx;
+-                let new = current.ceil() - 1.;
+-                new.clamp(0., (self.workspaces.len() - 1) as f64) as usize
++                self.adjacent_workspace(current.ceil() as usize, false)
+             }
+-            _ => self.active_workspace_idx.saturating_sub(1),
++            _ => self.adjacent_workspace(self.active_workspace_idx, false),
+         };
+ 
+         self.activate_workspace(new_idx);
+@@ -994,10 +1032,9 @@ impl<W: LayoutElement> Monitor<W> {
+             // During a DnD scroll, select the next apparent workspace.
+             Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
+                 let current = gesture.current_idx;
+-                let new = current.floor() + 1.;
+-                new.clamp(0., (self.workspaces.len() - 1) as f64) as usize
++                self.adjacent_workspace(current.floor() as usize, true)
+             }
+-            _ => min(self.active_workspace_idx + 1, self.workspaces.len() - 1),
++            _ => self.adjacent_workspace(self.active_workspace_idx, true),
+         };
+ 
+         self.activate_workspace(new_idx);
+@@ -1240,7 +1277,7 @@ impl<W: LayoutElement> Monitor<W> {
+     }
+ 
+     pub fn move_workspace_down(&mut self) {
+-        let mut new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
++        let mut new_idx = self.adjacent_workspace(self.active_workspace_idx, true);
+         if new_idx == self.active_workspace_idx {
+             return;
+         }
+@@ -1266,7 +1303,7 @@ impl<W: LayoutElement> Monitor<W> {
+     }
+ 
+     pub fn move_workspace_up(&mut self) {
+-        let mut new_idx = self.active_workspace_idx.saturating_sub(1);
++        let mut new_idx = self.adjacent_workspace(self.active_workspace_idx, false);
+         if new_idx == self.active_workspace_idx {
+             return;
+         }
+@@ -1471,7 +1508,7 @@ impl<W: LayoutElement> Monitor<W> {
+         }
+     }
+ 
+-    pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
++    pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> + '_ {
+         let scale = self.scale.fractional_scale();
+         let zoom = self.overview_zoom();
+ 
+@@ -1484,12 +1521,14 @@ impl<W: LayoutElement> Monitor<W> {
+             .to_physical_precise_round(scale)
+             .to_logical(scale);
+ 
+-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
++        let first_ws_y = -self.visible_render_index(self.workspace_render_idx()) * ws_height_with_gap;
+         let first_ws_y = round_logical_in_physical(scale, first_ws_y);
+ 
+         // Return position for one-past-last workspace too.
+-        (0..=self.workspaces.len()).map(move |idx| {
+-            let y = first_ws_y + idx as f64 * ws_height_with_gap;
++        let mut rank = 0;
++        self.workspaces.iter().map(|ws| ws.is_minimize_stash).chain([false]).map(move |hidden| {
++            let y = first_ws_y + rank as f64 * ws_height_with_gap;
++            rank += usize::from(!hidden);
+             let loc = Point::from((0., y)) + static_offset;
+ 
+             // Even though all components that go into loc are rounded to physical pixels, the
+@@ -1510,7 +1549,7 @@ impl<W: LayoutElement> Monitor<W> {
+         let geo = self.workspaces_render_geo();
+         zip(self.workspaces.iter(), geo)
+             // Cull out workspaces outside the output.
+-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
++            .filter(move |(ws, geo)| !ws.is_minimize_stash && geo.intersection(output_geo).is_some())
+     }
+ 
+     pub fn workspaces_with_render_geo_idx(
+@@ -1521,7 +1560,7 @@ impl<W: LayoutElement> Monitor<W> {
+         let geo = self.workspaces_render_geo();
+         zip(self.workspaces.iter().enumerate(), geo)
+             // Cull out workspaces outside the output.
+-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
++            .filter(move |((_, ws), geo)| !ws.is_minimize_stash && geo.intersection(output_geo).is_some())
+     }
+ 
+     pub fn workspaces_with_render_geo_mut(
+@@ -1530,10 +1569,10 @@ impl<W: LayoutElement> Monitor<W> {
+     ) -> impl Iterator<Item = (&mut Workspace<W>, Rectangle<f64, Logical>)> {
+         let output_geo = Rectangle::from_size(self.view_size);
+ 
+-        let geo = self.workspaces_render_geo();
++        let geo: Vec<_> = self.workspaces_render_geo().collect();
+         zip(self.workspaces.iter_mut(), geo)
+             // Cull out workspaces outside the output.
+-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
++            .filter(move |(ws, geo)| !ws.is_minimize_stash && (!cull || geo.intersection(output_geo).is_some()))
+     }
+ 
+     pub fn workspace_under(
+@@ -2006,6 +2045,13 @@ impl<W: LayoutElement> Monitor<W> {
+         let new_idx = new_idx.round() as usize;
+ 
+         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
++        let current_idx = gesture.current_idx;
++
++        let new_idx = if self.workspaces[new_idx].is_minimize_stash {
++            self.adjacent_workspace(new_idx, new_idx > self.active_workspace_idx)
++        } else {
++            new_idx
++        };
+ 
+         if self.active_workspace_idx != new_idx {
+             self.previous_workspace_id = Some(self.workspaces[self.active_workspace_idx].id());
+@@ -2014,7 +2060,7 @@ impl<W: LayoutElement> Monitor<W> {
+         self.active_workspace_idx = new_idx;
+         self.workspace_switch = Some(WorkspaceSwitch::Animation(Animation::new(
+             self.clock.clone(),
+-            gesture.current_idx,
++            current_idx,
+             new_idx as f64,
+             velocity,
+             self.options.animations.workspace_switch.0,
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index eb82b4a..46a4a69 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3553,6 +3553,38 @@ fn restore_to_floating_persists_across_fullscreen_maximize() {
+     assert!(scrolling.tiles().next().is_none());
+ }
+ 
++#[test]
++fn minimized_window_does_not_take_a_desktop() {
++    let mut layout = check_ops([
++        Op::AddOutput(1),
++        Op::AddWindow { params: TestWindowParams::new(1) },
++    ]);
++    let origin = layout.active_workspace().unwrap().id();
++    assert!(layout.minimize_window(&1));
++    assert!(layout.is_minimized(&1));
++    assert!(layout.has_window(&1));
++    assert!(!layout.active_workspace().unwrap().has_window(&1));
++
++    let monitor = layout.active_monitor_ref().unwrap();
++    let desktop_two = monitor.workspace_idx_for_number(1);
++    assert_eq!(monitor.visible_workspace_indices().count(), 2);
++    assert!(!monitor.workspaces[desktop_two].has_windows());
++    let stash = monitor.workspaces.iter().find(|ws| ws.is_minimize_stash).unwrap().id();
++    assert!(monitor.workspaces_with_render_geo().all(|(ws, _)| ws.id() != stash));
++    layout.switch_workspace_down();
++    assert_eq!(layout.active_monitor_ref().unwrap().active_workspace_idx(), desktop_two);
++
++    // After workspace-switch animations finish, the empty origin still exists.
++    layout.active_monitor().unwrap().workspace_switch = None;
++    layout.active_monitor().unwrap().clean_up_workspaces();
++    assert!(layout.find_workspace_by_id(origin).is_some());
++
++    layout.activate_window(&1);
++    assert!(!layout.is_minimized(&1));
++    assert_eq!(layout.active_workspace().unwrap().id(), origin);
++    assert!(layout.active_workspace().unwrap().has_window(&1));
++}
++
+ // hp-snap patch: minimize and restore keep a maximized ex-floating window's way back to floating.
+ #[test]
+ fn minimize_restore_keeps_restore_to_floating() {
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 4212327..7e19851 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -44,6 +44,11 @@ use crate::window::ResolvedWindowRules;
+ 
+ #[derive(Debug)]
+ pub struct Workspace<W: LayoutElement> {
++    // Internal holding space for minimized windows. Never exposed as a desktop.
++    pub(crate) is_minimize_stash: bool,
++
++    // Retain an otherwise empty desktop until its last minimized window is restored or closed.
++    pub(super) minimized_from_here: usize,
+     /// The scrollable-tiling layout.
+     scrolling: ScrollingSpace<W>,
+ 
+@@ -256,6 +261,8 @@ impl<W: LayoutElement> Workspace<W> {
+         Self {
+             scrolling,
+             floating,
++            is_minimize_stash: false,
++            minimized_from_here: 0,
+             floating_is_active: FloatingActive::No,
+             original_output,
+             scale,
+@@ -320,6 +327,8 @@ impl<W: LayoutElement> Workspace<W> {
+         Self {
+             scrolling,
+             floating,
++            is_minimize_stash: false,
++            minimized_from_here: 0,
+             floating_is_active: FloatingActive::No,
+             output: None,
+             scale,
+@@ -355,7 +364,7 @@ impl<W: LayoutElement> Workspace<W> {
+     }
+ 
+     pub fn has_windows_or_name(&self) -> bool {
+-        self.has_windows() || self.name.is_some()
++        self.has_windows() || self.name.is_some() || self.minimized_from_here != 0
+     }
+ 
+     pub fn scale(&self) -> smithay::output::Scale {
+diff --git a/src/niri.rs b/src/niri.rs
+index cc293f0..18de564 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -3653,7 +3653,10 @@ impl Niri {
+     ) -> Option<(Option<Output>, usize)> {
+         let (target_workspace_index, target_workspace) = match workspace_reference {
+             WorkspaceReference::Index(index) => {
+-                return Some((None, index.saturating_sub(1) as usize));
++                let index = index.saturating_sub(1) as usize;
++                let index = self.layout.active_monitor_ref()
++                    .map_or(index, |mon| mon.workspace_idx_for_number(index));
++                return Some((None, index));
+             }
+             WorkspaceReference::Name(name) => self.layout.find_workspace_by_name(&name)?,
+             WorkspaceReference::Id(id) => {
+@@ -3662,6 +3665,9 @@ impl Niri {
+             }
+         };
+ 
++        if target_workspace.is_minimize_stash {
++            return None;
++        }
+         let target_output = target_workspace.current_output();
+         Some((target_output.cloned(), target_workspace_index))
+     }

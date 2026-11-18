@@ -1,0 +1,29 @@
+--- a/src/evdev-mt-touchpad-buttons.c	2026-11-11 10:23:09.278432883 -0800
++++ b/src/evdev-mt-touchpad-buttons.c	2026-11-11 10:23:09.298557090 -0800
+@@ -1259,7 +1259,26 @@
+ 			return 0;
+ 		}
+ 
++		/* hp-snap patch: with several touches down, the button comes from
++		 * the touch placed last, the finger that clicks. A palm or thumb
++		 * already resting in the bottom-right area otherwise turned every
++		 * left click into a right click. A lone touch in a button area
++		 * keeps its button. */
++		struct tp_touch *newest = NULL;
++		unsigned int down = 0;
++
++		tp_for_each_touch(tp, t) {
++			if (t->state == TOUCH_NONE || t->state == TOUCH_HOVERING)
++				continue;
++			down++;
++			if (!newest || usec_cmp(t->button.initial_time,
++						 newest->button.initial_time) > 0)
++				newest = t;
++		}
++
+ 		tp_for_each_touch(tp, t) {
++			if (down > 1 && t != newest)
++				continue;
+ 			switch (t->button.current) {
+ 			case BUTTON_EVENT_IN_AREA:
+ 				area |= AREA;

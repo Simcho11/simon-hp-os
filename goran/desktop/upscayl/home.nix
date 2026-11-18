@@ -14,7 +14,8 @@ in {
  config = lib.mkIf (config.programs.hp-os-fleet.enable && config.programs.hp-os-fleet.upscayl.enable && pkgs.stdenv.hostPlatform.isLinux) {
   home.packages = [ app ];
   home.activation.upscaylSandbox = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-    if [[ -x /usr/sbin/apparmor_parser && -d /sys/module/apparmor ]]; then
+    # The ordinary administrator update installs the system rule. Enrollment runs as a desktop user.
+    if [[ "''${HP_OS_ACCOUNT_PROVISION:-0}" != 1 && -x /usr/sbin/apparmor_parser && -d /sys/module/apparmor ]]; then
       run /usr/bin/sudo -n /usr/bin/install -m 0644 ${sandboxPolicy} /etc/apparmor.d/upscayl-electron
       run /usr/bin/sudo -n /usr/sbin/apparmor_parser -r /etc/apparmor.d/upscayl-electron
     fi

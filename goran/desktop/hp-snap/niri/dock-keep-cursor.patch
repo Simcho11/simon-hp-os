@@ -1,0 +1,152 @@
+diff --git a/niri-config/src/binds.rs b/niri-config/src/binds.rs
+index 768a6d4..5387e35 100644
+--- a/niri-config/src/binds.rs
++++ b/niri-config/src/binds.rs
+@@ -160,7 +160,7 @@ pub enum Action {
+     #[knuffel(skip)]
+     ToggleWindowedFullscreenById(u64),
+     #[knuffel(skip)]
+-    FocusWindow(u64),
++    FocusWindow { id: u64, keep_cursor: bool },
+     FocusWindowInColumn(#[knuffel(argument)] u8),
+     FocusWindowPrevious,
+     FocusColumnLeft,
+@@ -447,7 +447,9 @@ impl From<niri_ipc::Action> for Action {
+             niri_ipc::Action::ToggleWindowedFullscreen { id: Some(id) } => {
+                 Self::ToggleWindowedFullscreenById(id)
+             }
+-            niri_ipc::Action::FocusWindow { id } => Self::FocusWindow(id),
++            niri_ipc::Action::FocusWindow { id, keep_cursor } => {
++                Self::FocusWindow { id, keep_cursor }
++            }
+             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
+             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
+             niri_ipc::Action::FocusColumnLeft {} => Self::FocusColumnLeft,
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0c74ac3..d23525f 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -363,6 +363,10 @@ pub enum Action {
+         /// Id of the window to focus.
+         #[cfg_attr(feature = "clap", arg(long))]
+         id: u64,
++        /// Keep the pointer in place while activating the window.
++        #[serde(default)]
++        #[cfg_attr(feature = "clap", arg(long))]
++        keep_cursor: bool,
+     },
+     /// Focus a window in the focused column by index.
+     FocusWindowInColumn {
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index bf8ee0a..e35dc7f 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -922,11 +922,11 @@ impl State {
+                     self.niri.queue_redraw_all();
+                 }
+             }
+-            Action::FocusWindow(id) => {
++            Action::FocusWindow { id, keep_cursor } => {
+                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                 let window = window.map(|(_, m)| m.window.clone());
+                 if let Some(window) = window {
+-                    self.focus_window(&window);
++                    self.focus_window(&window, keep_cursor);
+                 }
+             }
+             Action::FocusWindowInColumn(index) => {
+@@ -950,7 +950,7 @@ impl State {
+                     // Commit current focus so repeated focus-window-previous works as expected.
+                     self.niri.mru_apply_keyboard_commit();
+ 
+-                    self.focus_window(&window);
++                    self.focus_window(&window, false);
+                 }
+             }
+             Action::SwitchLayout(action) => {
+diff --git a/src/niri.rs b/src/niri.rs
+index 3e0c2b9..cb628ce 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -986,18 +986,20 @@ impl State {
+ 
+     /// Focus a specific window, taking care of a potential active output change and cursor
+     /// warp.
+-    pub fn focus_window(&mut self, window: &Window) {
++    pub fn focus_window(&mut self, window: &Window, keep_cursor: bool) {
+         let active_output = self.niri.layout.active_output().cloned();
+ 
+         self.niri.layout.activate_window(window);
+ 
+-        let new_active = self.niri.layout.active_output().cloned();
+-        if new_active != active_output {
+-            if !self.maybe_warp_cursor_to_focus_centered() {
+-                self.move_cursor_to_output(&new_active.unwrap());
++        if !keep_cursor {
++            let new_active = self.niri.layout.active_output().cloned();
++            if new_active != active_output {
++                if !self.maybe_warp_cursor_to_focus_centered() {
++                    self.move_cursor_to_output(&new_active.unwrap());
++                }
++            } else {
++                self.maybe_warp_cursor_to_focus();
+             }
+-        } else {
+-            self.maybe_warp_cursor_to_focus();
+         }
+ 
+         // FIXME: granular
+@@ -1049,7 +1051,7 @@ impl State {
+ 
+     pub fn confirm_mru(&mut self) {
+         if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
+-            self.focus_window(&window);
++            self.focus_window(&window, false);
+         }
+     }
+ 
+diff --git a/src/tests/floating.rs b/src/tests/floating.rs
+index 3ceedfd..4397d4a 100644
+--- a/src/tests/floating.rs
++++ b/src/tests/floating.rs
+@@ -32,6 +32,40 @@ fn set_up_with_config(config: Config) -> (Fixture, ClientId, WlSurface) {
+     (f, id, surface)
+ }
+ 
++#[test]
++fn dock_focus_keeps_pointer_on_its_output() {
++    let (mut f, _, _) = set_up();
++    let window_id = f.niri().layout.windows().next().unwrap().1.id().get();
++    let window_output = f.niri().layout.active_output().unwrap().clone();
++    let dock_output = if f.niri_output(1) == window_output {
++        f.niri_output(2)
++    } else {
++        f.niri_output(1)
++    };
++    let state = f.niri_state();
++    state.niri.layout.focus_output(&dock_output);
++    state.move_cursor_to_output(&dock_output);
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    let dock_location = pointer.current_location();
++
++    let focus = |keep_cursor| {
++        serde_json::from_value::<niri_ipc::Action>(serde_json::json!({
++            "FocusWindow": { "id": window_id, "keep_cursor": keep_cursor }
++        }))
++        .unwrap()
++        .into()
++    };
++    state.do_action(focus(true), false);
++    assert_eq!(state.niri.layout.active_output(), Some(&window_output));
++    assert_eq!(state.niri.layout.focus().unwrap().id().get(), window_id);
++    assert_eq!(pointer.current_location(), dock_location);
++
++    state.niri.layout.focus_output(&dock_output);
++    state.do_action(focus(false), false);
++    assert_eq!(state.niri.layout.active_output(), Some(&window_output));
++    assert_ne!(pointer.current_location(), dock_location);
++}
++
+ #[test]
+ fn unfocus_preserves_current_size() {
+     let (mut f, id, surface) = set_up();
