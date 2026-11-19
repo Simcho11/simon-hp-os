@@ -61,5 +61,6 @@ in {
     git apply ${./file-drops.patch}
     git apply ${./device-settings.patch}
     git apply ${./desktop-pages.patch}
+    git apply ${./desktop-polish.patch}
   '';
 }

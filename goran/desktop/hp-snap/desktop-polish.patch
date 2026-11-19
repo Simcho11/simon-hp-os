@@ -1,0 +1,617 @@
+diff --git a/modules/background/Background.qml b/modules/background/Background.qml
+index 8dd6fb7..a13d313 100644
+--- a/modules/background/Background.qml
++++ b/modules/background/Background.qml
+@@ -2310,7 +2310,15 @@ Scope {
+                     ? IrisPieces.addMenu(desktopMenuAnchor.x / Math.max(1, desktopMenuAnchor.parent.width),
+                         desktopMenuAnchor.y / Math.max(1, desktopMenuAnchor.parent.height),
+                         () => { irisDesktopMenu.pickingBubble = false })
+-                    : IrisDesktopActions.menu(bgRoot.screenName, bgRoot.wallpaperPath, bgRoot.wallpaperPath).concat(irisDesktopMenu.bubbleEntry)
++                    : irisDesktopMenu.folderEntry.concat(IrisDesktopActions.menu(bgRoot.screenName, bgRoot.wallpaperPath, bgRoot.wallpaperPath), irisDesktopMenu.bubbleEntry)
++                // hp-snap: right-click the desktop > New Folder, made where it was clicked
++                readonly property var folderEntry: [
++                    { text: Translation.tr("New Folder"), iconName: "create_new_folder",
++                        action: () => {
++                            const at = desktopMenuAnchor.mapToItem(desktopDropCoordinator, 0, 0)
++                            desktopDropCoordinator.newFolderAt(at.x, at.y)
++                        } },
++                    { type: "separator" }]
+             }
+ 
+             // Managed items use the same stable screen-level popup path as the
+diff --git a/modules/background/desktopItems/DesktopDragGhost.qml b/modules/background/desktopItems/DesktopDragGhost.qml
+index dbba497..4473c53 100644
+--- a/modules/background/desktopItems/DesktopDragGhost.qml
++++ b/modules/background/desktopItems/DesktopDragGhost.qml
+@@ -123,11 +123,31 @@ Singleton {
+             GlobalStates.desktopGroupAction("dragCancel")
+             GlobalStates.desktopGroupLeader = ""
+         }
+-        const moves = {}
+-        for (const p of plan)
++        const moves = {}, landing = {}
++        const w = root.work
++        for (const p of plan) {
+             moves[p.id] = { output: root.output, workspacePage: page || undefined, x: p.x, y: p.y }
++            // hp-snap: each icon glides from where it was let go into its place (no jump, no double)
++            const m = root.group.find(member => member.id === p.id) ?? { dx: 0, dy: 0 }
++            landing[p.id] = { dx: root.x + m.dx - w.x - p.x, dy: root.y + m.dy - w.y - p.y }
++        }
++        root.landing = landing
++        root.landingAt = Date.now()
+         console.log("hpos-carry: placing", plan.length, "on page", page)
+         DesktopItems.updateMany(moves)
++        root.landed()
++    }
++    property var landing: ({})
++    property real landingAt: 0
++    signal landed()
++    // An icon's own landing glide, once (null when it has none).
++    function takeLanding(id: string): var {
++        const l = root.landing[id]
++        if (!l || Date.now() - root.landingAt > 1500) return null
++        const rest = Object.assign({}, root.landing)
++        delete rest[id]
++        root.landing = rest
++        return l
+     }
+ 
+     function begin(output: string, page: int, size: size, iconSource: url, label: string, screen: var, owner: var,
+diff --git a/modules/background/desktopItems/DesktopDropCoordinator.qml b/modules/background/desktopItems/DesktopDropCoordinator.qml
+index c8ef2a3..221b09b 100644
+--- a/modules/background/desktopItems/DesktopDropCoordinator.qml
++++ b/modules/background/desktopItems/DesktopDropCoordinator.qml
+@@ -122,6 +122,34 @@ Item {
+         DesktopFolder.rescan()
+     }
+ 
++    // hp-snap: right-click > New Folder: an empty folder where the desktop was clicked, ready to name.
++    function newFolderAt(x: real, y: real): void {
++        if (newFolder.running) return
++        root._dropX = x
++        root._dropY = y
++        newFolder.position = root._position(0)
++        newFolder.page = root.page
++        newFolder.running = true
++    }
++    Process {
++        id: newFolder
++        property int page: 0
++        property var position: ({})
++        command: ["python3", DesktopFolder.script, "new-folder"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                const dest = text.trim()
++                if (dest.length === 0) return
++                const id = DesktopItems.create({ kind: "folder", target: "file://" + dest,
++                    label: root._labelFor(dest), desktopFile: true, output: root.outputName,
++                    workspacePage: newFolder.page || undefined, x: newFolder.position.x, y: newFolder.position.y })
++                if (id.length === 0) return
++                GlobalStates.selectDesktopItem(root.outputName + "::desktopItem." + id)
++                DesktopFolder.renameNext = id
++            }
++        }
++    }
++
+     function createAccesses(urls, x, y): void {
+         root._enqueue(urls, x, y)
+     }
+@@ -282,7 +310,9 @@ Item {
+             const files = [], others = []
+             for (const url of drop.urls) {
+                 const text = String(url)
+-                if (text.startsWith("file:") && !text.endsWith(".desktop")) files.push(text)
++                // hp-snap: anything from the Trash (launchers too) comes out of the Trash onto the desktop
++                const fromTrash = text.startsWith("trash:") || text.includes("/.local/share/Trash/files/")
++                if (fromTrash || (text.startsWith("file:") && !text.endsWith(".desktop"))) files.push(text)
+                 else others.push(text)
+             }
+             if (others.length > 0)
+diff --git a/modules/background/desktopItems/DesktopItemDelegate.qml b/modules/background/desktopItems/DesktopItemDelegate.qml
+index e906ab5..caeab91 100644
+--- a/modules/background/desktopItems/DesktopItemDelegate.qml
++++ b/modules/background/desktopItems/DesktopItemDelegate.qml
+@@ -355,6 +355,9 @@ Item {
+             { text: Translation.tr("Edit destination"), iconName: "edit", monochromeIcon: true,
+                 visible: !root.fromFolder,
+                 action: () => root.beginDestinationEdit() },
++            { text: Translation.tr("Set as Wallpaper"), iconName: "wallpaper", monochromeIcon: true,
++                visible: root.fromFolder && Images.isValidImageByName(root._pathForProbe()),
++                action: () => Wallpapers.setFromFile(root._pathForProbe()) },
+             { text: Translation.tr("Rename"), iconName: "drive_file_rename_outline", monochromeIcon: true,
+                 action: () => root.beginRename() },
+             { text: root.locked ? Translation.tr("Unlock") : Translation.tr("Lock"), iconName: root.locked ? "lock_open" : "lock", monochromeIcon: true,
+@@ -417,7 +420,20 @@ Item {
+         }
+     }
+ 
++    // hp-snap: a new folder starts with its name ready to type
++    function _renameIfNew(): void {
++        if (DesktopFolder.renameNext.length === 0 || DesktopFolder.renameNext !== root.itemId) return
++        DesktopFolder.renameNext = ""
++        Qt.callLater(() => root.beginRename())
++    }
++    Connections {
++        target: DesktopFolder
++        function onRenameNextChanged(): void { root._renameIfNew() }
++    }
++
+     Component.onCompleted: {
++        root._renameIfNew()
++        root._land()
+         root._componentReady = true
+         root._refreshTarget()
+         positionReconcile.restart()
+@@ -706,7 +722,8 @@ Item {
+     }
+     Loader {
+         active: root._picturing
+-        x: -4 * root.width
++        // Drawn far off screen: it is only there to be photographed.
++        x: -100000
+         sourceComponent: Item {
+             width: root.width
+             height: root.height
+@@ -886,6 +903,12 @@ Item {
+                 return
+             }
+             const pos = root._clampPosition(root.x, root.y)
++            if (Math.abs(root.x - pos.x) < 400 && Math.abs(root.y - pos.y) < 400) {
++                root._landDx = root.x - pos.x       // glides the last bit into its place
++                root._landDy = root.y - pos.y
++                root._landing = true
++                landGlide.restart()
++            }
+             root.x = pos.x
+             root.y = pos.y
+             if (Math.abs(root.x - root._pressX) > 1 || Math.abs(root.y - root._pressY) > 1)
+@@ -933,7 +956,35 @@ Item {
+     property bool _leaving: false
+     property bool _placedHere: false
+     Timer { id: leaveTimer; interval: 1500; onTriggered: root._leaving = false }
+-    opacity: root._leaving ? 0 : root._lifted || (root._groupFollowing && DesktopDragGhost.lifted)
++    // hp-snap: landing after a carry: drawn from where it was let go, gliding into its place.
++    property bool _landing: false
++    property real _landDx: 0
++    property real _landDy: 0
++    transform: Translate { x: root._landDx; y: root._landDy }
++    ParallelAnimation {
++        id: landGlide
++        NumberAnimation { target: root; property: "_landDx"; to: 0; duration: 280; easing.type: Easing.OutCubic }
++        NumberAnimation { target: root; property: "_landDy"; to: 0; duration: 280; easing.type: Easing.OutCubic }
++        onFinished: root._landing = false
++    }
++    function _land(): void {
++        const l = DesktopDragGhost.takeLanding(root.itemId)
++        if (!l) return
++        root._landing = true
++        if (root._positionOverride) {
++            root._positionOverride = false       // to its new place now; the glide covers the distance
++            root.x = Number(root.workArea.left ?? 0) + Number(root.itemData?.x ?? 0)
++            root.y = Number(root.workArea.top ?? 0) + Number(root.itemData?.y ?? 0)
++        }
++        root._landDx = Math.abs(l.dx) < 400 ? l.dx : 0
++        root._landDy = Math.abs(l.dy) < 400 ? l.dy : 0
++        landGlide.restart()
++    }
++    Connections {
++        target: DesktopDragGhost
++        function onLanded(): void { root._land() }
++    }
++    opacity: root._leaving ? 0 : (root._lifted && !root._landing) || (root._groupFollowing && DesktopDragGhost.lifted)
+         ? (root.fromFolder ? 0.4 : 0) : 1
+     Drag.active: root._lifted
+     Drag.dragType: Drag.Automatic
+@@ -962,8 +1013,10 @@ Item {
+             GlobalStates.desktopGroupLeader = ""
+         }
+         DesktopDragGhost.end("drag-and-drop finished, action " + dropAction)
+-        root.x = root._pressX
+-        root.y = root._pressY
++        if (!root._landing) {                  // a landing icon is already in its new place
++            root.x = root._pressX
++            root.y = root._pressY
++        }
+         root._positionOverride = false
+     }
+     Connections {
+diff --git a/modules/background/widgets/AbstractBackgroundWidget.qml b/modules/background/widgets/AbstractBackgroundWidget.qml
+index 4b475c6..3b2c4f1 100644
+--- a/modules/background/widgets/AbstractBackgroundWidget.qml
++++ b/modules/background/widgets/AbstractBackgroundWidget.qml
+@@ -577,7 +577,41 @@ AbstractWidget {
+ 
+     // In edit mode, allow dragging regardless of strategy (user can reposition freely)
+     readonly property bool _isZonePlacement: root._snapZones.indexOf(root.placementStrategy) >= 0
+-    draggable: (placementStrategy === "free" || GlobalStates.widgetEditMode) && !GlobalStates.screenLocked && !root.locked
++    // hp-snap: every widget can be moved unless it is locked (it becomes free-placed where it is let go).
++    draggable: !GlobalStates.screenLocked && !root.locked
++
++    // hp-snap: a widget held at the top or bottom edge, or scrolled while held, goes to the desktop page
++    // above or below, keeping its place on the screen.
++    property int _pageEdge: 0
++    property real _lastPageCarry: 0
++    Timer {
++        id: pageEdgeDwell
++        interval: 550
++        onTriggered: if (root.isDragging) root._carryToPage(root._pageEdge)
++    }
++    onDragPointer: (px, py, h) => {
++        const edge = py < 24 ? -1 : (h > 0 && py > h - 24) ? 1 : 0
++        if (edge === root._pageEdge) return
++        root._pageEdge = edge
++        if (edge !== 0) pageEdgeDwell.restart()
++        else pageEdgeDwell.stop()
++    }
++    onDragWheel: direction => root._carryToPage(direction)
++    function _carryToPage(direction: int): void {
++        if (direction === 0 || root.locked || root.stacked || root.outputName.length === 0
++                || !Config.workspacePageContents || !CompositorService.isNiri) return
++        if (Date.now() - root._lastPageCarry < 700) return
++        const pages = NiriService.allWorkspaces.filter(w => w.output === root.outputName)
++        const here = DesktopWidgetLayout.pageForWidget(root.outputName, root.configEntryName)
++        const destination = pages.find(w => w.idx === here + direction)
++        if (!destination) return
++        root._lastPageCarry = Date.now()
++        root._pageEdge = 0
++        root._setOutputValues({ x: root._clampX(root.x), y: root._clampY(root.y), placementStrategy: "free",
++            workspacePage: destination.idx })
++        NiriService.switchToWorkspaceById(destination.id)
++        if (root._pageEdge === 0 && root.isDragging) pageEdgeDwell.restart()   // still held at the edge: on again
++    }
+     grabCursor: GlobalStates.widgetEditMode
+     function syncFreePositionFromConfig(): void {
+         if (!Config.ready || root.containsPress || root._isResizing) return;
+@@ -1740,8 +1774,10 @@ AbstractWidget {
+         fontPixelSize: Appearance.font.pixelSize.smaller
+     }
+ 
+-    onCanceled: root._clearStackDrop()
++    onCanceled: { pageEdgeDwell.stop(); root._pageEdge = 0; root._clearStackDrop() }
+     onReleased: {
++        pageEdgeDwell.stop()
++        root._pageEdge = 0
+         if (GlobalStates.screenLocked || !root.dragMoved) return;
+         if (root._dropKey.length > 0) {
+             root._absorb()
+diff --git a/modules/common/widgets/widgetCanvas/AbstractWidget.qml b/modules/common/widgets/widgetCanvas/AbstractWidget.qml
+index f751670..cd5d2be 100644
+--- a/modules/common/widgets/widgetCanvas/AbstractWidget.qml
++++ b/modules/common/widgets/widgetCanvas/AbstractWidget.qml
+@@ -27,6 +27,10 @@ Item {
+     signal pressed()
+     signal released()
+     signal canceled()
++    // hp-snap: where the pointer is in its window while the widget is held (window height h), and
++    // scrolling while it is held (+1 down, -1 up).
++    signal dragPointer(real px, real py, real h)
++    signal dragWheel(int direction)
+ 
+     function center() {
+         root.x = (root.parent.width - root.width) / 2
+@@ -56,6 +60,15 @@ Item {
+             root.pressed()
+         }
+         drag.onActiveChanged: if (drag.active) root.dragMoved = true
++        onPositionChanged: mouse => {
++            if (!drag.active) return
++            const p = mapToItem(null, mouse.x, mouse.y)
++            root.dragPointer(p.x, p.y, root.Window.height)
++        }
++        onWheel: wheel => {
++            if (!pressed || Math.abs(wheel.angleDelta.y) < 1) { wheel.accepted = false; return }
++            root.dragWheel(wheel.angleDelta.y < 0 ? 1 : -1)
++        }
+         onReleased: {
+             root.released()
+             root._dragSessionActive = false
+diff --git a/modules/wallpaperSelector/WallpaperSelectorRouter.qml b/modules/wallpaperSelector/WallpaperSelectorRouter.qml
+index 28dec3d..6815cf3 100644
+--- a/modules/wallpaperSelector/WallpaperSelectorRouter.qml
++++ b/modules/wallpaperSelector/WallpaperSelectorRouter.qml
+@@ -195,6 +195,7 @@ Scope {
+             }
+             root.toggle()
+         }
++        function setFromFile(path: string): string { Wallpapers.setFromFile(path); return "ok" }
+         function random(): void { Wallpapers.randomFromCurrentFolder() }
+         function next(): string { return Wallpapers.nextWallpaper() || "no wallpaper in " + Wallpapers.shuffleFolder }
+         function shuffle(value: string): string {
+diff --git a/scripts/hp-snap/desktop_folder.py b/scripts/hp-snap/desktop_folder.py
+index 5c9042c..cefd4af 100755
+--- a/scripts/hp-snap/desktop_folder.py
++++ b/scripts/hp-snap/desktop_folder.py
+@@ -165,9 +165,25 @@ def copy_in(source):
+     print(dest)
+ 
+ 
++def new_folder():
++    """Make an empty folder on the desktop ("New Folder", "New Folder (2)", ...); print its path."""
++    folder = desktop_dir()
++    os.makedirs(folder, exist_ok=True)
++    while True:
++        path = free_name(folder, "New Folder", "")
++        try:
++            os.mkdir(path)
++            break
++        except FileExistsError:
++            continue
++    print(path)
++
++
+ if __name__ == "__main__":
+     if len(sys.argv) >= 2 and sys.argv[1] == "scan":
+         scan()
++    elif len(sys.argv) >= 2 and sys.argv[1] == "new-folder":
++        new_folder()
+     elif len(sys.argv) >= 3 and sys.argv[1] == "copy-in":
+         copy_in(sys.argv[2])
+     elif len(sys.argv) >= 3 and sys.argv[1] == "migrate":
+diff --git a/scripts/hp-snap/desktop_peek.py b/scripts/hp-snap/desktop_peek.py
+index 6877b71..68ccbde 100755
+--- a/scripts/hp-snap/desktop_peek.py
++++ b/scripts/hp-snap/desktop_peek.py
+@@ -2,36 +2,38 @@
+ """hp-snap: show the desktop while its widgets are edited (the widget library and the widgets live on
+ the desktop, under every window).
+ 
+-  desktop_peek.py peek      remember this output's workspace and go to its empty one (niri always
+-                            keeps one), so the windows slide out of the way; nothing is minimized
+-  desktop_peek.py restore   go back to the remembered workspace
++  desktop_peek.py peek      tuck this desktop page's windows into the Dock, so its widgets are in
++                            view; the page stays the same
++  desktop_peek.py restore   bring those windows back onto that page
+ """
+ import json, os, subprocess, sys
+ 
+ STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hp-snap-desktop-peek.json")
+ 
+ 
+-def workspaces():
+-    out = subprocess.run(["niri", "msg", "-j", "workspaces"], capture_output=True, text=True, timeout=5).stdout
+-    return json.loads(out or "[]")
++def niri(*args):
++    return subprocess.run(["niri", "msg", *args], capture_output=True, text=True, timeout=5)
+ 
+ 
+-def focus(idx):
+-    subprocess.run(["niri", "msg", "action", "focus-workspace", str(idx)], timeout=5)
++def read(what):
++    try:
++        return json.loads(niri("-j", what).stdout or "[]")
++    except ValueError:
++        return []
+ 
+ 
+ def peek():
+-    ws = workspaces()
+-    current = next((w for w in ws if w.get("is_focused")), None)
+-    if not current or current.get("active_window_id") is None:
+-        return                                    # already on an empty workspace
+-    mine = sorted((w for w in ws if w.get("output") == current.get("output")), key=lambda w: w["idx"])
+-    empty = [w for w in mine if w.get("active_window_id") is None]
+-    if not empty:
++    current = next((w for w in read("workspaces") if w.get("is_focused")), None)
++    if not current:
+         return
++    mine = [w for w in read("windows") if w.get("workspace_id") == current["id"]]
++    if not mine:
++        return                                    # nothing in the way
++    mine.sort(key=lambda w: (w.get("is_focused", False), w["id"]))   # the one in front comes back last
+     with open(STATE, "w") as f:
+-        json.dump({"id": current["id"], "output": current.get("output")}, f)
+-    focus(empty[-1]["idx"])
++        json.dump({"workspace": current["id"], "windows": [w["id"] for w in mine]}, f)
++    for w in mine:
++        niri("action", "minimize-window", "--id", str(w["id"]))
+ 
+ 
+ def restore():
+@@ -41,13 +43,18 @@ def restore():
+     except (OSError, ValueError):
+         return
+     os.remove(STATE)
+-    ws = workspaces()
+-    current = next((w for w in ws if w.get("is_focused")), None)
+-    if current and current.get("active_window_id") is not None:
+-        return                                    # moved on to a window meanwhile: stay there
+-    target = next((w for w in ws if w["id"] == saved["id"]), None)
+-    if target:
+-        focus(target["idx"])
++    workspaces = read("workspaces")
++    home = next((w for w in workspaces if w["id"] == saved.get("workspace")), None)
++    current = next((w for w in workspaces if w.get("is_focused")), None)
++    tucked = {w["id"] for w in read("windows") if w.get("minimized_from_workspace_id") is not None}
++    for wid in saved.get("windows", []):
++        if wid not in tucked:
++            continue                              # closed, or brought back from the Dock already
++        niri("action", "focus-window", "--id", str(wid))     # comes back on the page in view
++        if home and current and home["id"] != current["id"]:
++            # Edited another page meanwhile: the window goes home without taking the view along.
++            niri("action", "move-window-to-workspace", "--window-id", str(wid), "--focus", "false",
++                 str(home["idx"]))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/hp-snap/folder_drop.py b/scripts/hp-snap/folder_drop.py
+index 34fb1f8..dc64343 100644
+--- a/scripts/hp-snap/folder_drop.py
++++ b/scripts/hp-snap/folder_drop.py
+@@ -23,8 +23,20 @@ RENAME_NOREPLACE = 1
+ LIBC = ctypes.CDLL(None, use_errno=True)
+ 
+ 
++def trash_dir():
++    return Path(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))) / "Trash"
++
++
+ def local_path(uri):
+     url = urlsplit(uri)
++    if url.scheme == "trash":
++        # Dragged out of the Trash window: trash:/name (Dolphin's home Trash is trash:/0-name).
++        name = unquote(url.path, errors="strict").lstrip("/")
++        if "/" in name:
++            raise ValueError("Drag the whole item out of the Trash.")
++        if name.startswith("0-") and not os.path.lexists(trash_dir() / "files" / name):
++            name = name[2:]
++        return trash_dir() / "files" / name
+     if url.scheme != "file" or url.netloc not in ("", "localhost") or not url.path.startswith("/"):
+         raise ValueError("Only files on this device can be dropped here.")
+     return Path(unquote(url.path, errors="strict"))
+@@ -68,10 +80,49 @@ def copy_item(source, staged):
+         shutil.copy2(source, staged, follow_symlinks=False)
+ 
+ 
++def trashed(source):
++    """The Trash's record of source when source is an item in the Trash, else None."""
++    files = trash_dir() / "files"
++    if source.parent.resolve() != files.resolve():
++        return None
++    return trash_dir() / "info" / (source.name + ".trashinfo")
++
++
++def original_name(info, fallback):
++    try:
++        for line in info.read_text(errors="replace").splitlines():
++            if line.startswith("Path="):
++                return Path(unquote(line[5:])).name or fallback
++    except OSError:
++        pass
++    return fallback
++
++
++def out_of_trash(source, folder, info):
++    """Takes an item out of the Trash into folder, under the name it had before it was trashed."""
++    name = original_name(info, source.name)
++    if os.lstat(source).st_dev == os.stat(folder).st_dev:
++        dest = put(source, folder, name)
++    else:
++        with TemporaryDirectory(prefix=".hp-os-copy-", dir=folder) as staging:
++            staged = Path(staging) / "item"
++            copy_item(source, staged)
++            dest = put(staged, folder, name)
++        if source.is_dir() and not source.is_symlink():
++            shutil.rmtree(source)
++        else:
++            source.unlink()
++    info.unlink(missing_ok=True)
++    return dest
++
++
+ def transfer(action, folder, url):
+     source = local_path(url)
+     if not os.path.lexists(source) or not source.name:
+         raise ValueError(f"{source.name or source} is no longer available.")
++    info = trashed(source)
++    if info is not None:
++        return out_of_trash(source, folder, info)
+     real_dir = source.is_dir() and not source.is_symlink()
+     if source.parent.resolve() == folder and action == "auto":
+         return source
+diff --git a/scripts/hp-snap/set_wallpaper.py b/scripts/hp-snap/set_wallpaper.py
+new file mode 100755
+index 0000000..3d3148b
+--- /dev/null
++++ b/scripts/hp-snap/set_wallpaper.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""hp-snap: Files' "Set as Wallpaper": hands the picture to the running desktop.
++
++  set_wallpaper.py QS PICTURE     ask the running desktop to use PICTURE
++  set_wallpaper.py keep PICTURE   copy PICTURE into Pictures/Wallpapers (so deleting it later keeps the
++                                  wallpaper); print the copy's path
++"""
++import filecmp, os, re, shutil, subprocess, sys
++
++
++def keep(picture):
++    folder = os.path.join(os.path.expanduser("~"), "Pictures", "Wallpapers")
++    os.makedirs(folder, exist_ok=True)
++    picture = os.path.realpath(picture)
++    if os.path.dirname(picture) == os.path.realpath(folder):
++        print(picture)
++        return 0
++    stem, suffix = os.path.splitext(os.path.basename(picture))
++    n = 1
++    while True:
++        dest = os.path.join(folder, stem + (f" {n}" if n > 1 else "") + suffix)
++        if not os.path.exists(dest):
++            shutil.copy2(picture, dest)
++            break
++        if filecmp.cmp(dest, picture, shallow=False):
++            break                                     # already kept
++        n += 1
++    print(dest)
++    return 0
++
++
++def desktop_pid(qs):
++    listing = subprocess.run([qs, "list", "--all"], capture_output=True, text=True, timeout=10).stdout
++    found = None
++    for block in listing.split("Instance ")[1:]:
++        pid = re.search(r"Process ID: (\d+)", block)
++        path = re.search(r"Config path: (.*)", block)
++        if pid and path and path.group(1).strip().endswith("/share/quickshell/inir/shell.qml"):
++            if os.path.exists(f"/proc/{pid.group(1)}"):
++                found = pid.group(1)                      # the newest one wins
++    return found
++
++
++def main(qs, picture):
++    picture = os.path.abspath(picture)
++    pid = desktop_pid(qs)
++    if not pid or not os.path.isfile(picture):
++        subprocess.run(["notify-send", "Couldn’t set the wallpaper", "Try again in a moment."], check=False)
++        return 1
++    subprocess.run([qs, "ipc", "--pid", pid, "call", "wallpaperSelector", "setFromFile", picture], timeout=20, check=False)
++    return 0
++
++
++if __name__ == "__main__":
++    if len(sys.argv) < 3:
++        sys.exit(__doc__)
++    if sys.argv[1] == "keep":
++        sys.exit(keep(sys.argv[2]))
++    sys.exit(main(sys.argv[1], sys.argv[2]))
+diff --git a/services/DesktopFolder.qml b/services/DesktopFolder.qml
+index ee56f01..5b8e4eb 100644
+--- a/services/DesktopFolder.qml
++++ b/services/DesktopFolder.qml
+@@ -21,6 +21,8 @@ Singleton {
+     property bool _scanning: false
+     property bool _rescanQueued: false
+     property bool _migrating: false
++    // hp-snap: the icon to start renaming once it is on the desktop (a new folder)
++    property string renameNext: ""
+ 
+     function pathOf(target: string): string {
+         return String(target ?? "").replace(/^file:\/\//, "")
+diff --git a/services/Wallpapers.qml b/services/Wallpapers.qml
+index 291047f..97eb96e 100644
+--- a/services/Wallpapers.qml
++++ b/services/Wallpapers.qml
+@@ -1060,6 +1060,24 @@ Singleton {
+         return "main"
+     }
+ 
++    // hp-snap: "Set as Wallpaper" on a picture (desktop or Files): a copy is kept in Pictures/Wallpapers
++    // first, so the wallpaper stays when the picture is deleted.
++    function setFromFile(filePath: string): void {
++        const path = String(filePath ?? "").replace(/^file:\/\//, "")
++        if (path.length === 0) return
++        keepProc.command = ["python3", Quickshell.shellPath("scripts/hp-snap/set_wallpaper.py"), "keep", path]
++        keepProc.running = true
++    }
++    Process {
++        id: keepProc
++        stdout: StdioCollector {
++            onStreamFinished: {
++                const kept = text.trim()
++                if (kept.length > 0) root.select(kept)
++            }
++        }
++    }
++
+     function select(filePath, darkMode = Appearance.m3colors.darkmode, monitorName = "", target = "") {
+         const perMonitor = (Config.options?.background?.multiMonitor?.enable ?? false) ? monitorName : ""
+         selectProc.select(filePath, darkMode, perMonitor, target)

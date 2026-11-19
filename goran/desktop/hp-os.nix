@@ -209,6 +209,22 @@ in {
     # XDG_DATA_DIRS still includes the previous HP-OS store generation.
     xdg.dataFile."applications/org.kde.dolphin.desktop".source =
       "${shell}/share/hp-os/applications/org.kde.dolphin.desktop";
+    # Files: right-click a picture > Set as Wallpaper.
+    xdg.dataFile."kio/servicemenus/hp-os-set-wallpaper.desktop" = lib.mkIf useSnap {
+      executable = true;
+      text = ''
+        [Desktop Entry]
+        Type=Service
+        MimeType=image/png;image/jpeg;image/webp;image/gif;image/bmp;image/avif;image/heif;image/jxl;
+        Actions=setWallpaper;
+        X-KDE-Priority=TopLevel
+
+        [Desktop Action setWallpaper]
+        Name=Set as Wallpaper
+        Icon=preferences-desktop-wallpaper
+        Exec=${pkgs.python3}/bin/python3 -I ${snap.runtime}/share/quickshell/inir/scripts/hp-snap/set_wallpaper.py ${nativeQs}/bin/qs %f
+      '';
+    };
     fonts.fontconfig.enable = true;
     xdg.configFile."xdg-desktop-portal/hp-os-portals.conf".text = ''
       [preferred]
