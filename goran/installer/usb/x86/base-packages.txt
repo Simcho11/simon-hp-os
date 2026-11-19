@@ -3,6 +3,9 @@
 linux-generic linux-firmware firmware-sof-signed intel-microcode amd64-microcode initramfs-tools
 grub-efi-amd64-signed grub-efi-amd64-bin shim-signed efibootmgr
 systemd-sysv systemd-zram-generator dbus-user-session
+# Sets the clock from the internet, like Ubuntu on the ARM devices. Laptops that had Windows keep local time in
+# their hardware clock, which Linux reads as GMT, so without this the clock can stay hours off.
+chrony
 # Everyday system services
 network-manager wpasupplicant wireless-regdb bluez upower power-profiles-daemon udisks2 polkitd
 pipewire pipewire-pulse pipewire-alsa wireplumber libspa-0.2-bluetooth alsa-utils

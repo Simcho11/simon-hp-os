@@ -8,8 +8,8 @@ It can only ever create a standard (non-administrator) account, and never touche
 With --first-boot it is started by the hp-os-first-setup socket instead, for the login screen of a device
 that has never been set up: it makes the device's first account, an administrator. It refuses unless the
 device is marked as new and has no administrator yet. On such a device it also answers the welcome's Wi-Fi and
-Software Update steps: {"action": "wifi-list" | "wifi-join" | "update-check" | "update-install" | "update-status" |
-"restart"}.
+Software Update steps, and the time zone step after the password: {"action": "wifi-list" | "wifi-join" |
+"update-check" | "update-install" | "update-status" | "restart" | "timezone-list" | "timezone-set"}.
 """
 import ctypes
 import fcntl
@@ -287,8 +287,58 @@ def update_install():
     return {"ok": True}
 
 
+ZONEINFO = "/usr/share/zoneinfo"
+
+
+def time_zones():
+    """Every place in the system's own time zone list, by country, with its distance from GMT today."""
+    import datetime
+    import zoneinfo
+    countries = {}
+    with open(os.path.join(ZONEINFO, "iso3166.tab"), encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip() and not line.startswith("#"):
+                code, _, name = line.rstrip("\n").partition("\t")
+                countries[code] = name
+    now = datetime.datetime.now(datetime.timezone.utc)
+    zones = []
+    with open(os.path.join(ZONEINFO, "zone.tab"), encoding="utf-8") as stream:
+        for line in stream:
+            fields = line.rstrip("\n").split("\t")
+            if line.startswith("#") or len(fields) < 3:
+                continue
+            try:
+                offset = int(now.astimezone(zoneinfo.ZoneInfo(fields[2])).utcoffset().total_seconds() // 60)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+                continue
+            zones.append({"zone": fields[2], "country": countries.get(fields[0], fields[0]),
+                          "city": fields[2].rsplit("/", 1)[-1].replace("_", " "),
+                          "region": fields[3] if len(fields) > 3 else "", "offset": offset})
+    return sorted(zones, key=lambda zone: (zone["country"], zone["city"]))
+
+
+def current_zone():
+    try:
+        return os.path.realpath("/etc/localtime").split("/zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return ""
+
+
+def set_time_zone(request):
+    zone = request.get("zone")
+    if not isinstance(zone, str) or zone not in {place["zone"] for place in time_zones()}:
+        raise Refused("Choose a time zone from the list.")
+    if run("/usr/bin/timedatectl", "set-timezone", zone, timeout=30).returncode != 0:
+        raise Refused("The time zone couldn’t be set. You can try again.")
+    return {"ok": True}
+
+
 def welcome_step(request):
     action = request.get("action")
+    if action == "timezone-list":
+        return {"ok": True, "zones": time_zones(), "current": current_zone()}
+    if action == "timezone-set":
+        return set_time_zone(request)
     if action == "wifi-list":
         return wifi_list()
     if action == "wifi-join":

@@ -22,8 +22,11 @@ ShellRoot {
     readonly property var expressive: [0.16, 1, 0.3, 1, 1, 1]
 
     // ── The answers ──
-    // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password, 3 approve, 4 done
+    // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password,
+    // 8 time zone (new device only), 3 approve or set up, 4 done
     property int step: firstBoot ? 5 : 0
+    // Where each step sits in the flow, so screens slide the way the person is going.
+    function order(step) { return [0, 1, 2, 4, 5, -3, -2, -1, 3][step] }
     property Item activePage: null
     // Set by the first-setup service just before the restart that finishes an update: Wi-Fi and the update are done,
     // so the welcome carries on at "What's your name?" instead of starting over.
@@ -257,6 +260,14 @@ ShellRoot {
                 { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
                 { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
             else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
+            else if (a === "timezone-list") done({ ok: true, current: "Etc/UTC", zones: [
+                { zone: "Asia/Kolkata", country: "India", city: "Kolkata", region: "", offset: 330 },
+                { zone: "Europe/London", country: "Britain (UK)", city: "London", region: "", offset: 0 },
+                { zone: "America/New_York", country: "United States", city: "New York", region: "Eastern (most areas)", offset: -300 },
+                { zone: "America/Chicago", country: "United States", city: "Chicago", region: "Central (most areas)", offset: -360 },
+                { zone: "America/Denver", country: "United States", city: "Denver", region: "Mountain (most areas)", offset: -420 },
+                { zone: "America/Los_Angeles", country: "United States", city: "Los Angeles", region: "Pacific", offset: -480 },
+                { zone: "Asia/Kathmandu", country: "Nepal", city: "Kathmandu", region: "", offset: 345 } ] })
             else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
             else if (a === "update-status") { mockLater.progress = Math.min(100, mockLater.progress + 9)
                 done({ ok: true, status: { state: mockLater.progress >= 100 ? "restart" : "downloading", progress: mockLater.progress,
@@ -265,6 +276,72 @@ ShellRoot {
         }
     }
     Timer { id: mockLater; property var job: null; property real progress: 5; interval: 900; function run(job) { mockLater.job = job; start() } onTriggered: if (job) job() }
+
+    // ── Time zone (a new device): the whole device keeps time by it ──
+    property var zones: []
+    property string zoneSearch: ""
+    property string chosenZone: ""
+    property string zoneNotice: ""
+    property bool settingZone: false
+    property string heldPassword: ""           // From the password screen, until the time zone is chosen.
+    function plain(text) { return String(text).normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/−/g, "-").toLowerCase() }
+    readonly property var zoneMatches: {
+        const words = app.plain(app.zoneSearch).split(/[\s,]+/).filter(word => word.length > 0)
+        if (words.length === 0) return app.zones
+        return app.zones.filter(place => {
+            const text = app.plain([place.country, place.city, place.region, place.zone, app.offsetText(place.offset)].join(" "))
+            return words.every(word => text.indexOf(word) >= 0)
+        })
+    }
+    readonly property var chosenPlace: app.zones.find(place => place.zone === app.chosenZone) || null
+    function offsetText(minutes) {
+        if (!minutes) return "GMT"
+        const size = Math.abs(minutes)
+        return "GMT" + (minutes > 0 ? "+" : "−") + Math.floor(size / 60) + (size % 60 ? ":" + String(size % 60).padStart(2, "0") : "")
+    }
+    function timeThere(minutes) {
+        const there = new Date(Date.now() + minutes * 60000)
+        const hours = there.getUTCHours(), mins = String(there.getUTCMinutes()).padStart(2, "0")
+        return (hours % 12 || 12) + ":" + mins + (hours < 12 ? " AM" : " PM")
+    }
+    function placeName(place) { return place.country === place.city ? place.city : place.country + " · " + place.city }
+    function chooseTimeZone(password) {
+        app.heldPassword = password
+        app.zoneNotice = ""
+        app.zoneSearch = ""
+        zoneSearchField.text = ""
+        app.step = 8
+        Qt.callLater(() => zoneSearchField.input.forceActiveFocus())
+        app.ask({ action: "timezone-list" }, answer => {
+            app.zones = answer.zones || []
+            // Keep what the device already has only if it is a real place; a bare UTC means nobody chose it.
+            const current = String(answer.current || "")
+            if (!app.chosenZone && app.zones.some(place => place.zone === current)) app.chosenZone = current
+            if (app.zones.length === 0) app.zoneNotice = "The time zone list couldn’t be loaded. You can set it later."
+        })
+    }
+    function confirmTimeZone() {
+        if (app.settingZone) return
+        if (!app.chosenZone) { app.finishTimeZone(); return }      // Only when the list couldn't be loaded.
+        app.settingZone = true
+        app.zoneNotice = ""
+        app.ask({ action: "timezone-set", zone: app.chosenZone }, answer => {
+            app.settingZone = false
+            if (answer.ok) app.finishTimeZone()
+            else app.zoneNotice = answer.error || "The time zone couldn’t be set."
+        })
+    }
+    function finishTimeZone() {
+        const password = app.heldPassword
+        app.heldPassword = ""
+        app.requestAccount(password)
+    }
+    function leaveTimeZone() {
+        app.heldPassword = ""
+        app.zoneNotice = ""
+        app.step = 2
+        passwordField.input.forceActiveFocus()
+    }
 
     function requestAccount(password) {
         app.notice = ""
@@ -350,6 +427,7 @@ ShellRoot {
             if (app.step === 3) mockAsk.start()
             if (app.step === 6) app.scanWifi()
             if (app.step === 7) app.startUpdate()
+            if (app.step === 8) app.chooseTimeZone("previewpassword")
         }
     }
 
@@ -448,7 +526,7 @@ ShellRoot {
             scale: 0.97 + 0.03 * app.appear
             Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
             transform: Translate {
-                x: page.current ? 0 : (app.step > page.index ? -win.px(70) : win.px(70))
+                x: page.current ? 0 : (app.order(app.step) > app.order(page.index) ? -win.px(70) : win.px(70))
                 Behavior on x { NumberAnimation { duration: 480; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
             }
             readonly property Item holderItem: holder
@@ -878,8 +956,124 @@ ShellRoot {
                 if (!ready) return
                 const password = passwordField.text
                 passwordField.text = ""; verifyField.text = ""
-                app.requestAccount(password)
+                if (app.firstBoot) app.chooseTimeZone(password)
+                else app.requestAccount(password)
             }
+        }
+
+        // ── 4. Time zone (a new device) ──
+        Page {
+            index: 8
+            Title { text: "Choose your time zone" }
+            Subtitle { text: "Search for your country or a city." }
+            Gap { size: 14 }
+            Field {
+                id: zoneSearchField
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Search, like India or New York"
+                input.maximumLength: 48
+                input.onTextChanged: {
+                    app.zoneSearch = zoneSearchField.text
+                    // One match left: that's the one.
+                    if (app.zoneMatches.length === 1) app.chosenZone = app.zoneMatches[0].zone
+                }
+                onAccepted: { if (app.chosenZone) app.confirmTimeZone() }
+                Keys.onDownPressed: zoneList.move(1)
+                Keys.onUpPressed: zoneList.move(-1)
+            }
+            ListView {
+                id: zoneList
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: win.px(440)
+                height: win.px(3 * 50 + 2 * 6)
+                spacing: win.px(6)
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: app.zoneMatches
+                function move(by) {
+                    const places = app.zoneMatches
+                    if (places.length === 0) return
+                    const at = places.findIndex(place => place.zone === app.chosenZone)
+                    const next = Math.max(0, Math.min(places.length - 1, at < 0 ? 0 : at + by))
+                    app.chosenZone = places[next].zone
+                    zoneList.positionViewAtIndex(next, ListView.Contain)
+                }
+                Connections {
+                    target: app
+                    function onStepChanged() { if (app.step === 8) Qt.callLater(zoneList.showChosen) }
+                    function onZonesChanged() { Qt.callLater(zoneList.showChosen) }
+                }
+                function showChosen() {
+                    const at = app.zoneMatches.findIndex(place => place.zone === app.chosenZone)
+                    if (at >= 0) zoneList.positionViewAtIndex(at, ListView.Center)
+                }
+                delegate: Rectangle {
+                    id: zoneRow
+                    required property var modelData
+                    readonly property bool chosen: modelData.zone === app.chosenZone
+                    width: zoneList.width; height: win.px(50)
+                    radius: height / 2
+                    color: chosen ? "white" : Qt.rgba(1, 1, 1, zoneHit.pressed ? 0.24 : zoneHit.containsMouse ? 0.18 : 0.12)
+                    border.width: 1
+                    border.color: Qt.rgba(1, 1, 1, chosen ? 0 : 0.2)
+                    Behavior on color { ColorAnimation { duration: 140 } }
+                    Column {
+                        anchors { left: parent.left; leftMargin: win.px(24); right: zoneOffset.left; rightMargin: win.px(12); verticalCenter: parent.verticalCenter }
+                        Label {
+                            width: parent.width
+                            horizontalAlignment: Text.AlignLeft
+                            elide: Text.ElideRight
+                            text: app.placeName(zoneRow.modelData)
+                            color: zoneRow.chosen ? "#0b2a6b" : "white"
+                            font.pixelSize: win.px(17); font.weight: Font.Medium
+                        }
+                        Label {
+                            visible: zoneRow.modelData.region.length > 0
+                            width: parent.width
+                            horizontalAlignment: Text.AlignLeft
+                            elide: Text.ElideRight
+                            text: zoneRow.modelData.region
+                            color: zoneRow.chosen ? Qt.rgba(0.04, 0.16, 0.42, 0.7) : Qt.rgba(1, 1, 1, 0.65)
+                            font.pixelSize: win.px(13)
+                        }
+                    }
+                    Label {
+                        id: zoneOffset
+                        anchors { right: parent.right; rightMargin: win.px(24); verticalCenter: parent.verticalCenter }
+                        text: app.offsetText(zoneRow.modelData.offset)
+                        color: zoneRow.chosen ? "#0b2a6b" : Qt.rgba(1, 1, 1, 0.75)
+                        font.pixelSize: win.px(15)
+                    }
+                    MouseArea {
+                        id: zoneHit
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { app.chosenZone = zoneRow.modelData.zone; zoneSearchField.input.forceActiveFocus() }
+                        onDoubleClicked: app.confirmTimeZone()
+                    }
+                }
+                Label {
+                    visible: zoneList.count === 0
+                    anchors.centerIn: parent
+                    text: app.zones.length === 0 && !app.zoneNotice ? "Loading…" : app.zones.length === 0 ? "" : "No places match that."
+                    color: Qt.rgba(1, 1, 1, 0.7)
+                    font.pixelSize: win.px(17)
+                }
+            }
+            Note {
+                color: app.zoneNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8)
+                text: app.zoneNotice ? app.zoneNotice
+                    : app.chosenPlace ? "It’s " + app.timeThere(app.chosenPlace.offset) + " in " + app.chosenPlace.city + "." : " "
+            }
+            Gap { size: 4 }
+            Primary {
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: app.settingZone ? "Setting…" : "Continue"
+                ready: !app.settingZone && (!!app.chosenZone || (app.zones.length === 0 && app.zoneNotice.length > 0))
+                onActivated: app.confirmTimeZone()
+            }
+            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Back"; onActivated: app.leaveTimeZone() }
         }
 
         // ── 4. An administrator approves ──
@@ -988,20 +1182,21 @@ ShellRoot {
             }
         }
 
-        // Where you are: four quiet dots.
+        // Where you are: four quiet dots (name, picture, password, then approval or the time zone).
         Row {
-            visible: app.step < (app.firstBoot ? 3 : 4)
+            readonly property int at: app.step === 8 ? 3 : app.step
+            visible: app.firstBoot ? (app.step < 3 || app.step === 8) : app.step < 4
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             anchors.bottomMargin: win.px(46)
             spacing: win.px(10)
             Repeater {
-                model: app.firstBoot ? 3 : 4
+                model: 4
                 Rectangle {
                     required property int index
-                    width: win.px(index === app.step ? 22 : 8); height: win.px(8)
+                    width: win.px(index === parent.at ? 22 : 8); height: win.px(8)
                     radius: height / 2
-                    color: Qt.rgba(1, 1, 1, index === app.step ? 0.95 : 0.4)
+                    color: Qt.rgba(1, 1, 1, index === parent.at ? 0.95 : 0.4)
                     Behavior on width { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
                 }
             }
@@ -1034,6 +1229,7 @@ ShellRoot {
                 else if (app.step === 0) app.leave("", "")
                 else if (app.step === 1) { app.step = 0; nameField.input.forceActiveFocus() }
                 else if (app.step === 2) { app.step = 1; win.contentItem.forceActiveFocus() }
+                else if (app.step === 8 && !app.settingZone) app.leaveTimeZone()
                 else if (app.step === 3 && !app.working) app.cancelApproval()
             }
         }
