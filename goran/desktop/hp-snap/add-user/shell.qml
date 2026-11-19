@@ -22,7 +22,8 @@ ShellRoot {
     readonly property var expressive: [0.16, 1, 0.3, 1, 1, 1]
 
     // ── The answers ──
-    property int step: firstBoot ? 5 : 0       // 5 hello (new device), 0 name, 1 picture, 2 password, 3 approve, 4 done
+    // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password, 3 approve, 4 done
+    property int step: firstBoot ? 5 : 0
     property string fullName: ""
     readonly property var faces: ["daybreak", "tide", "bloom", "dune", "aurora"]
     property string face: ""                   // empty: their initial
@@ -120,6 +121,119 @@ ShellRoot {
                 : "Approval was cancelled, so no account was created."
         }
     }
+    // ── A new device: Wi-Fi, then the newest HP-OS, before the first account (accounts.py --first-boot) ──
+    property var networks: []
+    property bool online: false
+    property bool scanning: false
+    property var chosenNetwork: null
+    property bool joining: false
+    property string wifiNotice: ""
+    property string updatePhase: "checking"      // checking, installing, current, failed, restarting
+    property string updateVersion: ""
+    property real updateProgress: 0
+    property string updateMessage: ""
+    Process {
+        id: welcomeRequest
+        property string message: ""
+        property var answer: null
+        property var then: null
+        stdinEnabled: true
+        command: ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/first-setup.sock"]
+        stdout: SplitParser { onRead: line => { try { welcomeRequest.answer = JSON.parse(line) } catch (error) {} } }
+        onStarted: { welcomeRequest.write(welcomeRequest.message + "\n"); welcomeRequest.message = "" }
+        onExited: { const done = welcomeRequest.then; welcomeRequest.then = null; if (done) done(welcomeRequest.answer || { ok: false }) }
+    }
+    function ask(message, done) {
+        if (app.preview) { mockWelcome.reply(message, done); return }
+        if (welcomeRequest.running) return
+        welcomeRequest.answer = null
+        welcomeRequest.then = done
+        welcomeRequest.message = JSON.stringify(message)
+        welcomeRequest.running = true
+    }
+    function startWifi() {
+        app.step = 6
+        app.wifiNotice = ""
+        app.scanWifi()
+    }
+    function scanWifi() {
+        app.scanning = true
+        app.ask({ action: "wifi-list" }, answer => {
+            app.scanning = false
+            app.networks = answer.networks || []
+            app.online = answer.online === true
+            // Already online (a cable, or a network joined before): straight on to updates.
+            if (app.online && app.step === 6 && !app.chosenNetwork) app.startUpdate()
+        })
+    }
+    function joinWifi(password) {
+        if (!app.chosenNetwork || app.joining) return
+        app.joining = true
+        app.wifiNotice = ""
+        app.ask({ action: "wifi-join", ssid: app.chosenNetwork.ssid, secure: app.chosenNetwork.secure,
+                  sae: app.chosenNetwork.sae, password: password }, answer => {
+            app.joining = false
+            if (answer.ok) { app.online = true; app.startUpdate() }
+            else app.wifiNotice = answer.error || "Couldn’t join that network."
+        })
+    }
+    function skipWifi() { app.step = 0; nameField.input.forceActiveFocus() }
+    function startUpdate() {
+        app.step = 7
+        app.updatePhase = "checking"
+        app.ask({ action: "update-check" }, answer => {
+            const status = answer.status || {}
+            if (status.available && status.available.version) {
+                app.updateVersion = String(status.available.version)
+                app.updatePhase = "installing"
+                app.updateProgress = 0
+                app.updateMessage = "Downloading…"
+                app.ask({ action: "update-install" }, () => updatePoll.start())
+            } else if (status.checkError) {
+                app.updatePhase = "failed"
+                app.updateMessage = "Couldn’t check for updates. You can update later in Settings."
+            } else {
+                app.updatePhase = "current"
+                updateDone.start()
+            }
+        })
+    }
+    Timer {
+        id: updatePoll; interval: 2000; repeat: true
+        onTriggered: app.ask({ action: "update-status" }, answer => {
+            const status = answer.status || {}
+            app.updateProgress = Number(status.progress || app.updateProgress)
+            app.updateMessage = String(status.message || app.updateMessage)
+            if (status.state === "restart") {
+                updatePoll.stop()
+                app.updatePhase = "restarting"
+                app.ask({ action: "restart" }, () => {})
+            } else if (status.state === "error") {
+                updatePoll.stop()
+                app.updatePhase = "failed"
+                app.updateMessage = String(status.message || "The update couldn’t be installed.") + " You can update later in Settings."
+            }
+        })
+    }
+    Timer { id: updateDone; interval: 1400; onTriggered: if (app.step === 7) app.skipWifi() }
+    // Preview: a pretend network list and update, for designing these screens.
+    QtObject {
+        id: mockWelcome
+        function reply(message, done) {
+            const a = message.action
+            if (a === "wifi-list") done({ ok: true, online: false, networks: [
+                { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
+                { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
+            else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
+            else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1" } } }))
+            else if (a === "update-status") { mockLater.progress = Math.min(100, mockLater.progress + 9)
+                done({ ok: true, status: { state: mockLater.progress >= 100 ? "restart" : "downloading", progress: mockLater.progress,
+                                           message: "Preparing the update. This can take a while…" } }) }
+            else done({ ok: true })
+        }
+    }
+    Timer { id: mockLater; property var job: null; property real progress: 5; interval: 900; function run(job) { mockLater.job = job; start() } onTriggered: if (job) job() }
+
     function requestAccount(password) {
         app.notice = ""
         app.phase = app.firstBoot ? "creating" : "waiting"
@@ -202,6 +316,8 @@ ShellRoot {
             app.fullName = "Alex Morgan"
             app.step = Number(start)
             if (app.step === 3) mockAsk.start()
+            if (app.step === 6) app.scanWifi()
+            if (app.step === 7) app.startUpdate()
         }
     }
 
@@ -363,7 +479,7 @@ ShellRoot {
         // ── Who this is becoming: stays on screen through every step ──
         LoginAvatar {
             id: avatar
-            visible: app.step !== 5
+            visible: app.step !== 5 && app.step !== 6 && app.step !== 7
             anchors.horizontalCenter: parent.horizontalCenter
             y: Math.round(parent.height * 0.17)
             width: win.px(app.step === 4 ? 132 : 112); height: width
@@ -383,7 +499,155 @@ ShellRoot {
             Primary {
                 anchors.horizontalCenter: parent.horizontalCenter
                 label: "Get started"
-                onActivated: { app.step = 0; nameField.input.forceActiveFocus() }
+                onActivated: app.startWifi()
+            }
+        }
+
+        // ── Wi-Fi (a new device) ──
+        Page {
+            index: 6
+            Title { text: "Connect to Wi-Fi" }
+            Subtitle { text: app.chosenNetwork ? "Enter the password for " + app.chosenNetwork.ssid + "."
+                : "HP-OS checks for the latest version before you start." }
+            Gap { size: 12 }
+            Column {
+                visible: !app.chosenNetwork
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: win.px(440)
+                spacing: win.px(8)
+                Label {
+                    visible: app.networks.length === 0
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: app.scanning ? "Looking for networks…" : "No networks found."
+                    color: Qt.rgba(1, 1, 1, 0.7)
+                    font.pixelSize: win.px(17)
+                }
+                Repeater {
+                    model: app.networks.slice(0, 6)
+                    delegate: Rectangle {
+                        id: network
+                        required property var modelData
+                        width: parent.width; height: win.px(54)
+                        radius: height / 2
+                        color: Qt.rgba(1, 1, 1, rowHit.pressed ? 0.24 : rowHit.containsMouse ? 0.18 : 0.12)
+                        border.width: 1
+                        border.color: Qt.rgba(1, 1, 1, 0.2)
+                        Behavior on color { ColorAnimation { duration: 140 } }
+                        Label {
+                            anchors { left: parent.left; leftMargin: win.px(26); right: bars.left; rightMargin: win.px(12); verticalCenter: parent.verticalCenter }
+                            horizontalAlignment: Text.AlignLeft
+                            elide: Text.ElideRight
+                            text: network.modelData.ssid + (network.modelData.secure ? "" : "  ·  Open")
+                            font.pixelSize: win.px(18); font.weight: Font.Medium
+                        }
+                        Row {
+                            id: bars
+                            anchors { right: parent.right; rightMargin: win.px(26); verticalCenter: parent.verticalCenter }
+                            spacing: win.px(3)
+                            Repeater {
+                                model: 4
+                                Rectangle {
+                                    required property int index
+                                    anchors.bottom: parent.bottom
+                                    width: win.px(4); height: win.px(6 + index * 4); radius: width / 2
+                                    color: Qt.rgba(1, 1, 1, network.modelData.signal >= [1, 35, 55, 75][index] ? 0.95 : 0.3)
+                                }
+                            }
+                        }
+                        MouseArea {
+                            id: rowHit
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: !network.modelData.wep
+                            onClicked: {
+                                app.wifiNotice = ""
+                                app.chosenNetwork = network.modelData
+                                if (network.modelData.secure) wifiPassword.input.forceActiveFocus()
+                                else app.joinWifi("")
+                            }
+                        }
+                    }
+                }
+            }
+            Field {
+                id: wifiPassword
+                visible: !!app.chosenNetwork && app.chosenNetwork.secure
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Wi-Fi password"
+                secret: true
+                failed: app.wifiNotice.length > 0
+                onAccepted: app.joinWifi(wifiPassword.text)
+            }
+            Note { color: app.wifiNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8); text: app.joining ? "Joining…" : app.wifiNotice || " " }
+            Primary {
+                visible: !!app.chosenNetwork && app.chosenNetwork.secure
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: app.joining ? "Joining…" : "Join"
+                ready: !app.joining && wifiPassword.text.length >= 8
+                onActivated: app.joinWifi(wifiPassword.text)
+            }
+            Quiet {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: app.chosenNetwork ? "Other networks" : app.scanning ? " " : "Look again"
+                onActivated: { if (app.chosenNetwork) { app.chosenNetwork = null; wifiPassword.text = ""; app.wifiNotice = "" } else app.scanWifi() }
+            }
+            Gap { size: 4 }
+            Quiet {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Set up without Wi-Fi"
+                onActivated: app.skipWifi()
+            }
+        }
+
+        // ── Software update (a new device) ──
+        Page {
+            index: 7
+            Title {
+                text: app.updatePhase === "installing" ? "Updating HP-OS"
+                    : app.updatePhase === "restarting" ? "Restarting"
+                    : app.updatePhase === "current" ? "HP-OS is up to date"
+                    : app.updatePhase === "failed" ? "Update not installed" : "Checking for updates"
+            }
+            Subtitle {
+                text: app.updatePhase === "installing" ? "Getting HP-OS " + app.updateVersion + " ready. Please keep your device plugged in."
+                    : app.updatePhase === "restarting" ? "Your device restarts to finish, then continues setup."
+                    : app.updatePhase === "current" ? "You’re on the latest version."
+                    : app.updatePhase === "failed" ? app.updateMessage : "This only takes a moment."
+            }
+            Gap { size: 22 }
+            Rectangle {
+                visible: app.updatePhase === "installing" || app.updatePhase === "checking"
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: win.px(400); height: win.px(6); radius: height / 2
+                color: Qt.rgba(1, 1, 1, 0.2)
+                clip: true
+                Rectangle {
+                    id: updateBar
+                    height: parent.height; radius: height / 2
+                    color: "white"
+                    width: app.updatePhase === "installing" ? Math.max(parent.width * 0.04, parent.width * app.updateProgress / 100) : parent.width * 0.3
+                    Behavior on width { NumberAnimation { duration: 500; easing.type: Easing.OutCubic } }
+                    // While checking, a short bar sweeps back and forth.
+                    SequentialAnimation on x {
+                        running: app.updatePhase === "checking"
+                        loops: Animation.Infinite
+                        NumberAnimation { from: 0; to: win.px(400) * 0.7; duration: 900; easing.type: Easing.InOutQuad }
+                        NumberAnimation { from: win.px(400) * 0.7; to: 0; duration: 900; easing.type: Easing.InOutQuad }
+                    }
+                    onWidthChanged: if (app.updatePhase === "installing") x = 0
+                }
+            }
+            Note {
+                visible: app.updatePhase === "installing"
+                color: Qt.rgba(1, 1, 1, 0.75)
+                text: app.updateMessage
+            }
+            Primary {
+                visible: app.updatePhase === "failed"
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: "Continue"
+                onActivated: app.skipWifi()
             }
         }
 
@@ -444,7 +708,7 @@ ShellRoot {
             Quiet {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.firstBoot ? "Back" : "Cancel"
-                onActivated: { if (app.firstBoot) app.step = 5; else app.leave("", "") }
+                onActivated: { if (app.firstBoot) app.step = app.online ? 5 : 6; else app.leave("", "") }
             }
         }
 
@@ -680,7 +944,7 @@ ShellRoot {
             sequences: ["Return", "Enter"]
             enabled: app.step === 4 || app.step === 1 || app.step === 5
             onActivated: {
-                if (app.step === 5) { app.step = 0; nameField.input.forceActiveFocus() }
+                if (app.step === 5) app.startWifi()
                 else if (app.step === 4) app.continueToDesktop()
                 else { app.step = 2; passwordField.input.forceActiveFocus() }
             }
@@ -690,7 +954,8 @@ ShellRoot {
         Shortcut {
             sequence: "Escape"
             onActivated: {
-                if (app.step === 0 && app.firstBoot) app.step = 5
+                if (app.step === 6 && app.chosenNetwork && !app.joining) { app.chosenNetwork = null; app.wifiNotice = "" }
+                else if (app.step === 0 && app.firstBoot) app.step = 5
                 else if (app.step === 0) app.leave("", "")
                 else if (app.step === 1) { app.step = 0; nameField.input.forceActiveFocus() }
                 else if (app.step === 2) { app.step = 1; win.contentItem.forceActiveFocus() }
