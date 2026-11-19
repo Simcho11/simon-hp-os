@@ -1,6 +1,6 @@
 --- a/modules/background/Background.qml
 +++ b/modules/background/Background.qml
-@@ -516,6 +516,47 @@
+@@ -516,6 +516,85 @@
              && !GlobalStates.irisEdit && !GlobalStates.widgetEditMode
              && !GlobalStates.shellLayoutEditMode && !GameMode.active
  
@@ -39,6 +39,44 @@
 +                NiriService.send({ DesktopPageContent: { output: bgRoot.screenName, pages: JSON.parse(bgRoot.pageContentReport) } })
 +        }
 +        onPageContentReportChanged: pageContentTimer.restart()
++        // A page closed in the Overview: its icons move into free places on the page above, its widgets onto that
++        // page, and everything on later pages up one page, as niri did with the pages themselves.
++        Connections {
++            target: NiriService
++            function onDesktopPageRemoved(output, page) {
++                if (output !== bgRoot.screenName || !bgRoot.separatePages || page < 2)
++                    return
++                const patches = ({})
++                const taken = []
++                const area = bgRoot.desktopItemsWorkArea ?? ({})
++                const left = Number(area.left ?? 0), top = Number(area.top ?? 0)
++                for (const item of DesktopItems.listForPage(bgRoot.screenName, 0)) {
++                    const current = Number(item.workspacePage ?? 1)
++                    if (current > page) {
++                        patches[item.id] = { workspacePage: current - 1 }
++                    } else if (current === page) {
++                        const spot = DesktopItems.arrangePosition(bgRoot.screenName, Number(item.x ?? 0) - left,
++                            Number(item.y ?? 0) - top, Number(area.width ?? bgRoot.width), Number(area.height ?? bgRoot.height),
++                            Number(Config.getNestedValue("background.widgets.editGrid.size", 16)), true, item.id, page - 1, taken)
++                        taken.push({ x: spot.x, y: spot.y })
++                        patches[item.id] = { workspacePage: page - 1, x: left + spot.x, y: top + spot.y }
++                    }
++                }
++                DesktopItems.updateMany(patches)
++                const keys = Object.keys(bgRoot.pageWidgetDefaults)
++                const mascots = Config.getNestedValue("background.widgets.mascotInstances", {}) ?? {}
++                for (const id of Object.keys(mascots))
++                    keys.push("mascotInstances." + id)
++                if (CustomWidgets.ready)
++                    for (const widget of CustomWidgets.widgets)
++                        keys.push("custom." + widget.id)
++                for (const key of keys) {
++                    const current = Number(DesktopWidgetLayout.value(bgRoot.screenName, key, "workspacePage", 1))
++                    if (current >= page)
++                        DesktopWidgetLayout.setValue(bgRoot.screenName, key, "workspacePage", current - 1)
++                }
++            }
++        }
 +        Timer { id: pageContentTimer; interval: 300; onTriggered: bgRoot.sendPageContent() }
 +        Connections {
 +            target: NiriService
@@ -67,3 +105,24 @@
  
              Repeater {
                  // Keep delegates and rail geometry stable when the active workspace changes.
+--- a/services/NiriService.qml
++++ b/services/NiriService.qml
+@@ -67,6 +67,8 @@
+     property bool _overviewHotCornersRefreshQueued: false
+ 
+     signal configLoadFinished(bool ok, string error)
++    // hp-snap: a desktop page was closed in the Overview; what was on it belongs to the page above now.
++    signal desktopPageRemoved(string output, int page)
+ 
+     property var outputs: ({})
+     property var windows: []
+@@ -433,6 +435,9 @@
+         case 'WorkspaceUrgencyChanged':
+             handleWorkspaceUrgencyChanged(event.WorkspaceUrgencyChanged)
+             break
++        case 'DesktopPageRemoved':
++            root.desktopPageRemoved(String(event.DesktopPageRemoved.output), Number(event.DesktopPageRemoved.page))
++            break
+         }
+     }
+ 

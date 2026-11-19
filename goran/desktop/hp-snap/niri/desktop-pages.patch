@@ -1,5 +1,5 @@
 diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
-index f2477cc..9015d31 100644
+index f2477cc..0edff95 100644
 --- a/niri-ipc/src/lib.rs
 +++ b/niri-ipc/src/lib.rs
 @@ -71,6 +71,13 @@ pub enum Request {
@@ -16,8 +16,53 @@ index f2477cc..9015d31 100644
      /// Drive a workspace swipe. The compositor cancels it if this connection closes.
      DesktopSwipe(DesktopSwipe),
      /// hp-snap patch: where each app's dock icon is on an output, so minimizing a window flies
+@@ -1773,6 +1780,14 @@ pub enum Event {
+         /// Id of the window.
+         id: u64,
+     },
++    /// hp-snap patch: a desktop page was closed in the Overview. What was on it moved to the page above, and every
++    /// later page moved up one.
++    DesktopPageRemoved {
++        /// The output whose page it was.
++        output: String,
++        /// The page's number (1 is the first page).
++        page: u32,
++    },
+     /// hp-snap patch: a window was minimized (its title-bar minimize button or the
+     /// `minimize-window` action). niri moved it to a stash workspace; activating it restores it.
+     WindowMinimized {
+diff --git a/src/input/overview_workspace_grab.rs b/src/input/overview_workspace_grab.rs
+index 7e6ddd3..8470caf 100644
+--- a/src/input/overview_workspace_grab.rs
++++ b/src/input/overview_workspace_grab.rs
+@@ -63,7 +63,10 @@ impl OverviewWorkspaceGrab {
+                     }
+                 }
+                 WorkspaceControl::Remove(id) => {
+-                    state.niri.layout.overview_remove_workspace(&self.output, id);
++                    if let Some(page) = state.niri.layout.overview_remove_workspace(&self.output, id) {
++                        // hp-snap patch: the shell moves that page's icons and widgets to the page above.
++                        state.ipc_desktop_page_removed(self.output.name(), page);
++                    }
+                 }
+                 WorkspaceControl::Reorder(_) => {}
+             }
+diff --git a/src/ipc/client.rs b/src/ipc/client.rs
+index 7f7ad29..7c170eb 100644
+--- a/src/ipc/client.rs
++++ b/src/ipc/client.rs
+@@ -512,6 +512,9 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
+                     Event::WindowMinimized { id } => {
+                         println!("Window {id}: minimized");
+                     }
++                    Event::DesktopPageRemoved { output, page } => {
++                        println!("Desktop page {page} on {output} removed");
++                    }
+                 }
+             }
+         }
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index 2003345..702929a 100644
+index 2003345..bd399f2 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
 @@ -357,6 +357,13 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
@@ -34,8 +79,27 @@ index 2003345..702929a 100644
          Request::SetDockIcons(dock) => {
              let icons: Vec<(String, f64, f64)> = dock
                  .icons
+@@ -1065,6 +1072,18 @@ impl State {
+         server.send_event(event);
+     }
+ 
++    /// hp-snap patch: a desktop page was closed in the Overview; what was on it went to the page above.
++    pub fn ipc_desktop_page_removed(&mut self, output: String, page: u32) {
++        let Some(server) = &self.niri.ipc_server else {
++            return;
++        };
++        let mut state = server.event_stream_state.borrow_mut();
++
++        let event = Event::DesktopPageRemoved { output, page };
++        state.apply(event.clone());
++        server.send_event(event);
++    }
++
+     /// hp-snap patch: report a minimized window to event-stream clients.
+     pub fn ipc_window_minimized(&mut self, id: u64) {
+         let Some(server) = &self.niri.ipc_server else {
 diff --git a/src/layout/mod.rs b/src/layout/mod.rs
-index 76f25da..74b217a 100644
+index 76f25da..8b03c30 100644
 --- a/src/layout/mod.rs
 +++ b/src/layout/mod.rs
 @@ -1216,6 +1216,17 @@ impl<W: LayoutElement> Layout<W> {
@@ -56,7 +120,30 @@ index 76f25da..74b217a 100644
                      for (idx, ws) in mon.workspaces.iter_mut().enumerate() {
                          if ws.has_window(window) {
                              let removed = ws.remove_tile(window, transaction);
-@@ -4635,17 +4646,36 @@ impl<W: LayoutElement> Layout<W> {
+@@ -1977,17 +1988,16 @@ impl<W: LayoutElement> Layout<W> {
+         monitors.iter()
+     }
+ 
+-    pub(crate) fn overview_remove_workspace(&mut self, output: &Output, id: WorkspaceId) {
+-        let Some(target) = self.monitor_for_output_mut(output)
+-            .and_then(|monitor| monitor.overview_remove_workspace(id))
+-        else {
+-            return;
+-        };
++    /// Returns the page number (as the shell counts them) of the page that was closed.
++    pub(crate) fn overview_remove_workspace(&mut self, output: &Output, id: WorkspaceId) -> Option<u32> {
++        let (target, page) = self.monitor_for_output_mut(output)
++            .and_then(|monitor| monitor.overview_remove_workspace(id))?;
+         for (_, origin) in &mut self.minimized {
+             if *origin == id {
+                 *origin = target;
+             }
+         }
++        Some(page)
+     }
+ 
+     pub fn monitors_mut(&mut self) -> impl Iterator<Item = &mut Monitor<W>> + '_ {
+@@ -4635,17 +4645,36 @@ impl<W: LayoutElement> Layout<W> {
              }
          }
  
@@ -103,7 +190,7 @@ index 76f25da..74b217a 100644
              }
          }
      }
-@@ -4929,6 +4959,9 @@ impl<W: LayoutElement> Layout<W> {
+@@ -4929,6 +4958,9 @@ impl<W: LayoutElement> Layout<W> {
          )));
  
          self.set_monitors_overview_state();
@@ -114,7 +201,7 @@ index 76f25da..74b217a 100644
  
      pub fn open_overview(&mut self) -> bool {
 diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
-index 0821575..a0a054b 100644
+index 0821575..20c3812 100644
 --- a/src/layout/monitor.rs
 +++ b/src/layout/monitor.rs
 @@ -72,6 +72,8 @@ pub struct Monitor<W: LayoutElement> {
@@ -122,7 +209,7 @@ index 0821575..a0a054b 100644
      /// Output-local tile origin while carrying a window through a workspace animation.
      carried_window: Option<(W::Id, Point<f64, Logical>)>,
 +    /// hp-snap patch: page numbers (1 is the first visible page) holding desktop icons or widgets.
-+    content_pages: Vec<u32>,
++    pub(super) content_pages: Vec<u32>,
      /// Indication where an interactively-moved window is about to be placed.
      pub(super) insert_hint: Option<InsertHint>,
      /// Insert hint element for rendering.
@@ -152,7 +239,89 @@ index 0821575..a0a054b 100644
      pub(crate) fn overview_add_slot(&self) -> usize {
          self.workspaces.len() - 1
      }
-@@ -755,7 +769,75 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -475,6 +489,13 @@ impl<W: LayoutElement> Monitor<W> {
+         !self.workspaces[idx].is_minimize_stash
+             && idx + 1 < self.workspaces.len()
+             && (!self.options.layout.empty_workspace_above_first || idx > 0)
++            // hp-snap patch: the first page is the default one: it can't be closed, moved, or have one put above it.
++            && (self.options.layout.empty_workspace_above_first || !self.is_first_page(idx))
++    }
++
++    /// hp-snap patch: the first page as the shell counts them (the minimize stash isn't one).
++    pub(crate) fn is_first_page(&self, idx: usize) -> bool {
++        self.visible_workspace_indices().next() == Some(idx)
+     }
+ 
+     pub(crate) fn overview_add_workspace(&mut self) {
+@@ -492,18 +513,24 @@ impl<W: LayoutElement> Monitor<W> {
+     pub(super) fn overview_remove_workspace(
+         &mut self,
+         id: WorkspaceId,
+-    ) -> Option<WorkspaceId> {
++    ) -> Option<(WorkspaceId, u32)> {
+         let idx = self.workspaces.iter().position(|ws| ws.id() == id)?;
+         if !self.overview_can_manage(idx) {
+             return None;
+         }
++        let page = self.page_number(idx)?;
+ 
+-        let target_idx = self.visible_workspace_indices().rev()
+-            .find(|&other| other < idx && self.overview_can_manage(other) && self.workspaces[other].is_retained())
+-            .or_else(|| self.visible_workspace_indices()
+-                .find(|&other| other > idx && self.overview_can_manage(other) && self.workspaces[other].is_retained()))
+-            .unwrap_or(self.workspaces.len() - 1);
++        // hp-snap patch: what was on the page goes to the page right above it.
++        let target_idx = self.visible_workspace_indices().rev().find(|&other| other < idx)?;
+         let target = self.workspaces[target_idx].id();
++        // Where each of its windows is drawn now, so they can glide from there into the page above.
++        let zoom = self.overview_zoom();
++        let mut drawn_at = Vec::new();
++        if let Some(geo) = self.workspaces_render_geo().nth(idx) {
++            for (tile, pos, _) in self.workspaces[idx].tiles_with_render_positions() {
++                drawn_at.push((tile.window().id().clone(), geo.loc + pos.upscale(zoom)));
++            }
++        }
+         let was_active = self.active_workspace_idx == idx;
+         let mut removed = self.remove_workspace_by_idx(idx);
+         let target_idx = self.workspaces.iter().position(|ws| ws.id() == target)
+@@ -536,7 +563,35 @@ impl<W: LayoutElement> Monitor<W> {
+                 self.activate_workspace(idx);
+             }
+         }
+-        Some(target)
++        // The page's icons and widgets join the page above, and every later page moves up one (the shell moves
++        // them the same way when it hears DesktopPageRemoved).
++        let mut pages: Vec<u32> = self.content_pages.iter()
++            .map(|&other| if other >= page { other - 1 } else { other })
++            .filter(|&other| other >= 1)
++            .collect();
++        pages.sort_unstable();
++        pages.dedup();
++        self.content_pages = pages;
++        // Each window glides from where it was into its place on the page above.
++        let geos: Vec<_> = self.workspaces_render_geo().collect();
++        for (window, from) in drawn_at {
++            let Some(ws_idx) = self.workspaces.iter().position(|ws| ws.has_window(&window)) else {
++                continue;
++            };
++            let Some(geo) = geos.get(ws_idx).copied() else {
++                continue;
++            };
++            for (tile, pos) in self.workspaces[ws_idx].tiles_with_render_positions_mut(false) {
++                if *tile.window().id() == window {
++                    let to = geo.loc + pos.upscale(zoom);
++                    tile.animate_move_from((from - to).downscale(zoom));
++                }
++            }
++        }
++        if self.workspace_switch.is_none() {
++            self.clean_up_workspaces();
++        }
++        Some((target, page))
+     }
+ 
+     pub(crate) fn overview_reorder_workspace(&mut self, id: WorkspaceId, target: WorkspaceId) {
+@@ -755,7 +810,75 @@ impl<W: LayoutElement> Monitor<W> {
          }
      }
  
@@ -228,7 +397,56 @@ index 0821575..a0a054b 100644
          assert!(self.workspace_switch.is_none());
  
          let range_start = if self.options.layout.empty_workspace_above_first {
-@@ -2385,7 +2467,15 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1379,6 +1502,10 @@ impl<W: LayoutElement> Monitor<W> {
+     }
+ 
+     pub fn move_workspace_down(&mut self) {
++        // hp-snap patch: the first page stays first.
++        if !self.options.layout.empty_workspace_above_first && self.is_first_page(self.active_workspace_idx) {
++            return;
++        }
+         let mut new_idx = self.adjacent_workspace(self.active_workspace_idx, true);
+         if new_idx == self.active_workspace_idx {
+             return;
+@@ -1406,7 +1533,9 @@ impl<W: LayoutElement> Monitor<W> {
+ 
+     pub fn move_workspace_up(&mut self) {
+         let mut new_idx = self.adjacent_workspace(self.active_workspace_idx, false);
+-        if new_idx == self.active_workspace_idx {
++        if new_idx == self.active_workspace_idx
++            || !self.options.layout.empty_workspace_above_first && self.is_first_page(new_idx)
++        {
+             return;
+         }
+ 
+@@ -1439,6 +1568,13 @@ impl<W: LayoutElement> Monitor<W> {
+         if old_idx == new_idx {
+             return;
+         }
++        // hp-snap patch: nothing moves above the first page, and the first page doesn't move.
++        if !self.options.layout.empty_workspace_above_first {
++            let first = self.visible_workspace_indices().next().unwrap_or(0);
++            if old_idx == first || new_idx <= first {
++                return;
++            }
++        }
+ 
+         let ws = self.workspaces.remove(old_idx);
+         self.workspaces.insert(new_idx, ws);
+@@ -1745,8 +1881,11 @@ impl<W: LayoutElement> Monitor<W> {
+         // Monitors always have at least one workspace.
+         let ((idx, ws), geo) = iter.next().unwrap();
+ 
+-        // Check if above first.
++        // Check if above first. hp-snap patch: no new page goes above the first one; a window dropped there joins it.
+         if pos_within_output.y < geo.loc.y {
++            if !self.options.layout.empty_workspace_above_first {
++                return (InsertWorkspace::Existing(ws.id()), geo);
++            }
+             return (InsertWorkspace::NewAt(idx), dummy);
+         }
+ 
+@@ -2385,7 +2524,15 @@ impl<W: LayoutElement> Monitor<W> {
          } else {
              0
          };
@@ -246,7 +464,7 @@ index 0821575..a0a054b 100644
                  .workspaces
                  .iter()
 diff --git a/src/layout/tests.rs b/src/layout/tests.rs
-index 43d15c1..5cb25de 100644
+index 43d15c1..c84cd06 100644
 --- a/src/layout/tests.rs
 +++ b/src/layout/tests.rs
 @@ -2034,7 +2034,8 @@ fn move_to_workspace_by_idx_does_not_leave_empty_workspaces() {
@@ -259,7 +477,7 @@ index 43d15c1..5cb25de 100644
  }
  
  #[test]
-@@ -3994,6 +3995,49 @@ proptest! {
+@@ -3994,6 +3995,76 @@ proptest! {
      }
  }
  
@@ -306,9 +524,66 @@ index 43d15c1..5cb25de 100644
 +    assert_eq!(pages_with_windows(&layout), [true, false]);
 +}
 +
++#[test]
++fn the_first_page_stays_first() {
++    let mut ops = three_pages_of_windows();
++    ops.extend([Op::FocusWorkspace(1), Op::CompleteAnimations, Op::MoveWorkspaceUp, Op::CompleteAnimations]);
++    let mut layout = check_ops(ops);
++    let output = layout.outputs().next().unwrap().clone();
++    let monitor = layout.monitor_for_output_mut(&output).unwrap();
++    assert!(monitor.workspaces[0].has_window(&1), "a page can't be moved above the first one");
++    let first = monitor.workspaces[0].id();
++    assert!(layout.overview_remove_workspace(&output, first).is_none(), "the first page can't be closed");
++    layout.verify_invariants();
++}
++
++#[test]
++fn closing_a_page_moves_what_was_on_it_to_the_page_above() {
++    let mut layout = check_ops(three_pages_of_windows());
++    let output = layout.outputs().next().unwrap().clone();
++    layout.set_desktop_page_content("output1", vec![2, 3]);
++    let second = layout.monitor_for_output_mut(&output).unwrap().workspaces[1].id();
++    assert_eq!(layout.overview_remove_workspace(&output, second), Some(2));
++    layout.verify_invariants();
++    let monitor = layout.monitor_for_output_mut(&output).unwrap();
++    assert!(monitor.workspaces[0].has_window(&1) && monitor.workspaces[0].has_window(&2));
++    assert!(monitor.workspaces[1].has_window(&3));
++    assert_eq!(monitor.content_pages, vec![1, 2]);
++}
++
  fn carry_window(switch_desktop: bool) -> Layout<TestWindow> {
      let update = Op::InteractiveMoveUpdate { window: 1, dx: 1000., dy: 0., output_idx: 1, px: 0., py: 0. };
      let mut ops = vec![
+@@ -4033,6 +4104,17 @@ fn dropping_the_last_window_back_keeps_one_desktop() {
+ fn overview_add_reorder_and_remove_workspaces() {
+     let mut layout = check_ops([Op::AddOutput(1), Op::AddOutput(2)]);
+     let output = layout.outputs().next().unwrap().clone();
++    // hp-snap: the default first page stays first; the pages added here go below it.
++    let default_page = layout.monitor_for_output_mut(&output).unwrap().workspaces[0].id();
++    layout.add_window(
++        TestWindow::new(TestWindowParams::new(9)),
++        AddWindowTarget::Workspace(default_page),
++        None,
++        None,
++        false,
++        false,
++        ActivateWindow::No,
++    );
+     let monitor = layout.monitor_for_output_mut(&output).unwrap();
+ 
+     monitor.overview_add_workspace();
+@@ -4040,8 +4122,9 @@ fn overview_add_reorder_and_remove_workspaces() {
+     monitor.overview_add_workspace();
+     let second = monitor.active_workspace_ref().id();
+     monitor.overview_reorder_workspace(second, first);
+-    assert_eq!(monitor.workspaces[0].id(), second);
+-    assert_eq!(monitor.workspaces[1].id(), first);
++    assert_eq!(monitor.workspaces[0].id(), default_page);
++    assert_eq!(monitor.workspaces[1].id(), second);
++    assert_eq!(monitor.workspaces[2].id(), first);
+     assert_eq!(monitor.active_workspace_ref().id(), second);
+     layout.verify_invariants();
+ 
 diff --git a/src/niri.rs b/src/niri.rs
 index 82d22e5..50f8409 100644
 --- a/src/niri.rs
