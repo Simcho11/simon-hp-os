@@ -331,6 +331,105 @@ index f751670..cd5d2be 100644
          onReleased: {
              root.released()
              root._dragSessionActive = false
+diff --git a/modules/iris/background/IrisDesktopActions.qml b/modules/iris/background/IrisDesktopActions.qml
+index d4db1da..a88cd45 100644
+--- a/modules/iris/background/IrisDesktopActions.qml
++++ b/modules/iris/background/IrisDesktopActions.qml
+@@ -33,8 +33,6 @@ Singleton {
+             } },
+         { id: "customize", group: 0, label: Translation.tr("Customize iRiS"), glyph: "palette", tint: "purple",
+             run: screen => GlobalStates.openIrisCustomize("") },
+-        { id: "nextWallpaper", group: 0, label: Translation.tr("Next wallpaper"), glyph: "shuffle", tint: "pink",
+-            run: screen => Wallpapers.nextWallpaper(Appearance.m3colors.darkmode, screen) },
+         { id: "screenshot", group: 1, label: Translation.tr("Screenshot"), glyph: "screenshot_region", tint: "blue",
+             run: screen => root.inir(["region", "screenshot"]) },
+         { id: "record", group: 1, label: Translation.tr("Record screen"), glyph: "screen_record", tint: "red",
+@@ -67,9 +65,7 @@ Singleton {
+                 action: () => {
+                     GlobalStates.wallpaperSelectorTargetMonitor = screenName
+                     GlobalActions.runLauncher(["wallpaperSelector", "toggle"])
+-                },
+-                secondary: { id: "wallpaperNext", iconName: "shuffle", text: Translation.tr("Next wallpaper"),
+-                    action: () => Wallpapers.nextWallpaper(Appearance.m3colors.darkmode, screenName) } })
++                } })
+         const groupOf = id => root.catalogue.find(item => item.id === id).group
+         const ordered = root.chosen.map((id, index) => ({ id: id, index: index }))
+             .sort((a, b) => groupOf(a.id) - groupOf(b.id) || a.index - b.index).map(item => item.id)
+@@ -91,7 +87,7 @@ Singleton {
+             if (item.secondary?.id === id) { item.secondary.action(); return id }
+         }
+         const entry = root.catalogue.find(item => item.id === id)
+-        if (!entry) return "Unknown action: wallpaper, wallpaperNext or " + root.catalogue.map(item => item.id).join(", ")
++        if (!entry) return "Unknown action: wallpaper or " + root.catalogue.map(item => item.id).join(", ")
+         entry.run(screenName)
+         return id
+     }
+diff --git a/modules/iris/dock/IrisDock.qml b/modules/iris/dock/IrisDock.qml
+index 83ea53d..edb6f40 100644
+--- a/modules/iris/dock/IrisDock.qml
++++ b/modules/iris/dock/IrisDock.qml
+@@ -719,6 +719,44 @@ Item {
+                     }
+                 }
+ 
++                // hp-snap: drop apps, files, folders and web links between or beside the icons to keep them in the Dock.
++                DropArea {
++                    id: keepDrop
++                    anchors.fill: parent
++                    z: -1
++                    keys: ["text/uri-list", "text/plain"]
++                    onEntered: drag => {
++                        if (!drag.hasUrls) { drag.accepted = false; return }
++                        drag.accept(Qt.LinkAction)
++                    }
++                    onDropped: drop => {
++                        if (!drop.hasUrls || !drop.urls.length) { drop.accepted = false; return }
++                        keepPin.exec(["python3", Quickshell.shellPath("scripts/hp-snap/dock_pin.py")].concat(Array.from(drop.urls, String)))
++                        drop.accept(Qt.LinkAction)
++                    }
++                    Process {
++                        id: keepPin
++                        stdout: StdioCollector {
++                            onStreamFinished: {
++                                let ids = []
++                                try { ids = JSON.parse(this.text) } catch (error) {}
++                                if (ids.length > 0) TaskbarApps.pinIds(ids)
++                            }
++                        }
++                    }
++                }
++                // While something is held over the Dock, it glows to say it can keep it.
++                Rectangle {
++                    anchors.fill: parent
++                    z: -1
++                    radius: dock.radius
++                    color: IrisStyle.accent
++                    opacity: keepDrop.containsDrag ? 0.16 : 0
++                    border.width: keepDrop.containsDrag ? 2 : 0
++                    border.color: IrisStyle.accent
++                    Behavior on opacity { NumberAnimation { duration: 160 } }
++                }
++
+                 Grid {
+                     id: appRow
+                     columns: root.vertical ? 1 : Math.max(1, root.entries.length + (root.showLauncher ? 1 : 0)
+@@ -898,7 +936,15 @@ Item {
+                                     keys: ["text/uri-list"]
+                                     readonly property bool trash: entry.modelData.appId === "hp-os-trash"
+                                     enabled: !entry.separator && (trash || /%[fFuU]/.test(String(appSlot.desktopEntry?.execString ?? "")))
+-                                    onEntered: drag => drag.accept(trash && (drag.supportedActions & Qt.MoveAction) ? Qt.MoveAction : Qt.CopyAction)
++                                    onEntered: drag => {
++                                        // hp-snap: apps (their .desktop files) and web links aren't opened with an app: they pass on
++                                        // to the Dock itself, which keeps them.
++                                        if (!fileDrop.trash && drag.hasUrls && Array.from(drag.urls, String).every(u => /\.desktop$/.test(u) || /^https?:/.test(u))) {
++                                            drag.accepted = false
++                                            return
++                                        }
++                                        drag.accept(trash && (drag.supportedActions & Qt.MoveAction) ? Qt.MoveAction : Qt.CopyAction)
++                                    }
+                                     onDropped: drop => {
+                                         if (!drop.hasUrls || !drop.urls.length) { drop.accepted = false; return }
+                                         const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py")]
 diff --git a/modules/iris/settings/IrisNiri.qml b/modules/iris/settings/IrisNiri.qml
 index f31593f..85dfd54 100644
 --- a/modules/iris/settings/IrisNiri.qml
@@ -377,10 +476,20 @@ index f31593f..85dfd54 100644
          id: devices
          command: ["grep", "-i", "^N: Name=", "/proc/bus/input/devices"]
 diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
-index 1c9dd35..1779861 100644
+index 1c9dd35..6c9b683 100644
 --- a/modules/iris/settings/IrisOptions.qml
 +++ b/modules/iris/settings/IrisOptions.qml
-@@ -889,7 +889,7 @@ QtObject {
+@@ -839,9 +839,6 @@ QtObject {
+         { section: "bubbles", group: "Tray", label: "App names", path: "iris.tray.labels", kind: "switch", fallback:true },
+         { section: "bubbles", group: "Tray", label: "Hide passive apps", path: "iris.tray.hidePassive", kind: "switch", fallback:false },
+         { section: "bubbles", group: "Tray", label: "Columns", path: "iris.tray.columns", kind: "range", fallback:4,min:2,max:6 },
+-        { section: "desktop", group: "Wallpaper shuffle", label: "Shuffle wallpapers", description: "A new wallpaper from your folder every few minutes. Next wallpaper in the desktop menu does it once.", path: "background.autoWallpaper.enable", kind: "switch", fallback: false, keywords: ["shuffle", "random", "slideshow", "rotate", "cycle", "change", "automatic", "timer", "next wallpaper"] },
+-        { section: "desktop", group: "Wallpaper shuffle", label: "Every", path: "background.autoWallpaper.intervalMinutes", visibleWhen: "background.autoWallpaper.enable", kind: "range", fallback: 30, min: 1, max: 240, step: 1, unit: " min", keywords: ["interval", "minutes", "how often", "slideshow"] },
+-        { section: "desktop", group: "Wallpaper shuffle", label: "Colours follow", description: "Each new wallpaper recolours the shell and your apps. Off keeps the current colours.", path: "background.autoWallpaper.generateColors", visibleWhen: "background.autoWallpaper.enable", kind: "switch", fallback: true, keywords: ["colors", "theme", "recolor", "palette"] },
+         { section: "desktop", group: "Wallpaper gallery", label: "Preview on the desktop", description: "The highlighted wallpaper shows behind the gallery; closing without applying restores yours.", path: "iris.wallpaper.livePreview", kind: "switch", fallback: true },
+         { section: "desktop", group: "Wallpaper gallery", label: "Play previews", description: "Live wallpapers play a muted preview while chosen or hovered in the gallery. Only one plays at a time.", path: "iris.wallpaper.motion", kind: "switch", fallback: true },
+         { section: "desktop", group: "Wallpaper gallery", label: "Library order", description: "How your folders line up in the gallery.", path: "iris.wallpaper.sort", kind: "choice", fallback: "newest", choices: [{label:"Newest",value:"newest",glyph:"schedule"},{label:"Oldest",value:"oldest",glyph:"history"},{label:"Name",value:"name",glyph:"sort_by_alpha"}], keywords: ["sort", "order", "date", "recent", "newest", "oldest", "name", "alphabetical"] },
+@@ -889,7 +886,7 @@ QtObject {
          { section: "general", group: "Language", label: "Language", description: "Every label in the shell. System follows your locale.", path: "language.ui", kind: "choice", fallback: "auto",
              choices: [{ label: "System", value: "auto" }].concat(Translation.allAvailableLanguages.map(code => ({ label: Translation.languageDisplayName(code), value: code }))),
              keywords: ["language", "idioma", "translation", "locale", "español", "spanish"] },
@@ -389,7 +498,7 @@ index 1c9dd35..1779861 100644
          { section: "general", group: "Settings window", label: "Opens as", description: "Over the desktop previews every change on the screen behind it. A window sits with your apps: Niri sizes, maximizes and moves it like any other.", path: "iris.appearance.settingsHost", kind: "choice", fallback: "overlay", choices: [{ label: "Over the desktop", value: "overlay", glyph: "layers" }, { label: "Window", value: "window", glyph: "web_asset" }], keywords: ["settings", "window", "overlay", "floating", "tile", "maximize"] },
          { section: "general", group: "Settings window", label: "Show every setting", description: "Off keeps Settings to the areas most people need. Search still finds everything.", path: "settingsUi.easyMode", invert: true, kind: "switch", fallback: true, keywords: ["simple", "easy", "advanced", "all settings", "sections"] },
          { section: "general", group: "Settings window", label: "Layout", description: "Sidebar lists every area beside the page. Rail keeps only their marks, for more room. Home opens on every area at once; each opens full width.", path: "iris.appearance.settingsLayout", kind: "choice", fallback: "sidebar", choices: [{ label: "Sidebar", value: "sidebar", glyph: "view_sidebar" }, { label: "Rail", value: "rail", glyph: "view_week" }, { label: "Home", value: "home", glyph: "grid_view" }], keywords: ["settings", "navigation", "sidebar", "rail", "grid", "home", "layout"] },
-@@ -901,9 +901,6 @@ QtObject {
+@@ -901,9 +898,6 @@ QtObject {
          { section: "general", group: "Power", label: "Factory reset", description: "Erase every account and its files, and start this device again as new. Needs an administrator.", kind: "action", button: "Reset…", keywords: ["erase", "wipe", "reset"], run: () => Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-factory-reset"]) },
          { section: "general", group: "HP-OS", label: "Weather provider", description: "Open-Meteo receives manually configured coordinates. Set latitude and longitude in weather settings, then enable weather. Automatic geolocation is disabled for HP-OS.", path: "hpos.weatherProvider", kind: "choice", fallback: "disabled", showIf: () => Config.options.panelFamily === "hpos", choices: [{label:"Disabled",value:"disabled"},{label:"Open-Meteo",value:"open-meteo"}] },
          { section: "general", group: "HP-OS", label: "HP-OS preferences", description: "Typography, materials, accessibility and component gallery.", kind: "action", button: "Open", showIf: () => Config.options.panelFamily === "hpos", run: () => Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "hpos", "settings"]) },
@@ -399,7 +508,7 @@ index 1c9dd35..1779861 100644
  
          { section: "spotlight", group: "Web search", label: "Search the web with", description: "What ? and Search the web use in Spotlight.", path: "search.engineBaseUrl", kind: "choice", fallback: "https://www.google.com/search?q=",
              choices: [{label:"Google",value:"https://www.google.com/search?q="},{label:"DuckDuckGo",value:"https://duckduckgo.com/?q="},{label:"Brave",value:"https://search.brave.com/search?q="},{label:"Bing",value:"https://www.bing.com/search?q="},{label:"Startpage",value:"https://www.startpage.com/do/search?q="}],
-@@ -1095,8 +1092,8 @@ QtObject {
+@@ -1095,8 +1089,8 @@ QtObject {
              keywords: ["typing", "trackpad", "touchpad", "instant"]
          },
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.click-method", label: "Right click", kind: "choice", fallback: "button-areas", choices: [{label:"Bottom corner",value:"button-areas"},{label:"Two fingers",value:"clickfinger"}] },
@@ -410,6 +519,51 @@ index 1c9dd35..1779861 100644
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.disabled-on-external-mouse", label: "Off while a mouse is plugged in", kind: "switch", fallback: false },
  
          { section: "keyboard", group: "Pointer", niri: "input", key: "cursor.xcursor-theme", read: "cursor.theme", label: "Cursor", kind: "choice", choicesFrom: "cursors", fallback: "", keywords: ["cursor", "theme", "pointer"] },
+@@ -1130,7 +1124,7 @@ QtObject {
+         { id: "general", cluster: 0, title: "General", subtitle: "Time, language and how iRiS behaves", icon: "settings", get tint() { return IrisStyle.identity.gray }, tip: "Settings that shape the whole shell, whichever surface shows them." },
+         { id: "appearance", cluster: 0, title: "Appearance", subtitle: "Look, material, shape and type", icon: "style", get tint() { return IrisStyle.identity.purple }, tip: "Customize edits the same values live, on top of your desktop." },
+         { id: "colour", cluster: 0, title: "Colour", subtitle: "Light or dark, accent, highlight and your apps", icon: "palette", get tint() { return IrisStyle.identity.pink }, tip: "Colour can come from your wallpaper, from a theme, or be one you pick." },
+-        { id: "wallpaper", cluster: 0, title: "Wallpaper", subtitle: "Shuffle, live wallpapers, the gallery and the overview", icon: "wallpaper", get tint() { return IrisStyle.identity.teal }, tip: "Next wallpaper in the desktop menu changes it once; Shuffle keeps changing it." },
++        { id: "wallpaper", cluster: 0, title: "Wallpaper", subtitle: "Live wallpapers, the gallery and the overview", icon: "wallpaper", get tint() { return IrisStyle.identity.teal }, tip: "Right-click any picture to set it as your wallpaper." },
+         { id: "motion", cluster: 0, title: "Motion", subtitle: "How every shape grows, moves and settles", icon: "animation", get tint() { return IrisStyle.identity.indigo }, tip: "Shorter durations feel snappier; the curve stays the same." },
+         { id: "bar", cluster: 1, title: "Island", subtitle: "Composition, size and how the Island responds", icon: "pill", get tint() { return IrisStyle.identity.blue }, tip: "Rest on the Island to peek, click to keep it, scroll for volume." },
+         { id: "bubbles", cluster: 1, title: "Bubbles & Cards", subtitle: "Pieces you carry and the cards they grow", icon: "bubble_chart", get tint() { return IrisStyle.identity.sky }, tip: "Hold a bubble to carry it; drop it beside the Island to bring it back." },
+@@ -1158,6 +1152,8 @@ QtObject {
+     ]
+     // The shared iNiR pages that still act under iRiS, as "More Settings" lists them. Pages for other families stay out.
+     readonly property var morePages: [
++        { group: "System", key: "wifi", label: "Wi-Fi", detail: "Networks, joining and forgetting", icon: "wifi", get tint() { return IrisStyle.identity.blue }, keywords: ["wifi", "wi-fi", "wireless", "network", "internet", "hotspot", "join"] },
++        { group: "System", key: "bluetooth", label: "Bluetooth", detail: "Headphones, keyboards and other devices", icon: "bluetooth", get tint() { return IrisStyle.identity.blue }, keywords: ["bluetooth", "bt", "headphones", "airpods", "earbuds", "speaker", "keyboard", "mouse", "pair", "devices"] },
+         { group: "System", key: "accounts", label: "Users & Accounts", detail: "People, passwords and sign-in", icon: "manage_accounts", get tint() { return IrisStyle.identity.blue }, keywords: ["user", "account", "password", "login", "register"] },
+         { group: "Desktop", key: "wallpaper", label: "Wallpaper engine", detail: "Backend, transitions, rotation", icon: "wallpaper", get tint() { return IrisStyle.identity.teal }, keywords: ["wallpaper", "awww", "transition", "slideshow", "fondo"] },
+         { group: "Desktop", key: "widgets", label: "Desktop widgets", detail: "Every widget's own options", icon: "widgets", get tint() { return IrisStyle.identity.sky }, keywords: ["widgets", "clock", "weather", "media"] },
+@@ -1422,7 +1418,7 @@ QtObject {
+         bubbles: ["Size", "Behaviour", "On the contour", "Floating", "Opening bodies", "Cards", "Card contents", "Joining", "Tray"],
+         dock: ["Notch", "Look", "Icons", "Visibility"],
+         desktop: ["Icons", "Widgets", "Desktop menu"],
+-        wallpaper: ["Wallpaper shuffle", "Live wallpapers", "Wallpaper gallery", "Scaling", "Behind windows", "Parallax", "Overview backdrop"],
++        wallpaper: ["Live wallpapers", "Wallpaper gallery", "Scaling", "Behind windows", "Parallax", "Overview backdrop"],
+         lock: ["When idle", "Security", "Scene", "Clock", "At a glance", "Now playing", "Activity", "Status", "Sign in", "Type"]
+     })
+     // How a section's page reads: named blocks of groups, by what someone came to change.
+@@ -1448,7 +1444,7 @@ QtObject {
+             { caption: "Fine tuning", groups: ["Dark look", "Ink look", "Light look", "Wallpaper tint"] }
+         ],
+         wallpaper: [
+-            { caption: "Changing it", groups: ["Wallpaper shuffle", "Live wallpapers", "Wallpaper gallery"] },
++            { caption: "Changing it", groups: ["Live wallpapers", "Wallpaper gallery"] },
+             { caption: "How it sits", groups: ["Scaling", "Behind windows", "Parallax", "Overview backdrop"] }
+         ],
+         lock: [
+@@ -1461,7 +1457,7 @@ QtObject {
+     // surface's other rows are (Customize reads them there) and are shown here.
+     readonly property var movedGroups: ({
+         appearance: { to: "colour", groups: ["Colour theme", "Scheme", "Accent", "Highlight", "App colours", "Dark look", "Ink look", "Light look", "Wallpaper tint"] },
+-        desktop: { to: "wallpaper", groups: ["Wallpaper shuffle", "Scaling", "Live wallpapers", "Wallpaper gallery", "Behind windows", "Parallax", "Overview backdrop"] }
++        desktop: { to: "wallpaper", groups: ["Scaling", "Live wallpapers", "Wallpaper gallery", "Behind windows", "Parallax", "Overview backdrop"] }
+     })
+     function placed(spec: var): var {
+         const move = root.movedGroups[String(spec.section ?? "")]
 diff --git a/modules/iris/settings/IrisSearch.qml b/modules/iris/settings/IrisSearch.qml
 index 4810e60..d26c84f 100644
 --- a/modules/iris/settings/IrisSearch.qml
@@ -425,6 +579,18 @@ index 4810e60..d26c84f 100644
      readonly property var categoryAreas: ({ system: "System", tools: "Tools", media: "Media", appearance: "Appearance", settings: "General", setup: "System" })
      readonly property var aliases: ({
          bt: ["bluetooth"], wifi: ["wi-fi", "wireless", "network"], wlan: ["wi-fi", "network"], dnd: ["disturb", "silent"],
+diff --git a/modules/iris/settings/IrisWallpaperCard.qml b/modules/iris/settings/IrisWallpaperCard.qml
+index 1d830cb..6d4735b 100644
+--- a/modules/iris/settings/IrisWallpaperCard.qml
++++ b/modules/iris/settings/IrisWallpaperCard.qml
+@@ -219,7 +219,6 @@ ClippingRectangle {
+                 Layout.topMargin: Math.round(14 * card.d)
+                 spacing: Math.round(8 * card.d)
+                 GlassButton { glyph: "photo_library"; label: Translation.tr("Change wallpaper"); onClicked: card.openGallery() }
+-                GlassButton { glyph: "shuffle"; label: ""; onClicked: Wallpapers.nextWallpaper() }
+             }
+         }
+     }
 diff --git a/modules/settings/AccountsConfig.qml b/modules/settings/AccountsConfig.qml
 index 5e20c7c..582e9ca 100644
 --- a/modules/settings/AccountsConfig.qml
@@ -462,6 +628,291 @@ index 5e20c7c..582e9ca 100644
 +    }
      }
  }
+diff --git a/modules/settings/BluetoothConfig.qml b/modules/settings/BluetoothConfig.qml
+new file mode 100644
+index 0000000..9496eed
+--- /dev/null
++++ b/modules/settings/BluetoothConfig.qml
+@@ -0,0 +1,263 @@
++import QtQuick
++import QtQuick.Layouts
++import Quickshell
++import Quickshell.Bluetooth
++import qs
++import qs.services
++import qs.modules.common
++import qs.modules.common.widgets
++import qs.modules.common.functions
++import qs.modules.iris.components
++import qs.modules.iris.style
++
++// hp-snap: Bluetooth, the way a phone shows it. One switch; My Devices (everything paired: connected or not, with
++// battery), where a tap connects or disconnects and ⓘ offers Forget; Other Devices (found nearby), where a tap pairs
++// and connects. The laptop looks for devices only while this page is open.
++Flickable {
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
++    id: root
++    contentHeight: content.implicitHeight + 64
++    clip: true
++
++    readonly property var adapter: Bluetooth.defaultAdapter
++    readonly property bool on: !!root.adapter && root.adapter.enabled
++    readonly property var devices: root.adapter ? root.adapter.devices.values : []
++    function named(device) {
++        const name = String(device.name || device.deviceName || "")
++        return name.length > 0 && name.replace(/[-:]/g, "").toUpperCase() !== String(device.address || "").replace(/:/g, "").toUpperCase()
++    }
++    readonly property var mine: root.devices.filter(d => d.paired || d.bonded || d.connected)
++        .sort((a, b) => (b.connected - a.connected) || String(a.name).localeCompare(String(b.name)))
++    // Like a phone: only devices that say what they are (headphones, a keyboard…), each name once. Beacons, tags
++    // and sensors nearby don't, and would fill the list.
++    readonly property var others: {
++        const seen = new Set()
++        return root.devices.filter(d => !(d.paired || d.bonded || d.connected) && root.named(d) && String(d.icon || "").length > 0)
++            .sort((a, b) => String(a.name).localeCompare(String(b.name)))
++            .filter(d => { const name = String(d.name); if (seen.has(name)) return false; seen.add(name); return true })
++    }
++    property string opened: ""          // The device whose details are showing (its address).
++    property string forgetting: ""      // Asking to forget this one.
++    property string message: ""
++
++    // Look for devices only while the page is open.
++    function look(on) { if (root.adapter && root.adapter.enabled) root.adapter.discovering = on }
++    onVisibleChanged: root.look(root.visible)
++    Component.onCompleted: root.look(root.visible)
++    Component.onDestruction: root.look(false)
++    Connections { target: root.adapter; function onEnabledChanged() { root.look(root.visible && root.adapter.enabled) } }
++
++    function status(device) {
++        if (device.pairing) return Translation.tr("Pairing…")
++        if (device.state === BluetoothDeviceState.Connecting) return Translation.tr("Connecting…")
++        if (device.state === BluetoothDeviceState.Disconnecting) return Translation.tr("Disconnecting…")
++        return device.connected ? Translation.tr("Connected") : Translation.tr("Not Connected")
++    }
++    function tap(device) {
++        root.message = ""
++        if (device.connected) { device.disconnect(); return }
++        if (device.paired || device.bonded) { device.connect(); return }
++        // New: pair, keep it trusted so it comes back by itself, then connect.
++        device.trusted = true
++        device.pair()
++    }
++    // A device that has just paired connects on its own.
++    Repeater {
++        model: root.devices
++        Item {
++            required property var modelData
++            Connections {
++                target: modelData
++                function onPairedChanged() { if (modelData.paired && !modelData.connected) modelData.connect() }
++            }
++        }
++    }
++
++    component Group: Rectangle {
++        default property alias rows: list.data
++        Layout.fillWidth: true
++        implicitHeight: list.implicitHeight
++        radius: IrisStyle.radiusCard
++        color: IrisStyle.surfaceHigh
++        clip: true
++        ColumnLayout { id: list; width: parent.width; spacing: 0 }
++    }
++    component Heading: IrisText {
++        Layout.topMargin: 8
++        Layout.leftMargin: 18
++        color: IrisStyle.subtext
++        font.pixelSize: IrisStyle.typeCaption ?? 13
++        font.weight: Font.DemiBold
++    }
++    component DeviceRow: Rectangle {
++        id: row
++        required property var device
++        property bool last: false
++        readonly property bool open: root.opened === String(row.device.address)
++        Layout.fillWidth: true
++        implicitHeight: rowLine.implicitHeight + 28 + (row.open ? details.implicitHeight + 12 : 0)
++        color: hit.pressed ? IrisStyle.fillHover : "transparent"
++        Behavior on implicitHeight { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
++        RowLayout {
++            id: rowLine
++            x: 18; y: 14
++            width: row.width - 36
++            spacing: 14
++            Rectangle {
++                width: 34; height: 34; radius: 10
++                color: row.device.connected ? IrisStyle.accent : ColorUtils.applyAlpha(IrisStyle.text, 0.08)
++                MaterialSymbol { anchors.centerIn: parent; text: BluetoothStatus.iconForDevice(row.device).replace("bluetooth_connected", "bluetooth"); iconSize: 20
++                                 color: row.device.connected ? "white" : IrisStyle.text }
++            }
++            IrisText { Layout.fillWidth: true; text: row.device.name || row.device.deviceName || row.device.address; elide: Text.ElideRight }
++            IrisText {
++                visible: row.device.batteryAvailable
++                text: Math.round(row.device.battery * 100) + "%"
++                color: IrisStyle.subtext
++            }
++            IrisText { text: root.status(row.device); color: row.device.connected ? IrisStyle.accent : IrisStyle.subtext }
++            MaterialSymbol {
++                visible: row.device.paired || row.device.bonded
++                text: "info"; iconSize: 22; color: IrisStyle.accent
++                MouseArea {
++                    anchors { fill: parent; margins: -8 }
++                    cursorShape: Qt.PointingHandCursor
++                    onClicked: { root.forgetting = ""; root.opened = row.open ? "" : String(row.device.address) }
++                }
++            }
++        }
++        MouseArea {
++            id: hit
++            anchors { left: parent.left; right: parent.right; top: parent.top }
++            anchors.rightMargin: 56
++            height: rowLine.implicitHeight + 28
++            cursorShape: Qt.PointingHandCursor
++            onClicked: root.tap(row.device)
++        }
++        // Details: Disconnect, and Forget This Device (asked twice).
++        ColumnLayout {
++            id: details
++            visible: row.open
++            x: 66; y: rowLine.implicitHeight + 26
++            width: row.width - 84
++            spacing: 8
++            RowLayout {
++                spacing: 10
++                IrisButton {
++                    visible: row.device.connected
++                    text: Translation.tr("Disconnect")
++                    onClicked: row.device.disconnect()
++                }
++                IrisButton {
++                    text: root.forgetting === String(row.device.address) ? Translation.tr("Forget it") : Translation.tr("Forget This Device…")
++                    onClicked: {
++                        if (root.forgetting !== String(row.device.address)) { root.forgetting = String(row.device.address); return }
++                        root.forgetting = ""; root.opened = ""
++                        row.device.forget()
++                    }
++                }
++            }
++            IrisText {
++                visible: root.forgetting === String(row.device.address)
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.subtext
++                text: Translation.tr("This laptop won’t connect to it until you pair it again.")
++            }
++        }
++        Rectangle {
++            visible: !row.last
++            anchors { left: parent.left; leftMargin: 66; right: parent.right; bottom: parent.bottom }
++            height: 1
++            color: ColorUtils.applyAlpha(IrisStyle.text, 0.08)
++        }
++    }
++
++    ColumnLayout {
++        id: content
++        x: 32; y: 32; width: Math.min(root.width - 64, 760); spacing: 10
++
++        // The switch, and what other devices see.
++        Group {
++            RowLayout {
++                Layout.fillWidth: true
++                Layout.margins: 18
++                spacing: 14
++                Rectangle {
++                    width: 40; height: 40; radius: 12; color: "#2f7cf6"
++                    MaterialSymbol { anchors.centerIn: parent; text: "bluetooth"; iconSize: 24; color: "white" }
++                }
++                ColumnLayout {
++                    Layout.fillWidth: true
++                    spacing: 2
++                    IrisText { text: Translation.tr("Bluetooth"); font.pixelSize: IrisStyle.typeTitle; font.bold: true }
++                    IrisText {
++                        Layout.fillWidth: true
++                        wrapMode: Text.WordWrap
++                        color: IrisStyle.subtext
++                        text: !root.adapter ? Translation.tr("This laptop has no Bluetooth.")
++                            : root.on ? Translation.tr("Other devices can find this laptop as “%1” while this page is open.").arg(root.adapter.name || "HP-OS")
++                            : Translation.tr("Turn on to use headphones, keyboards, mice and other devices.")
++                    }
++                }
++                IrisSwitch {
++                    visible: !!root.adapter
++                    name: Translation.tr("Bluetooth")
++                    on: root.on
++                    onToggled: root.adapter.enabled = !root.adapter.enabled
++                }
++            }
++        }
++
++        Heading { visible: root.on; text: Translation.tr("MY DEVICES") }
++        Group {
++            visible: root.on
++            IrisText {
++                visible: root.mine.length === 0
++                Layout.margins: 18
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.subtext
++                text: Translation.tr("No devices yet. Put a device in pairing mode and choose it under Other Devices.")
++            }
++            Repeater {
++                model: root.mine
++                DeviceRow { required property var modelData; required property int index; device: modelData; last: index === root.mine.length - 1 }
++            }
++        }
++
++        RowLayout {
++            visible: root.on
++            Layout.topMargin: 8
++            spacing: 8
++            Heading { Layout.topMargin: 0; text: Translation.tr("OTHER DEVICES") }
++            IrisText { visible: !!root.adapter && root.adapter.discovering; text: Translation.tr("Searching…"); color: IrisStyle.subtext; font.pixelSize: IrisStyle.typeCaption ?? 13 }
++        }
++        Group {
++            visible: root.on
++            IrisText {
++                visible: root.others.length === 0
++                Layout.margins: 18
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.subtext
++                text: root.adapter && root.adapter.discovering ? Translation.tr("Looking for devices nearby…")
++                    : Translation.tr("No other devices found.")
++            }
++            Repeater {
++                model: root.others
++                DeviceRow { required property var modelData; required property int index; device: modelData; last: index === root.others.length - 1 }
++            }
++        }
++        IrisText {
++            visible: root.on
++            Layout.fillWidth: true
++            Layout.leftMargin: 18
++            wrapMode: Text.WordWrap
++            color: IrisStyle.subtext
++            text: Translation.tr("To pair a device, put it in pairing mode (check its instructions), then choose it above.")
++        }
++    }
++}
+diff --git a/modules/settings/SettingsPageRegistry.qml b/modules/settings/SettingsPageRegistry.qml
+index 48a09eb..33d891f 100644
+--- a/modules/settings/SettingsPageRegistry.qml
++++ b/modules/settings/SettingsPageRegistry.qml
+@@ -250,7 +250,10 @@ Singleton {
+             component: "modules/settings/IrisConfig.qml"
+         },
+         { key: "accounts", name: Translation.tr("Users & Accounts"), icon: "manage_accounts", desc: Translation.tr("People, passwords and sign-in"), essential: true, component: "modules/settings/AccountsConfig.qml" },
+-        { key: "welcome", name: Translation.tr("Welcome"), icon: "waving_hand", desc: Translation.tr("Getting started with HP-OS"), essential: false, component: "modules/settings/WelcomeConfig.qml" }
++        { key: "welcome", name: Translation.tr("Welcome"), icon: "waving_hand", desc: Translation.tr("Getting started with HP-OS"), essential: false, component: "modules/settings/WelcomeConfig.qml" },
++        // hp-snap: Wi-Fi and Bluetooth the way a phone shows them.
++        { key: "wifi", name: Translation.tr("Wi-Fi"), icon: "wifi", desc: Translation.tr("Networks, joining and forgetting"), essential: true, component: "modules/settings/WifiConfig.qml" },
++        { key: "bluetooth", name: Translation.tr("Bluetooth"), icon: "bluetooth", desc: Translation.tr("Headphones, keyboards and other devices"), essential: true, component: "modules/settings/BluetoothConfig.qml" }
+     ]
+ 
+     // Sidebar grouping shared by both modes. Page indices reference the
 diff --git a/modules/settings/WelcomeConfig.qml b/modules/settings/WelcomeConfig.qml
 index 4820162..1f0c98b 100644
 --- a/modules/settings/WelcomeConfig.qml
@@ -649,6 +1100,347 @@ index 4820162..1f0c98b 100644
          }
      }
  }
+diff --git a/modules/settings/WifiConfig.qml b/modules/settings/WifiConfig.qml
+new file mode 100644
+index 0000000..d7a5775
+--- /dev/null
++++ b/modules/settings/WifiConfig.qml
+@@ -0,0 +1,335 @@
++import QtQuick
++import QtQuick.Layouts
++import Quickshell
++import Quickshell.Io
++import qs
++import qs.services
++import qs.modules.common
++import qs.modules.common.widgets
++import qs.modules.common.functions
++import qs.modules.iris.components
++import qs.modules.iris.style
++
++// hp-snap: Wi-Fi, the way a phone shows it. One switch and the network you're on; My Networks (ones this laptop has
++// joined before, in range); Other Networks, where a tap joins (asking for the password, or a username and password,
++// right there); Other… for a hidden network; ⓘ forgets a network. The list refreshes while the page is open.
++Flickable {
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
++    id: root
++    contentHeight: content.implicitHeight + 64
++    clip: true
++
++    readonly property bool on: Network.wifiEnabled
++    property var saved: []              // Names of the Wi-Fi networks this laptop has joined before.
++    property string asking: ""          // The network asking for its password here.
++    property string opened: ""          // The network whose details are showing.
++    property string forgetting: ""
++    property bool hiddenOpen: false
++    property string message: ""
++    readonly property var nearby: {
++        // One row per name, the strongest signal, never the one we're on.
++        const best = {}
++        for (const ap of Network.wifiNetworks) {
++            if (!ap.ssid || ap.active) continue
++            if (!best[ap.ssid] || ap.strength > best[ap.ssid].strength) best[ap.ssid] = ap
++        }
++        return Object.values(best).sort((a, b) => b.strength - a.strength)
++    }
++    readonly property var mine: root.nearby.filter(ap => root.saved.includes(ap.ssid))
++    readonly property var others: root.nearby.filter(ap => !root.saved.includes(ap.ssid))
++
++    Process {
++        id: savedList
++        command: ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"]
++        stdout: StdioCollector {
++            onStreamFinished: root.saved = this.text.split("\n").filter(line => line.endsWith(":802-11-wireless"))
++                .map(line => line.slice(0, line.lastIndexOf(":")).replace(/\\:/g, ":"))
++        }
++    }
++    function refresh() { savedList.running = true; if (root.on) Network.rescanWifi() }
++    Timer { running: root.visible && root.on; interval: 8000; repeat: true; triggeredOnStart: true; onTriggered: root.refresh() }
++    Connections { target: Network; function onWifiConnectingChanged() { if (!Network.wifiConnecting) savedList.running = true } }
++
++    function bars(strength) { return strength >= 70 ? "network_wifi" : strength >= 45 ? "network_wifi_3_bar" : strength >= 20 ? "network_wifi_2_bar" : "network_wifi_1_bar" }
++    function tap(ap) {
++        root.message = ""
++        root.opened = ""
++        if (ap.isSecure && !root.saved.includes(ap.ssid)) { root.asking = ap.ssid; return }   // Ask first: no failed try.
++        Network.connectToWifiNetwork(ap)
++    }
++    Process { id: forget; onExited: { root.forgetting = ""; root.opened = ""; savedList.running = true } }
++    Process {
++        id: hidden
++        property string name: ""
++        onExited: code => { root.message = code === 0 ? "" : Translation.tr("Couldn’t join %1. Check its name and password.").arg(hidden.name); savedList.running = true }
++    }
++
++    component Group: Rectangle {
++        default property alias rows: list.data
++        Layout.fillWidth: true
++        implicitHeight: list.implicitHeight
++        radius: IrisStyle.radiusCard
++        color: IrisStyle.surfaceHigh
++        clip: true
++        ColumnLayout { id: list; width: parent.width; spacing: 0 }
++    }
++    component Heading: IrisText {
++        Layout.topMargin: 8
++        Layout.leftMargin: 18
++        color: IrisStyle.subtext
++        font.pixelSize: IrisStyle.typeCaption ?? 13
++        font.weight: Font.DemiBold
++    }
++    component Line: Rectangle {
++        Layout.fillWidth: true
++        Layout.leftMargin: 66
++        implicitHeight: 1
++        color: ColorUtils.applyAlpha(IrisStyle.text, 0.08)
++    }
++    component NetworkRow: Rectangle {
++        id: row
++        required property var ap
++        property bool current: false
++        property bool last: false
++        readonly property bool askingHere: root.asking === row.ap.ssid || row.ap.askingPassword
++        readonly property bool open: root.opened === row.ap.ssid
++        Layout.fillWidth: true
++        implicitHeight: col.implicitHeight + 28
++        color: hit.pressed ? IrisStyle.fillHover : "transparent"
++        ColumnLayout {
++            id: col
++            x: 18; y: 14
++            width: row.width - 36
++            spacing: 10
++            RowLayout {
++                spacing: 14
++                Layout.fillWidth: true
++                Item {
++                    width: 34; height: 34
++                    MaterialSymbol { anchors.centerIn: parent; visible: row.current; text: "check"; iconSize: 22; color: IrisStyle.accent }
++                }
++                IrisText { Layout.fillWidth: true; text: row.ap.ssid; elide: Text.ElideRight; font.weight: row.current ? Font.DemiBold : Font.Normal }
++                IrisText {
++                    visible: row.current || (Network.wifiConnecting && Network.wifiConnectTarget === row.ap)
++                    text: Network.wifiConnecting && Network.wifiConnectTarget === row.ap ? Translation.tr("Joining…") : ""
++                    color: IrisStyle.subtext
++                }
++                MaterialSymbol { visible: row.ap.isSecure; text: "lock"; iconSize: 16; color: IrisStyle.subtext }
++                MaterialSymbol { text: root.bars(row.ap.strength); iconSize: 20; color: IrisStyle.text }
++                MaterialSymbol {
++                    visible: row.current || root.saved.includes(row.ap.ssid)
++                    text: "info"; iconSize: 22; color: IrisStyle.accent
++                    MouseArea {
++                        anchors { fill: parent; margins: -8 }
++                        cursorShape: Qt.PointingHandCursor
++                        onClicked: { root.forgetting = ""; root.opened = row.open ? "" : row.ap.ssid }
++                    }
++                }
++            }
++            // Asked right here: the password, or a username and password for work and school networks.
++            ColumnLayout {
++                visible: row.askingHere
++                Layout.leftMargin: 48
++                Layout.fillWidth: true
++                spacing: 8
++                IrisField { id: user; visible: row.ap.isEnterprise; Layout.fillWidth: true; placeholderText: Translation.tr("Username") }
++                IrisField {
++                    id: pass
++                    Layout.fillWidth: true
++                    placeholderText: Translation.tr("Password")
++                    echoMode: TextInput.Password
++                    onAccepted: join.clicked()
++                }
++                RowLayout {
++                    spacing: 10
++                    IrisButton {
++                        id: join
++                        text: Translation.tr("Join")
++                        emphasized: true
++                        enabled: pass.text.length >= (row.ap.isEnterprise ? 1 : 8) && (!row.ap.isEnterprise || user.text.length > 0)
++                        onClicked: {
++                            if (!enabled) return
++                            root.asking = ""
++                            if (root.saved.includes(row.ap.ssid) || row.ap.isEnterprise) Network.changePassword(row.ap, pass.text, user.text)
++                            else {
++                                // A new network: nmcli joins with the password and keeps it in the network's profile.
++                                Network.wifiConnectTarget = row.ap
++                                joinNew.exec(["nmcli", "dev", "wifi", "connect", row.ap.ssid, "password", pass.text])
++                            }
++                            pass.text = ""
++                        }
++                    }
++                    IrisButton { text: Translation.tr("Cancel"); quiet: true; onClicked: { root.asking = ""; row.ap.askingPassword = false; pass.text = "" } }
++                }
++            }
++            // Details: Disconnect, and Forget This Network (asked twice).
++            RowLayout {
++                visible: row.open
++                Layout.leftMargin: 48
++                spacing: 10
++                IrisButton { visible: row.current; text: Translation.tr("Disconnect"); onClicked: { root.opened = ""; Network.disconnectWifiNetwork() } }
++                IrisButton {
++                    text: root.forgetting === row.ap.ssid ? Translation.tr("Forget it") : Translation.tr("Forget This Network…")
++                    onClicked: {
++                        if (root.forgetting !== row.ap.ssid) { root.forgetting = row.ap.ssid; return }
++                        forget.exec(["nmcli", "connection", "delete", "id", row.ap.ssid])
++                    }
++                }
++            }
++            IrisText {
++                visible: row.open && root.forgetting === row.ap.ssid
++                Layout.leftMargin: 48
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.subtext
++                text: Translation.tr("This laptop won’t join it by itself anymore, and you’ll need its password again.")
++            }
++        }
++        MouseArea {
++            id: hit
++            anchors { left: parent.left; right: parent.right; top: parent.top }
++            anchors.rightMargin: 64
++            height: 62
++            enabled: !row.current
++            cursorShape: Qt.PointingHandCursor
++            onClicked: root.tap(row.ap)
++        }
++    }
++    Process {
++        id: joinNew
++        onExited: code => {
++            Network.wifiConnectTarget = null
++            if (code !== 0) root.message = Translation.tr("Couldn’t join that network. Check the password and try again.")
++            savedList.running = true
++            Network.refreshActiveNetworkDetails()
++        }
++    }
++
++    ColumnLayout {
++        id: content
++        x: 32; y: 32; width: Math.min(root.width - 64, 760); spacing: 10
++
++        Group {
++            RowLayout {
++                Layout.fillWidth: true
++                Layout.margins: 18
++                spacing: 14
++                Rectangle {
++                    width: 40; height: 40; radius: 12; color: "#2f7cf6"
++                    MaterialSymbol { anchors.centerIn: parent; text: "wifi"; iconSize: 24; color: "white" }
++                }
++                ColumnLayout {
++                    Layout.fillWidth: true
++                    spacing: 2
++                    IrisText { text: Translation.tr("Wi-Fi"); font.pixelSize: IrisStyle.typeTitle; font.bold: true }
++                    IrisText {
++                        Layout.fillWidth: true
++                        wrapMode: Text.WordWrap
++                        color: IrisStyle.subtext
++                        text: !Network.wifiAvailable && Network.wifiCapabilityKnown ? Translation.tr("This laptop has no Wi-Fi.")
++                            : !root.on ? Translation.tr("Turn on to join a network.")
++                            : Network.active ? (Network.online ? Translation.tr("Connected to the internet.") : Translation.tr("Connected, but not reaching the internet."))
++                            : Translation.tr("Choose a network below.")
++                    }
++                }
++                IrisSwitch { name: Translation.tr("Wi-Fi"); on: root.on; onToggled: Network.toggleWifi() }
++            }
++            Line { visible: root.on && !!Network.active }
++            NetworkRow { visible: root.on && !!Network.active; ap: Network.active ?? ({ ssid: "", strength: 0, isSecure: false }); current: true; last: true }
++        }
++        IrisText {
++            visible: root.message.length > 0
++            Layout.fillWidth: true
++            Layout.leftMargin: 18
++            wrapMode: Text.WordWrap
++            color: "#d93025"
++            text: root.message
++        }
++
++        Heading { visible: root.on && root.mine.length > 0; text: Translation.tr("MY NETWORKS") }
++        Group {
++            visible: root.on && root.mine.length > 0
++            Repeater {
++                model: root.mine
++                ColumnLayout {
++                    required property var modelData
++                    required property int index
++                    Layout.fillWidth: true
++                    spacing: 0
++                    Line { visible: index > 0 }
++                    NetworkRow { ap: modelData }
++                }
++            }
++        }
++
++        RowLayout {
++            visible: root.on
++            Layout.topMargin: 8
++            spacing: 8
++            Heading { Layout.topMargin: 0; text: Translation.tr("OTHER NETWORKS") }
++            IrisText { visible: Network.wifiScanning; text: Translation.tr("Searching…"); color: IrisStyle.subtext; font.pixelSize: IrisStyle.typeCaption ?? 13 }
++        }
++        Group {
++            visible: root.on
++            Repeater {
++                model: root.others
++                ColumnLayout {
++                    required property var modelData
++                    required property int index
++                    Layout.fillWidth: true
++                    spacing: 0
++                    Line { visible: index > 0 }
++                    NetworkRow { ap: modelData }
++                }
++            }
++            Line { visible: root.others.length > 0 }
++            // A network that doesn't show its name: join it by typing it.
++            Rectangle {
++                Layout.fillWidth: true
++                implicitHeight: otherCol.implicitHeight + 28
++                color: otherHit.pressed ? IrisStyle.fillHover : "transparent"
++                ColumnLayout {
++                    id: otherCol
++                    x: 66; y: 14
++                    width: parent.width - 84
++                    spacing: 10
++                    IrisText { text: Translation.tr("Other…"); color: IrisStyle.accent }
++                    ColumnLayout {
++                        visible: root.hiddenOpen
++                        Layout.fillWidth: true
++                        spacing: 8
++                        IrisField { id: hiddenName; Layout.fillWidth: true; placeholderText: Translation.tr("Network name") }
++                        IrisField { id: hiddenPass; Layout.fillWidth: true; placeholderText: Translation.tr("Password (if it has one)"); echoMode: TextInput.Password }
++                        RowLayout {
++                            spacing: 10
++                            IrisButton {
++                                text: Translation.tr("Join")
++                                emphasized: true
++                                enabled: hiddenName.text.trim().length > 0 && (hiddenPass.text.length === 0 || hiddenPass.text.length >= 8)
++                                onClicked: {
++                                    hidden.name = hiddenName.text.trim()
++                                    hidden.exec(["nmcli", "dev", "wifi", "connect", hidden.name, "hidden", "yes"]
++                                        .concat(hiddenPass.text.length > 0 ? ["password", hiddenPass.text] : []))
++                                    root.hiddenOpen = false; hiddenName.text = ""; hiddenPass.text = ""
++                                }
++                            }
++                            IrisButton { text: Translation.tr("Cancel"); quiet: true; onClicked: { root.hiddenOpen = false; hiddenName.text = ""; hiddenPass.text = "" } }
++                        }
++                    }
++                }
++                MouseArea { id: otherHit; anchors { left: parent.left; right: parent.right; top: parent.top } height: 50; enabled: !root.hiddenOpen
++                            cursorShape: Qt.PointingHandCursor; onClicked: root.hiddenOpen = true }
++            }
++        }
++        IrisText {
++            visible: root.on
++            Layout.fillWidth: true
++            Layout.leftMargin: 18
++            wrapMode: Text.WordWrap
++            color: IrisStyle.subtext
++            text: Translation.tr("Networks you’ve joined join again by themselves. Hotel and café Wi-Fi may open a sign-in page in your browser.")
++        }
++    }
++}
 diff --git a/modules/sidebarLeft/widgets/QuickLaunch.qml b/modules/sidebarLeft/widgets/QuickLaunch.qml
 index d9b438e..eb4100c 100644
 --- a/modules/sidebarLeft/widgets/QuickLaunch.qml
@@ -790,6 +1582,146 @@ index 6877b71..68ccbde 100755
  
  
  if __name__ == "__main__":
+diff --git a/scripts/hp-snap/dock_pin.py b/scripts/hp-snap/dock_pin.py
+new file mode 100644
+index 0000000..87ddae6
+--- /dev/null
++++ b/scripts/hp-snap/dock_pin.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""hp-snap: what to keep in the Dock for things dropped on it. Prints the Dock ids, as JSON, one per thing.
++
++  dock_pin.py URL...      an app (its .desktop file, from the app list or the desktop) keeps its own id; a web
++                          shortcut, a file or a folder gets a small launcher of its own in
++                          ~/.local/share/applications (hp-os-dock-*.desktop, hidden from the app list) that opens it
++  dock_pin.py remove ID   removes such a launcher once it leaves the Dock (apps are left alone)
++"""
++import configparser
++import hashlib
++import json
++import mimetypes
++import os
++import sys
++from urllib.parse import unquote, urlparse
++
++APPS = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "applications")
++PREFIX = "hp-os-dock-"
++
++
++def entry(path):
++    parser = configparser.ConfigParser(interpolation=None, strict=False)
++    parser.optionxform = str
++    try:
++        parser.read(path, encoding="utf-8")
++        return dict(parser["Desktop Entry"])
++    except (configparser.Error, KeyError, OSError, UnicodeDecodeError):
++        return {}
++
++
++def quoted(text):
++    """One argument of a .desktop Exec line."""
++    return '"' + "".join("\\" + c if c in '"`$\\' else c for c in text) + '"'
++
++
++def launcher(key, name, target, icon):
++    """A hidden launcher that opens target; the same target always gets the same one."""
++    ident = PREFIX + hashlib.sha1(key.encode()).hexdigest()[:12]
++    os.makedirs(APPS, exist_ok=True)
++    text = "\n".join(["[Desktop Entry]", "Type=Application", "Name=" + name.replace("\n", " "),
++                      "Exec=/usr/bin/gio open " + quoted(target).replace("%", "%%"), "Icon=" + icon, "NoDisplay=true",
++                      "X-HP-OS-Dock=" + target.replace("\n", " "), ""])
++    path = os.path.join(APPS, ident + ".desktop")
++    with open(path + ".new", "w", encoding="utf-8") as stream:
++        stream.write(text)
++    os.replace(path + ".new", path)
++    return ident
++
++
++def app_dirs():
++    data = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
++    return [APPS, os.path.expanduser("~/.nix-profile/share/applications")] + [os.path.join(d, "applications") for d in data if d]
++
++
++def installed_like(path, found):
++    """The id of the installed app this .desktop file is a copy of: the same file, or else the same command."""
++    try:
++        with open(path, "rb") as stream:
++            wanted = stream.read()
++    except OSError:
++        return None
++    by_command = None
++    for folder in app_dirs():
++        try:
++            names = sorted(os.listdir(folder))
++        except OSError:
++            continue
++        for name in names:
++            if not name.endswith(".desktop") or name.startswith(PREFIX):
++                continue
++            candidate = os.path.join(folder, name)
++            try:
++                with open(candidate, "rb") as stream:
++                    if stream.read() == wanted:
++                        return name[:-len(".desktop")]
++            except OSError:
++                continue
++            if by_command is None and found.get("Exec") and entry(candidate).get("Exec") == found.get("Exec"):
++                by_command = name[:-len(".desktop")]
++    return by_command
++
++
++def file_icon(path):
++    if os.path.isdir(path):
++        return "folder"
++    kind, _ = mimetypes.guess_type(path)
++    return kind.replace("/", "-") if kind else "text-x-generic"
++
++
++def pin(url):
++    if url.startswith("file://"):
++        path = unquote(urlparse(url).path)
++    elif url.startswith(("http://", "https://")):
++        host = urlparse(url).hostname or url
++        return launcher(url, host, url, "web-browser")
++    else:
++        return None
++    if not os.path.exists(path):
++        return None
++    if path.endswith(".desktop"):
++        found = entry(path)
++        if found.get("Type") == "Link" and found.get("URL"):
++            return launcher(found["URL"], found.get("Name", found["URL"]), found["URL"], found.get("Icon", "web-browser"))
++        if found.get("Type", "Application") == "Application":
++            # An app: its own id, from wherever its file really lives, or the installed app it's a copy of (the
++            # desktop's app icons are copies).
++            real = os.path.realpath(path)
++            if os.sep + "applications" + os.sep in real and not real.startswith(os.path.expanduser("~/Desktop")):
++                return os.path.basename(real)[:-len(".desktop")]
++            same = installed_like(real, found)
++            if same:
++                return same
++            # A launcher made somewhere else: a copy among the apps, so the Dock can find it.
++            ident = PREFIX + hashlib.sha1(real.encode()).hexdigest()[:12]
++            os.makedirs(APPS, exist_ok=True)
++            with open(real, encoding="utf-8") as src, open(os.path.join(APPS, ident + ".desktop"), "w", encoding="utf-8") as dst:
++                dst.write(src.read())
++            return ident
++    return launcher(path, os.path.basename(path.rstrip("/")) or path, path, file_icon(path))
++
++
++def remove(ident):
++    if ident.startswith(PREFIX) and "/" not in ident:
++        try:
++            os.unlink(os.path.join(APPS, ident + ".desktop"))
++        except FileNotFoundError:
++            pass
++
++
++if __name__ == "__main__":
++    if len(sys.argv) >= 3 and sys.argv[1] == "remove":
++        remove(sys.argv[2])
++    else:
++        print(json.dumps([ident for ident in (pin(url) for url in sys.argv[1:]) if ident]))
 diff --git a/scripts/hp-snap/folder_drop.py b/scripts/hp-snap/folder_drop.py
 index 34fb1f8..dc64343 100644
 --- a/scripts/hp-snap/folder_drop.py
@@ -973,6 +1905,30 @@ index ee56f01..5b8e4eb 100644
  
      function pathOf(target: string): string {
          return String(target ?? "").replace(/^file:\/\//, "")
+diff --git a/services/TaskbarApps.qml b/services/TaskbarApps.qml
+index 6626687..0c0a338 100644
+--- a/services/TaskbarApps.qml
++++ b/services/TaskbarApps.qml
+@@ -86,6 +86,19 @@ Singleton {
+         const next = exists ? pinned.filter(p => AppSearch.canonicalDesktopIdentity(p).toLowerCase() !== lower)
+             : pinned.concat([AppSearch.lookupDesktopEntry(id)?.id || id])
+         Config.setNestedValue(["dock", "pinnedApps"], next)
++        // hp-snap: a file, folder or web shortcut kept in the Dock has a launcher of its own; it goes with it.
++        if (exists && /^hp-os-dock-/.test(id))
++            Quickshell.execDetached(["python3", Quickshell.shellPath("scripts/hp-snap/dock_pin.py"), "remove", id])
++    }
++    // hp-snap: keeps what was dropped on the Dock (dock_pin.py turns each thing into a Dock id), after the pinned apps.
++    function pinIds(ids) {
++        const pinned = Array.from(Config.options?.dock?.pinnedApps ?? [])
++        const have = pinned.map(p => AppSearch.canonicalDesktopIdentity(p).toLowerCase())
++        for (const id of ids) {
++            const lower = AppSearch.canonicalDesktopIdentity(String(id)).toLowerCase()
++            if (!have.includes(lower)) { pinned.push(String(id)); have.push(lower) }
++        }
++        Config.setNestedValue(["dock", "pinnedApps"], pinned)
+     }
+ 
+     function _buildApps(): var {
 diff --git a/services/Wallpapers.qml b/services/Wallpapers.qml
 index 291047f..97eb96e 100644
 --- a/services/Wallpapers.qml

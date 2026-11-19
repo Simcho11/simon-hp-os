@@ -6,8 +6,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(HERE, "img")
 CHROME = os.path.expanduser("~/.nix-profile/bin/google-chrome-stable")
 PDFTOTEXT = "/nix/store/ffafgfpymilqh8zcbhl0kwfh96ajgvjx-poppler-utils-26.10.0/bin/pdftotext"
-VERSION = "2026.11.19.4"
-EDITION = "Edition 4 · November 2026"
+VERSION = "2026.11.19.13"
+EDITION = "Edition 5 · November 2026"
 
 def img(name):
     return "file://" + os.path.join(IMG, name)

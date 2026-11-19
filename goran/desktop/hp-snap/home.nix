@@ -212,6 +212,12 @@ in {
           ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-hp-blue-v1"}
       fi
     '';
+    # Wallpaper shuffle is out of HP-OS for now: switched off once on accounts that had it on.
+    home.activation.hpSnapNoShuffle = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
+      run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./no-shuffle.json} \
+        ${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"} \
+        ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-no-shuffle-v1"}
+    '';
     # The terminal HP-OS ships (Ghostty), once per account still set to the stock kitty, which HP-OS doesn't have.
     home.activation.hpSnapTerminal = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
       config=${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"}

@@ -1,5 +1,5 @@
 # Microsoft 365 for every HP-OS account: all the web apps in the app launcher, and the everyday
-# ones in a Microsoft 365 folder on the desktop. Word, Excel and PowerPoint are web apps here too.
+# ones straight on the desktop. Word, Excel and PowerPoint are web apps here too.
 { config, lib, pkgs, ... }:
 let
   catalogue = builtins.fromJSON (builtins.readFile ./microsoft365-webapps/apps.json);
@@ -87,10 +87,10 @@ let
 in {
   home.file = {
     ".local/bin/chrome-live-control".source = chrome;
-    # Google Chrome on every desktop, beside the Microsoft 365 folder.
+    # Google Chrome on every desktop, beside the Microsoft 365 apps.
     "${desktopDir}/Google Chrome.desktop" = { source = "${listedApps}/google-chrome.desktop"; executable = true; };
   } // builtins.listToAttrs (map (app: {
-    name = "${desktopDir}/Microsoft 365/${folder.${app.id}}.desktop";
+    name = "${desktopDir}/${folder.${app.id}}.desktop";
     value = { source = file app; executable = true; };
   }) (builtins.filter (app: folder ? ${app.id}) catalogue));
   xdg.dataFile = {
