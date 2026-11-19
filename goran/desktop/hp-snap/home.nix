@@ -212,6 +212,14 @@ in {
           ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-hp-blue-v1"}
       fi
     '';
+    # The terminal HP-OS ships (Ghostty), once per account still set to the stock kitty, which HP-OS doesn't have.
+    home.activation.hpSnapTerminal = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
+      config=${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"}
+      if [ -f "$config" ] && ${pkgs.python3}/bin/python3 -c 'import json,sys; t=json.load(open(sys.argv[1])).get("apps",{}).get("terminal","kitty"); sys.exit(0 if t in ("kitty","") else 1)' "$config"; then
+        run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./terminal.json} "$config" \
+          ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-terminal-v1"}
+      fi
+    '';
     # The HP-OS User Guide: always at ~/.local/share/hp-os (Settings › Welcome opens it), and on the desktop. The
     # desktop copy is put there once; a later edition replaces it only while it is the copy put there, so a guide
     # that was moved, changed or deleted stays that way.

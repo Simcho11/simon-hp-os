@@ -80,6 +80,9 @@ let
       done
       if [ -n "$found" ]; then sed "s|^Icon=.*|Icon=$found|" "$entry" > "$out/$id.desktop"; else cp "$entry" "$out/$id.desktop"; fi
     done
+    # The terminal is called Terminal, as on a Mac, so searching "terminal" finds it before the Settings row of that name.
+    sed -i -e '0,/^Name=Ghostty$/s//Name=Terminal/' -e 's/^Keywords=terminal;/Keywords=terminal;ghostty;shell;command;console;/' \
+      "$out/com.mitchellh.ghostty.desktop"
   '';
 in {
   home.file = {

@@ -1,3 +1,16 @@
+diff --git a/defaults/config.json b/defaults/config.json
+index e1a3a42..716000c 100644
+--- a/defaults/config.json
++++ b/defaults/config.json
+@@ -352,7 +352,7 @@
+         "network": "nm-connection-editor",
+         "networkEthernet": "nm-connection-editor",
+         "taskManager": "missioncenter",
+-        "terminal": "kitty",
++        "terminal": "ghostty",
+         "volumeMixer": "pavucontrol",
+         "update": ""
+     },
 diff --git a/modules/background/Background.qml b/modules/background/Background.qml
 index 8dd6fb7..a13d313 100644
 --- a/modules/background/Background.qml
@@ -274,6 +287,19 @@ index 4b475c6..3b2c4f1 100644
          if (GlobalStates.screenLocked || !root.dragMoved) return;
          if (root._dropKey.length > 0) {
              root._absorb()
+diff --git a/modules/common/Config.qml b/modules/common/Config.qml
+index e34c3a8..4938fc1 100644
+--- a/modules/common/Config.qml
++++ b/modules/common/Config.qml
+@@ -1334,7 +1334,7 @@ Singleton {
+                 property string network: "kitty -1 fish -c nmtui"
+                 property string networkEthernet: "kcmshell6 kcm_networkmanagement"
+                 property string taskManager: "missioncenter"
+-                property string terminal: "kitty" // This is only for shell actions
++                property string terminal: "ghostty" // hp-snap: the terminal HP-OS ships. This is only for shell actions
+                 property string browser: "firefox" // Used by launcher-backed browser shortcuts
+                 property string volumeMixer: "pavucontrol"
+                 property string discord: "discord" // Shell command to launch Discord client
 diff --git a/modules/common/widgets/widgetCanvas/AbstractWidget.qml b/modules/common/widgets/widgetCanvas/AbstractWidget.qml
 index f751670..cd5d2be 100644
 --- a/modules/common/widgets/widgetCanvas/AbstractWidget.qml
@@ -351,9 +377,18 @@ index f31593f..85dfd54 100644
          id: devices
          command: ["grep", "-i", "^N: Name=", "/proc/bus/input/devices"]
 diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
-index 1c9dd35..36e0dc7 100644
+index 1c9dd35..286ae40 100644
 --- a/modules/iris/settings/IrisOptions.qml
 +++ b/modules/iris/settings/IrisOptions.qml
+@@ -889,7 +889,7 @@ QtObject {
+         { section: "general", group: "Language", label: "Language", description: "Every label in the shell. System follows your locale.", path: "language.ui", kind: "choice", fallback: "auto",
+             choices: [{ label: "System", value: "auto" }].concat(Translation.allAvailableLanguages.map(code => ({ label: Translation.languageDisplayName(code), value: code }))),
+             keywords: ["language", "idioma", "translation", "locale", "español", "spanish"] },
+-        { section: "general", group: "Apps", label: "Terminal", description: "Where Spotlight's commands, package installs and anime playback open.", path: "apps.terminal", kind: "text", placeholder: "kitty", fallback: "kitty", keywords: ["terminal", "kitty", "foot", "alacritty", "ghostty", "wezterm", "default apps"] },
++        { section: "general", group: "Apps", label: "Default terminal", description: "Where Spotlight's commands, package installs and anime playback open.", path: "apps.terminal", kind: "text", placeholder: "ghostty", fallback: "ghostty", keywords: ["terminal", "kitty", "foot", "alacritty", "ghostty", "wezterm", "default apps"] },
+         { section: "general", group: "Settings window", label: "Opens as", description: "Over the desktop previews every change on the screen behind it. A window sits with your apps: Niri sizes, maximizes and moves it like any other.", path: "iris.appearance.settingsHost", kind: "choice", fallback: "overlay", choices: [{ label: "Over the desktop", value: "overlay", glyph: "layers" }, { label: "Window", value: "window", glyph: "web_asset" }], keywords: ["settings", "window", "overlay", "floating", "tile", "maximize"] },
+         { section: "general", group: "Settings window", label: "Show every setting", description: "Off keeps Settings to the areas most people need. Search still finds everything.", path: "settingsUi.easyMode", invert: true, kind: "switch", fallback: true, keywords: ["simple", "easy", "advanced", "all settings", "sections"] },
+         { section: "general", group: "Settings window", label: "Layout", description: "Sidebar lists every area beside the page. Rail keeps only their marks, for more room. Home opens on every area at once; each opens full width.", path: "iris.appearance.settingsLayout", kind: "choice", fallback: "sidebar", choices: [{ label: "Sidebar", value: "sidebar", glyph: "view_sidebar" }, { label: "Rail", value: "rail", glyph: "view_week" }, { label: "Home", value: "home", glyph: "grid_view" }], keywords: ["settings", "navigation", "sidebar", "rail", "grid", "home", "layout"] },
 @@ -1095,8 +1095,8 @@ QtObject {
              keywords: ["typing", "trackpad", "touchpad", "instant"]
          },
@@ -582,6 +617,19 @@ index 4820162..8127ba0 100644
          }
      }
  }
+diff --git a/modules/sidebarLeft/widgets/QuickLaunch.qml b/modules/sidebarLeft/widgets/QuickLaunch.qml
+index d9b438e..eb4100c 100644
+--- a/modules/sidebarLeft/widgets/QuickLaunch.qml
++++ b/modules/sidebarLeft/widgets/QuickLaunch.qml
+@@ -14,7 +14,7 @@ Item {
+ 
+     readonly property var defaultShortcuts: [
+         { icon: "folder", name: "Files", cmd: "nautilus" },
+-        { icon: "terminal", name: "Terminal", cmd: "kitty" },
++        { icon: "terminal", name: "Terminal", cmd: "ghostty" },
+         { icon: "web", name: "Browser", cmd: "firefox" },
+         { icon: "code", name: "Code", cmd: "code" }
+     ]
 diff --git a/modules/wallpaperSelector/WallpaperSelectorRouter.qml b/modules/wallpaperSelector/WallpaperSelectorRouter.qml
 index 28dec3d..6815cf3 100644
 --- a/modules/wallpaperSelector/WallpaperSelectorRouter.qml
@@ -850,6 +898,23 @@ index 0000000..3d3148b
 +    if sys.argv[1] == "keep":
 +        sys.exit(keep(sys.argv[2]))
 +    sys.exit(main(sys.argv[1], sys.argv[2]))
+diff --git a/services/AppCatalog.qml b/services/AppCatalog.qml
+index 96694c8..ae753d8 100644
+--- a/services/AppCatalog.qml
++++ b/services/AppCatalog.qml
+@@ -205,9 +205,9 @@ Singleton {
+     // ─── Install / Remove ──────────────────────────────────────────
+ 
+     function _safeTerminal(): string {
+-        const configured = (Config.options?.apps?.terminal ?? "kitty").trim()
+-        if (configured.length === 0) return "kitty"
+-        if (!/^[A-Za-z0-9._+-]+$/.test(configured)) return "kitty"
++        const configured = (Config.options?.apps?.terminal ?? "ghostty").trim()
++        if (configured.length === 0) return "ghostty"
++        if (!/^[A-Za-z0-9._+-]+$/.test(configured)) return "ghostty"
+         return configured
+     }
+ 
 diff --git a/services/DesktopFolder.qml b/services/DesktopFolder.qml
 index ee56f01..5b8e4eb 100644
 --- a/services/DesktopFolder.qml
@@ -892,3 +957,39 @@ index 291047f..97eb96e 100644
      function select(filePath, darkMode = Appearance.m3colors.darkmode, monitorName = "", target = "") {
          const perMonitor = (Config.options?.background?.multiMonitor?.enable ?? false) ? monitorName : ""
          selectProc.select(filePath, darkMode, perMonitor, target)
+diff --git a/services/deferred/AnimeWatch.qml b/services/deferred/AnimeWatch.qml
+index 9cfc811..0fb993b 100644
+--- a/services/deferred/AnimeWatch.qml
++++ b/services/deferred/AnimeWatch.qml
+@@ -452,9 +452,9 @@ Singleton {
+     }
+ 
+     function _terminal(): string {
+-        const configured = String(Config.options?.apps?.terminal ?? "kitty").trim()
+-        if (configured.length === 0) return "kitty"
+-        if (!/^[A-Za-z0-9._+-]+$/.test(configured)) return "kitty"
++        const configured = String(Config.options?.apps?.terminal ?? "ghostty").trim()
++        if (configured.length === 0) return "ghostty"
++        if (!/^[A-Za-z0-9._+-]+$/.test(configured)) return "ghostty"
+         return configured
+     }
+ 
+diff --git a/services/deferred/PackageSearch.qml b/services/deferred/PackageSearch.qml
+index 5b7f130..372776c 100644
+--- a/services/deferred/PackageSearch.qml
++++ b/services/deferred/PackageSearch.qml
+@@ -31,11 +31,11 @@ Singleton {
+     property int debounceMs: 300
+ 
+     function _safeTerminal(): string {
+-        const configured = (Config.options?.apps?.terminal ?? "kitty").trim()
++        const configured = (Config.options?.apps?.terminal ?? "ghostty").trim()
+         if (configured.length === 0)
+-            return "kitty"
++            return "ghostty"
+         if (!/^[A-Za-z0-9._+-]+$/.test(configured))
+-            return "kitty"
++            return "ghostty"
+         return configured
+     }
+ 
