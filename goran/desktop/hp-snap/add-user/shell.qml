@@ -173,11 +173,20 @@ ShellRoot {
         command: ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/first-setup.sock"]
         stdout: SplitParser { onRead: line => { try { welcomeRequest.answer = JSON.parse(line) } catch (error) {} } }
         onStarted: { welcomeRequest.write(welcomeRequest.message + "\n"); welcomeRequest.message = "" }
-        onExited: { const done = welcomeRequest.then; welcomeRequest.then = null; if (done) done(welcomeRequest.answer || { ok: false }) }
+        onExited: { const done = welcomeRequest.then; welcomeRequest.then = null; if (done) done(welcomeRequest.answer || { ok: false }); app.askNext() }
     }
-    function ask(message, done) {
+    // One request at a time; one asked for meanwhile waits its turn (dropping it could leave a step waiting for good).
+    // Regular looks (optional) are skipped instead while another is under way, so they never pile up.
+    property var askQueue: []
+    function askNext() {
+        if (welcomeRequest.running || app.askQueue.length === 0) return
+        const job = app.askQueue[0]
+        app.askQueue = app.askQueue.slice(1)
+        app.ask(job.message, job.done)
+    }
+    function ask(message, done, optional) {
         if (app.preview) { mockWelcome.reply(message, done); return }
-        if (welcomeRequest.running) return
+        if (welcomeRequest.running) { if (!optional) app.askQueue = app.askQueue.concat([{ message: message, done: done }]); return }
         welcomeRequest.answer = null
         welcomeRequest.then = done
         welcomeRequest.message = JSON.stringify(message)
@@ -339,7 +348,7 @@ ShellRoot {
                 app.updatePhase = "failed"
                 app.updateMessage = String(status.message || "The update couldn’t be installed.") + " You can update later in Settings."
             }
-        })
+        }, true)
     }
     Timer { id: updateDone; interval: 1400; onTriggered: if (app.step === 7) app.skipWifi() }
     // Preview: the same time zone list a new device shows, read by accounts.py from this computer's own zone files.
@@ -505,11 +514,18 @@ ShellRoot {
         command: ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/recovery.sock"]
         stdout: SplitParser { onRead: line => { try { recoveryRequest.answer = JSON.parse(line) } catch (error) {} } }
         onStarted: { recoveryRequest.write(recoveryRequest.message + "\n"); recoveryRequest.message = "" }
-        onExited: { const done = recoveryRequest.then; recoveryRequest.then = null; if (done) done(recoveryRequest.answer || { ok: false }) }
+        onExited: { const done = recoveryRequest.then; recoveryRequest.then = null; if (done) done(recoveryRequest.answer || { ok: false }); app.askRecoveryNext() }
+    }
+    property var recoveryQueue: []
+    function askRecoveryNext() {
+        if (recoveryRequest.running || app.recoveryQueue.length === 0) return
+        const job = app.recoveryQueue[0]
+        app.recoveryQueue = app.recoveryQueue.slice(1)
+        app.askRecovery(job.message, job.done)
     }
     function askRecovery(message, done) {
         if (app.preview) { mockRecovery.reply(message, done); return }
-        if (recoveryRequest.running) return
+        if (recoveryRequest.running) { app.recoveryQueue = app.recoveryQueue.concat([{ message: message, done: done }]); return }
         recoveryRequest.answer = null
         recoveryRequest.then = done
         recoveryRequest.message = JSON.stringify(message)

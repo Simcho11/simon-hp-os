@@ -38,6 +38,7 @@ NIX_SETTINGS = "etc/nix/nix.conf"
 NETRC = "etc/nix/hp-os-updates.netrc"
 BEGIN, END = "# HP-OS ready-built updates (managed by hp-os-update)", "# end of HP-OS ready-built updates"
 PUBLIC_CACHE = "https://cache.nixos.org"
+MEASURE_SECONDS = 110
 UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
 # Where a device without its own time service (chrony, timesyncd) reads the time: two HTTPS sites the updater uses
 # anyway. Their Date headers have to agree, and TLS keeps them honest.
@@ -317,8 +318,10 @@ class Updater:
             source = self.unpack(manifest)
             if self.use_ready_built(manifest):
                 self.restart_nix()
-            result = self.as_updater(["/usr/bin/nix", "build", "--dry-run", "--impure", "--expr", self.everything(source)],
-                                     check=False, timeout=900)
+            # At most two minutes: on a brand-new device it has to fetch everything first, and nobody should wait on
+            # a size. Past that the update is offered without one (timeout stops nix itself, not just runuser).
+            result = self.as_updater(["/usr/bin/timeout", str(MEASURE_SECONDS), "/usr/bin/nix", "build", "--dry-run", "--impure",
+                                      "--expr", self.everything(source)], check=False, timeout=MEASURE_SECONDS + 30)
         except (Stop, subprocess.SubprocessError, OSError, ValueError, KeyError):
             return {}
         if result.returncode != 0:
@@ -351,7 +354,7 @@ class Updater:
             raise RuntimeError(result.stderr[-2000:])
 
     def record(self, version, previous):
-        data = json.dumps({"version": version, "previous": previous, "at": int(time.time())}) + "\n"
+        data = json.dumps({"version": version, "previous": previous, "at": int(time.time()), "boot": self.boot_id()}) + "\n"
         (self.state / "installed.json").write_text(data)
         keep = {version, previous}
         for folder in self.versions.iterdir():
@@ -378,13 +381,29 @@ class Updater:
             return self.save(state="idle", message="", progress=0)
         return self.status()
 
-    def restarted_since_install(self):
+    def boot_id(self):
+        """This start of the device: a new one at every restart, whatever the clock says."""
         try:
-            installed_at = json.loads((self.state / "installed.json").read_text()).get("at", 0)
-            uptime = float(Path("/proc/uptime").read_text().split()[0])
+            return (self.root / "proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            return ""
+
+    def restarted_since_install(self):
+        """By the start the install happened in, not by the clock: a laptop whose clock starts hours off (Windows
+        keeps it in local time) would otherwise keep asking for a restart it already had."""
+        try:
+            record = json.loads((self.state / "installed.json").read_text())
+        except (OSError, ValueError):
+            return False
+        now = self.boot_id()
+        if record.get("boot") and now:
+            return record["boot"] != now
+        try:
+            uptime = float((self.root / "proc/uptime").read_text().split()[0])
         except (OSError, ValueError, IndexError):
             return False
-        return installed_at < time.time() - uptime
+        # Installed by an updater from before starts were recorded: by the clock, as before.
+        return record.get("at", 0) < time.time() - uptime
 
     # ── The three things this device can be asked to do ──
     def check(self):
@@ -465,7 +484,8 @@ class Updater:
             self.apply(source)
         except (RuntimeError, subprocess.SubprocessError, OSError):
             return self.save(state="error", progress=0, message="The previous version couldn’t be restored.")
-        (self.state / "installed.json").write_text(json.dumps({"version": previous, "previous": "", "at": int(time.time())}) + "\n")
+        (self.state / "installed.json").write_text(json.dumps({"version": previous, "previous": "", "at": int(time.time()),
+                                                              "boot": self.boot_id()}) + "\n")
         shutil.rmtree(self.versions / current, ignore_errors=True)
         return self.save(state="restart", installed=previous, progress=100, message="Restart to finish.")
 

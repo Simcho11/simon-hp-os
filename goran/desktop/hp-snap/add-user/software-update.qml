@@ -54,17 +54,27 @@ ShellRoot {
         command: ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/update.sock"]
         stdout: SplitParser { onRead: line => { try { request.answer = JSON.parse(line) } catch (error) {} } }
         onStarted: { request.write(request.message + "\n"); request.message = "" }
-        onExited: { const done = request.then; request.then = null; if (done) done(request.answer) }
+        onExited: { const done = request.then; request.then = null; if (done) done(request.answer); app.sendNext() }
+    }
+    // One request at a time. One asked for while another is under way waits its turn: dropping it left Update now
+    // on "Checking…" for good when it landed during a status refresh.
+    property var queued: []
+    function sendNext() {
+        if (request.running || app.queued.length === 0) return
+        const job = app.queued[0]
+        app.queued = app.queued.slice(1)
+        app.send(job.message, job.done)
     }
     function send(message, done) {
-        if (request.running) return
+        if (request.running) { app.queued = app.queued.concat([{ message: message, done: done }]); return }
         request.answer = null
         request.then = done
         request.message = JSON.stringify(message)
         request.running = true
     }
     function refresh() {
-        if (app.preview.length > 0 || app.sending) return
+        // A regular look; skipped while something else is being asked, so looks never pile up.
+        if (app.preview.length > 0 || app.sending || request.running) return
         app.send({ action: "status" }, answer => {
             if (!answer || !answer.ok) return
             app.status = answer.status
