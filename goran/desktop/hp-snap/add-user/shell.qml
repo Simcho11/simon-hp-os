@@ -300,13 +300,39 @@ ShellRoot {
     property bool settingZone: false
     property string heldPassword: ""           // From the password screen, until the time zone is chosen.
     function plain(text) { return String(text).normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/−/g, "-").toLowerCase() }
+    // Best first: a time name (PST) or the start of a city, state or country beats a word found somewhere inside,
+    // and common places come before small ones that match as well. Every word typed has to match something.
+    function zoneScore(place, words) {
+        const city = app.plain(place.city), country = app.plain(place.country), region = app.plain(place.region)
+        const names = " " + app.plain(place.names || "").replace(/[^a-z0-9]+/g, " ") + " "
+        const abbr = (place.abbr || []).map(name => app.plain(name))
+        const spaced = text => " " + text.replace(/[^a-z0-9+-]+/g, " ") + " "
+        const offset = app.plain(app.offsetText(place.offset)), zone = app.plain(place.zone)
+        let total = 0
+        for (const word of words) {
+            let best = 0
+            if (abbr.indexOf(word) >= 0) best = 8
+            else if (city === word || country === word) best = 7
+            else if (spaced(city).indexOf(" " + word) >= 0) best = 6
+            else if (names.indexOf(" " + word + " ") >= 0) best = 7
+            else if (names.indexOf(" " + word) >= 0) best = 5
+            else if (spaced(country).indexOf(" " + word) >= 0) best = 5
+            else if (spaced(region).indexOf(" " + word) >= 0) best = 3
+            else if ([offset, offset.split(":")[0]].some(text => text === word || text === "gmt" + word)) best = 3
+            else if (city.indexOf(word) >= 0 || country.indexOf(word) >= 0) best = 2
+            else if (zone.indexOf(word) >= 0) best = 1
+            if (best === 0) return 0
+            total += best
+        }
+        return total + 2 * Number(place.common || 0)
+    }
     readonly property var zoneMatches: {
-        const words = app.plain(app.zoneSearch).split(/[\s,]+/).filter(word => word.length > 0)
+        const words = app.plain(app.zoneSearch).replace(/\btime\b/g, " ").replace(/\butc/g, "gmt").split(/[\s,]+/).filter(word => word.length > 0)
         if (words.length === 0) return app.zones
-        return app.zones.filter(place => {
-            const text = app.plain([place.country, place.city, place.region, place.zone, app.offsetText(place.offset)].join(" "))
-            return words.every(word => text.indexOf(word) >= 0)
-        })
+        return app.zones.map(place => ({ place: place, score: app.zoneScore(place, words) }))
+            .filter(found => found.score > 0)
+            .sort((a, b) => b.score - a.score)      // Stable: equal scores keep the list's country order.
+            .map(found => found.place)
     }
     readonly property var chosenPlace: app.zones.find(place => place.zone === app.chosenZone) || null
     function offsetText(minutes) {
@@ -591,6 +617,13 @@ ShellRoot {
         implicitHeight: app.newKeyMode ? 820 : 900
         readonly property real d: Math.max(0.75, Math.min(2.2, Math.min(height / 1000, width / 1500)))
         function px(n) { return Math.round(n * d) }
+        // Where a screen's content starts: about a third of the way down, but higher for a tall screen, so the glass
+        // always ends above the dots at the bottom; never above the very top.
+        function topFor(contentHeight) {
+            const height = win.contentItem.height, pad = win.px(46)
+            return Math.round(Math.max(pad + win.px(20), Math.min(height * 0.36, height - contentHeight - pad - win.px(76))))
+        }
+        readonly property real cardContent: card.holder ? card.holder.height : win.px(260)
 
         // ── Pieces ──
         component Label: Text {
@@ -684,8 +717,9 @@ ShellRoot {
             Column {
                 id: holder
                 anchors.horizontalCenter: parent.horizontalCenter
-                y: Math.round(parent.height * 0.36)
+                y: win.topFor(holder.height)
                 spacing: win.px(14)
+                Behavior on y { NumberAnimation { duration: 560; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
             }
         }
         component Title: Label {
@@ -814,7 +848,8 @@ ShellRoot {
             width: card.holder ? Math.max(win.px(660), card.holder.width + 2 * card.pad) : win.px(660)
             height: card.holder ? card.holder.height + 2 * card.pad : win.px(260)
             x: Math.round((win.contentItem.width - card.width) / 2)
-            y: Math.round(win.contentItem.height * 0.36) - card.pad
+            y: win.topFor(win.cardContent) - card.pad
+            Behavior on y { NumberAnimation { duration: 560; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
             opacity: app.appear
             scale: 0.97 + 0.03 * app.appear
             radius: win.px(44)
@@ -830,9 +865,13 @@ ShellRoot {
         LoginAvatar {
             id: avatar
             visible: app.step !== 5 && app.step !== 6 && app.step !== 7
-            opacity: app.appear
+            // Above the glass; it steps aside when a tall screen needs the room.
+            readonly property real room: win.topFor(win.cardContent) - win.px(46) - win.px(22)
+            opacity: app.appear * (avatar.room - win.px(16) >= avatar.width ? 1 : 0)
+            Behavior on opacity { NumberAnimation { duration: 240 } }
             anchors.horizontalCenter: parent.horizontalCenter
-            y: Math.round(parent.height * 0.17)
+            y: Math.round(Math.max(win.px(16), Math.min(parent.height * 0.17, avatar.room - avatar.width)))
+            Behavior on y { NumberAnimation { duration: 560; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
             width: win.px(app.step === 4 ? 132 : 112); height: width
             icon: app.recoveryMode ? "" : app.faceUrl(app.face)
             account: app.recoveryLogin
@@ -1177,8 +1216,11 @@ ShellRoot {
                 input.maximumLength: 48
                 input.onTextChanged: {
                     app.zoneSearch = zoneSearchField.text
-                    // One match left: that's the one.
-                    if (app.zoneMatches.length === 1) app.chosenZone = app.zoneMatches[0].zone
+                    // The best match is chosen as you type, so Enter takes it.
+                    if (app.zoneSearch.trim().length > 0 && app.zoneMatches.length > 0) {
+                        app.chosenZone = app.zoneMatches[0].zone
+                        zoneList.positionViewAtBeginning()
+                    }
                 }
                 onAccepted: { if (app.chosenZone) app.confirmTimeZone() }
                 Keys.onDownPressed: zoneList.move(1)
@@ -1188,10 +1230,14 @@ ShellRoot {
                 id: zoneList
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: win.px(440)
-                height: win.px(5 * 50 + 4 * 6)
+                height: win.px(4 * 50 + 3 * 6)
                 spacing: win.px(6)
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                // Free, phone-like scrolling: a flick carries on and slows gently, and the ends give a little.
+                boundsBehavior: Flickable.DragAndOvershootBounds
+                flickDeceleration: win.px(900)
+                maximumFlickVelocity: win.px(7000)
+                pixelAligned: true
                 model: app.zoneMatches
                 function move(by) {
                     const places = app.zoneMatches
@@ -1292,7 +1338,7 @@ ShellRoot {
                 id: keyCard
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: win.px(440)
-                height: app.showQr ? win.px(250) : win.px(106)
+                height: app.showQr ? win.px(222) : win.px(106)
                 radius: app.showQr ? win.px(30) : height / 2
                 color: "white"
                 Behavior on height { NumberAnimation { duration: 320; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
@@ -1309,7 +1355,7 @@ ShellRoot {
                 Canvas {
                     id: qrCanvas
                     anchors.centerIn: parent
-                    width: win.px(210); height: width
+                    width: win.px(184); height: width
                     opacity: app.showQr ? 1 : 0
                     visible: opacity > 0
                     Behavior on opacity { NumberAnimation { duration: 200 } }

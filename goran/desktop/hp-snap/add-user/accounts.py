@@ -290,10 +290,61 @@ def update_install():
 
 
 ZONEINFO = "/usr/share/zoneinfo"
+# What people call the places they search for: time names, states, big cities without their own time zone.
+# A zone listed here is also a common choice, shown ahead of small places that match as well.
+ZONE_NAMES = {
+    "America/Los_Angeles": "Pacific Time PT West Coast California San Francisco SF LA Seattle Washington State Portland Oregon Las Vegas Nevada San Diego San Jose USA US America",
+    "America/Vancouver": "Pacific Time PT British Columbia BC",
+    "America/Tijuana": "Pacific Time PT Baja California",
+    "America/Denver": "Mountain Time MT Colorado Utah Salt Lake City Albuquerque New Mexico Boise Idaho Montana Wyoming USA US America",
+    "America/Phoenix": "Mountain Time MT Arizona Tucson USA US America",
+    "America/Edmonton": "Mountain Time MT Alberta Calgary",
+    "America/Chicago": "Central Time CT Illinois Texas Dallas Houston Austin San Antonio Minnesota Minneapolis Missouri St Louis Kansas City New Orleans Louisiana Nashville Tennessee Wisconsin Milwaukee Iowa Oklahoma USA US America",
+    "America/Winnipeg": "Central Time CT Manitoba",
+    "America/Mexico_City": "Central Time Mexico Guadalajara Monterrey",
+    "America/New_York": "Eastern Time ET East Coast New York City NYC Boston Massachusetts Washington DC Philadelphia Pennsylvania Pittsburgh Atlanta Georgia Miami Orlando Florida Charlotte North Carolina Virginia Baltimore Maryland Ohio Cleveland Columbus New Jersey Connecticut USA US America",
+    "America/Detroit": "Eastern Time ET Michigan",
+    "America/Toronto": "Eastern Time ET Ontario Ottawa Montreal Quebec",
+    "America/Halifax": "Atlantic Time AT Nova Scotia",
+    "America/St_Johns": "Newfoundland Time",
+    "America/Anchorage": "Alaska Time AKT",
+    "Pacific/Honolulu": "Hawaii Time HT",
+    "America/Sao_Paulo": "Brazil Rio de Janeiro Brasilia",
+    "America/Argentina/Buenos_Aires": "Argentina",
+    "America/Bogota": "Colombia", "America/Lima": "Peru", "America/Santiago": "Chile",
+    "Europe/London": "UK United Kingdom Britain Great Britain England Scotland Wales Northern Ireland Manchester Edinburgh",
+    "Europe/Dublin": "Ireland Irish Time",
+    "Europe/Lisbon": "Portugal",
+    "Europe/Paris": "France Europe European", "Europe/Berlin": "Germany Europe European Munich Frankfurt Hamburg",
+    "Europe/Madrid": "Spain Barcelona Europe European", "Europe/Rome": "Italy Milan Europe European",
+    "Europe/Amsterdam": "Netherlands Holland Europe European", "Europe/Brussels": "Belgium Europe European",
+    "Europe/Zurich": "Switzerland Geneva Europe European", "Europe/Stockholm": "Sweden Europe European",
+    "Europe/Warsaw": "Poland Europe European", "Europe/Vienna": "Austria Europe European",
+    "Europe/Athens": "Greece Eastern European Time", "Europe/Kyiv": "Ukraine Kiev Eastern European Time",
+    "Europe/Istanbul": "Turkey Türkiye", "Europe/Moscow": "Russia Moscow Time",
+    "Africa/Cairo": "Egypt", "Africa/Lagos": "Nigeria West Africa Time", "Africa/Nairobi": "Kenya East Africa Time",
+    "Africa/Johannesburg": "South Africa Cape Town", "Asia/Dubai": "UAE United Arab Emirates Gulf Abu Dhabi",
+    "Asia/Jerusalem": "Israel Tel Aviv", "Asia/Riyadh": "Saudi Arabia",
+    "Asia/Karachi": "Pakistan Lahore Islamabad", "Asia/Kolkata": "India Indian Time Delhi New Delhi Mumbai Bombay Bangalore Bengaluru Chennai Hyderabad Pune Calcutta",
+    "Asia/Kathmandu": "Nepal", "Asia/Dhaka": "Bangladesh", "Asia/Bangkok": "Thailand", "Asia/Jakarta": "Indonesia",
+    "Asia/Ho_Chi_Minh": "Vietnam Saigon Hanoi", "Asia/Singapore": "Singapore", "Asia/Kuala_Lumpur": "Malaysia",
+    "Asia/Manila": "Philippines", "Asia/Shanghai": "China Beijing Shenzhen Guangzhou China Time", "Asia/Hong_Kong": "Hong Kong",
+    "Asia/Taipei": "Taiwan", "Asia/Seoul": "South Korea Korea", "Asia/Tokyo": "Japan Osaka",
+    "Australia/Sydney": "Australia New South Wales NSW Canberra Australian Eastern Time",
+    "Australia/Melbourne": "Australia Victoria Australian Eastern Time", "Australia/Brisbane": "Australia Queensland",
+    "Australia/Perth": "Australia Western Australia", "Australia/Adelaide": "Australia South Australia",
+    "Pacific/Auckland": "New Zealand NZ Wellington",
+}
+
+# The very most chosen: ahead of other common places that match a search equally well (PST: Los Angeles first).
+MAJOR_ZONES = {"America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York",
+               "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Kolkata", "Asia/Shanghai", "Asia/Tokyo",
+               "America/Sao_Paulo", "America/Mexico_City", "Asia/Dubai", "Asia/Singapore"}
 
 
 def time_zones():
-    """Every place in the system's own time zone list, by country, with its distance from GMT today."""
+    """Every place in the system's own time zone list, by country, with its distance from GMT today, its time names
+    (PST, PDT, CET…) and what else people call it."""
     import datetime
     import zoneinfo
     countries = {}
@@ -303,6 +354,7 @@ def time_zones():
                 code, _, name = line.rstrip("\n").partition("\t")
                 countries[code] = name
     now = datetime.datetime.now(datetime.timezone.utc)
+    seasons = [datetime.datetime(now.year, month, 15, 12, tzinfo=datetime.timezone.utc) for month in (1, 7)]
     zones = []
     with open(os.path.join(ZONEINFO, "zone.tab"), encoding="utf-8") as stream:
         for line in stream:
@@ -310,12 +362,18 @@ def time_zones():
             if line.startswith("#") or len(fields) < 3:
                 continue
             try:
-                offset = int(now.astimezone(zoneinfo.ZoneInfo(fields[2])).utcoffset().total_seconds() // 60)
+                place = zoneinfo.ZoneInfo(fields[2])
+                offset = int(now.astimezone(place).utcoffset().total_seconds() // 60)
+                # Real names only, not "+05".
+                names = sorted({moment.astimezone(place).tzname() for moment in seasons + [now]} - {None})
             except (zoneinfo.ZoneInfoNotFoundError, ValueError):
                 continue
             zones.append({"zone": fields[2], "country": countries.get(fields[0], fields[0]),
                           "city": fields[2].rsplit("/", 1)[-1].replace("_", " "),
-                          "region": fields[3] if len(fields) > 3 else "", "offset": offset})
+                          "region": fields[3] if len(fields) > 3 else "", "offset": offset,
+                          "abbr": [name for name in names if name.isalpha()],
+                          "names": ZONE_NAMES.get(fields[2], ""),
+                          "common": 2 if fields[2] in MAJOR_ZONES else 1 if fields[2] in ZONE_NAMES else 0})
     return sorted(zones, key=lambda zone: (zone["country"], zone["city"]))
 
 
