@@ -12,6 +12,9 @@ ShellRoot {
     property bool asking: false
     property bool sending: false
     property string notice: ""
+    property bool checking: false
+    property real checkStarted: 0
+    readonly property string checkError: String(app.status.checkError || "")
     readonly property string state: String(app.status.state || "idle")
     readonly property var offer: app.status.available || null
     readonly property bool busy: state === "downloading" || state === "installing" || state === "restoring"
@@ -36,7 +39,13 @@ ShellRoot {
     }
     function refresh() {
         if (app.preview.length > 0 || app.sending) return
-        app.send({ action: "status" }, answer => { if (answer && answer.ok) { app.status = answer.status; app.admin = answer.admin === true } })
+        app.send({ action: "status" }, answer => {
+            if (!answer || !answer.ok) return
+            app.status = answer.status
+            app.admin = answer.admin === true
+            // The check runs in the background; it is done once it has recorded a time after the button was pressed.
+            if (app.checking && Number(answer.status.lastChecked || 0) >= app.checkStarted - 2) app.checking = false
+        })
     }
     function perform(action) {
         if (password.text.length === 0 || app.sending) return
@@ -52,8 +61,19 @@ ShellRoot {
         })
     }
     function checkNow() {
-        if (app.preview.length > 0) return
-        app.send({ action: "check" }, () => app.refresh())
+        if (app.preview.length > 0 || app.checking) return
+        app.checking = true
+        app.checkStarted = Date.now() / 1000
+        checkLimit.restart()
+        app.send({ action: "check" }, answer => {
+            if (!answer || !answer.ok) { app.checking = false; app.notice = "Software Update isn’t available right now. Restart your device and try again." }
+            app.refresh()
+        })
+    }
+    Timer {
+        id: checkLimit
+        interval: 120000
+        onTriggered: if (app.checking) { app.checking = false; app.notice = "Checking took too long. Make sure you’re connected to the internet, then try again." }
     }
     QtObject {
         id: previews
@@ -126,6 +146,7 @@ ShellRoot {
                 font.pixelSize: 17
                 text: app.state === "restart" || app.busy || app.state === "error" ? String(app.status.message || "")
                     : app.offer ? "A new version is ready to install. Your files, apps and settings stay as they are."
+                    : app.checking ? "Checking for updates…"
                     : app.status.installed ? "You’re on version " + app.status.installed + "." : "You’re on the latest version."
             }
 
@@ -206,6 +227,15 @@ ShellRoot {
                 }
             }
             Label {
+                visible: !app.asking && !app.checking && !app.offer && !app.busy && app.state !== "restart"
+                    && (app.notice.length > 0 || app.checkError.length > 0)
+                color: "#ffb4ab"
+                font.pixelSize: 15; font.weight: Font.Medium
+                text: app.notice.length > 0 ? app.notice
+                    : app.checkError.indexOf("reach") >= 0 ? "Couldn’t check for updates. Make sure you’re connected to the internet, then try again."
+                    : app.checkError
+            }
+            Label {
                 visible: app.asking || (!app.admin && !!app.offer && !app.busy && app.state !== "restart")
                 color: app.notice.length > 0 ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.78)
                 font.pixelSize: 15; font.weight: Font.Medium
@@ -229,8 +259,9 @@ ShellRoot {
             }
             Action {
                 visible: !app.busy && app.state !== "restart" && !app.offer && !app.asking
-                label: "Check for updates"
-                onActivated: app.checkNow()
+                label: app.checking ? "Checking…" : "Check for updates"
+                ready: !app.checking
+                onActivated: { app.notice = ""; app.checkNow() }
             }
             Quiet {
                 visible: app.asking

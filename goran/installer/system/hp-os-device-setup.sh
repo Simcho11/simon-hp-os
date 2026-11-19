@@ -17,9 +17,9 @@ state=/var/lib/hp-os
 
 if [[ "${1:-}" == --undo ]]; then
     systemctl disable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-factory-wipe.service \
-        hp-os-update.socket hp-os-update-check.timer 2>/dev/null || true
+        hp-os-update.socket hp-os-update-check.timer hp-os-update-settle.service 2>/dev/null || true
     rm -f "$units"/hp-os-update.socket "$units"/hp-os-update@.service "$units"/hp-os-update-job.service \
-          "$units"/hp-os-update-check.service "$units"/hp-os-update-check.timer
+          "$units"/hp-os-update-check.service "$units"/hp-os-update-check.timer "$units"/hp-os-update-settle.service
     rm -f "$units"/hp-os-factory-reset.socket "$units"/hp-os-factory-reset@.service "$units"/hp-os-first-setup.socket \
           "$units"/hp-os-first-setup@.service "$units"/hp-os-factory-wipe.service "$state/factory-reset-request"
     rm -rf /opt/hp-os/device
@@ -158,6 +158,18 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-update check
 UNIT
+cat > "$units/hp-os-update-settle.service" <<UNIT
+[Unit]
+Description=Finish an HP-OS software update after its restart
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-update settle
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 cat > "$units/hp-os-update-check.timer" <<UNIT
 [Unit]
 Description=Look for HP-OS software updates once a day
@@ -173,7 +185,7 @@ WantedBy=timers.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-update.socket hp-os-update-check.timer >/dev/null
-systemctl enable hp-os-factory-wipe.service >/dev/null
+systemctl enable hp-os-factory-wipe.service hp-os-update-settle.service >/dev/null
 
 # The login screen must survive a reset that removes every home folder.
 niri=$(readlink -f /opt/hp-os/niri-patch/result-hpos)

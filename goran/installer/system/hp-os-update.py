@@ -2,6 +2,7 @@
 """HP-OS software updates on a device, run as root by the units hp-os-device-setup.sh installs.
 
   hp-os-update check          look for a new release (a daily timer, or Settings)
+  hp-os-update settle         at startup: an update that was waiting for a restart has now finished
   hp-os-update job            carry out the install or restore that was asked for
   hp-os-update request        answer Settings (socket activated)
   hp-os-update enroll FILE    connect this device to its publisher, from the bundle made on the publishing laptop
@@ -213,6 +214,12 @@ class Updater:
                             "HP-OS %s is available" % offer["version"], "Open Settings to install it."],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def settle(self):
+        """After the restart an update asked for, it is simply installed: Settings stops asking to restart."""
+        if self.status().get("state") == "restart" and self.restarted_since_install():
+            return self.save(state="idle", message="", progress=0)
+        return self.status()
+
     def restarted_since_install(self):
         try:
             installed_at = json.loads((self.state / "installed.json").read_text()).get("at", 0)
@@ -225,8 +232,7 @@ class Updater:
     def check(self):
         if not self.enrolled():
             return self.save(state="idle")
-        if self.status().get("state") == "restart" and self.restarted_since_install():
-            self.save(state="idle", message="", progress=0)
+        self.settle()
         if self.status().get("state") in ("downloading", "installing", "restoring"):
             return self.status()
         try:
@@ -306,7 +312,7 @@ class Updater:
         if action == "status":
             tools = device_tools().Device(self.root)
             who = tools.person(uid)
-            return {"ok": True, "status": self.status(), "admin": bool(who) and tools.is_admin(who)}
+            return {"ok": True, "status": self.settle(), "admin": bool(who) and tools.is_admin(who)}
         if action == "check":
             subprocess.run(["/usr/bin/systemctl", "start", "--no-block", "hp-os-update-check.service"], check=False)
             return {"ok": True}
@@ -356,6 +362,8 @@ def main():
     updater = Updater()
     if command == "check":
         updater.check()
+    elif command == "settle":
+        updater.settle()
     elif command == "job":
         updater.job()
     elif command == "status":
