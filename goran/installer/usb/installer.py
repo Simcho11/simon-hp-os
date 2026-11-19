@@ -217,9 +217,84 @@ def target_disk(source):
     return max(disks)[1]
 
 
+# The OmniBook models with NVIDIA's N1X (its graphics, 10de:2e03, are on every one): the OmniBook X also comes with
+# other chips, which this installer can't run.
+SUPPORTED_MODELS = ("OmniBook Ultra", "OmniBook X")
+
+
+def n1x_chip():
+    return any(read(device / "vendor") == "0x10de" and read(device / "device") == "0x2e03"
+               for device in Path("/sys/bus/pci/devices").glob("*"))
+
+
 def supported_hardware():
     product = Path("/sys/class/dmi/id/product_name").read_text().strip() if os.path.exists("/sys/class/dmi/id/product_name") else ""
-    return "OmniBook Ultra" in product or "hpos.any_hardware=1" in Path("/proc/cmdline").read_text()
+    return (any(model in product for model in SUPPORTED_MODELS) and n1x_chip()) or "hpos.any_hardware=1" in Path("/proc/cmdline").read_text()
+
+
+# ── The battery: the N1X firmware reads it from NVIDIA's controller into a buffer too small for the answer, so Linux
+# sees no battery. The startup fix is the laptop's own DSDT with that one buffer (FFA0.RBUF's BUFF) made 0x90 bytes. ──
+ULTRA_BOARD = "8E6A"          # The OmniBook Ultra's fix is the one made by hand and checked on it; it comes with the system.
+SMALL_BUFFER = b"\x08BUFF\x11\x03\x0a\x40"
+BIG_BUFFER = b"\x08BUFF\x11\x03\x0a\x90"
+
+
+def package_length(data, at):
+    """An AML PkgLength at this offset: (value, bytes it takes)."""
+    lead = data[at]
+    follow = lead >> 6
+    if follow == 0:
+        return lead & 0x3F, 1
+    value = lead & 0x0F
+    for index in range(follow):
+        value |= data[at + 1 + index] << (4 + 8 * index)
+    return value, follow + 1
+
+
+def fixed_dsdt(dsdt):
+    """The DSDT with the battery buffer enlarged, its revision raised so it replaces the firmware's, and its checksum
+    redone; None unless the buffer is found exactly once, inside a method named RBUF."""
+    if len(dsdt) < 36 or dsdt[:4] != b"DSDT" or int.from_bytes(dsdt[4:8], "little") != len(dsdt):
+        return None
+    spots = []
+    at = dsdt.find(b"RBUF")
+    while at >= 0:
+        for size in range(1, 5):
+            start = at - size
+            if start > 0 and dsdt[start - 1] == 0x14 and package_length(dsdt, start)[1] == size:
+                end = start + package_length(dsdt, start)[0]
+                inside = dsdt.find(SMALL_BUFFER, at, end)
+                while inside >= 0:
+                    spots.append(inside)
+                    inside = dsdt.find(SMALL_BUFFER, inside + 1, end)
+                break
+        at = dsdt.find(b"RBUF", at + 1)
+    if len(spots) != 1:
+        return None
+    fixed = bytearray(dsdt)
+    fixed[spots[0]:spots[0] + len(BIG_BUFFER)] = BIG_BUFFER
+    fixed[24:28] = (int.from_bytes(fixed[24:28], "little") + 1).to_bytes(4, "little")
+    fixed[9] = 0
+    fixed[9] = (-sum(fixed)) & 0xFF
+    return bytes(fixed)
+
+
+def battery_fix(target):
+    """Writes target/boot/goran-battery-acpi.cpio for this laptop. The OmniBook Ultra keeps the system's own; any other
+    gets one made from its firmware, or an empty one (no fix, nothing else changed) if the firmware isn't as expected."""
+    if read("/sys/class/dmi/id/board_name") == ULTRA_BOARD:
+        return "kept"
+    fixed = fixed_dsdt(read("/sys/firmware/acpi/tables/DSDT", binary=True))
+    work = Path("/run/hp-os-battery")
+    shutil.rmtree(work, ignore_errors=True)
+    (work / "kernel/firmware/acpi").mkdir(parents=True)
+    if fixed:
+        (work / "kernel/firmware/acpi/dsdt.aml").write_bytes(fixed)
+    files = "kernel\nkernel/firmware\nkernel/firmware/acpi\n" + ("kernel/firmware/acpi/dsdt.aml\n" if fixed else "")
+    archive = subprocess.run(["cpio", "--quiet", "-H", "newc", "-o"], input=files.encode(), cwd=work, capture_output=True, check=True).stdout
+    (Path(target) / "boot/goran-battery-acpi.cpio").write_bytes(archive)
+    log("battery fix:", "made from this laptop's firmware" if fixed else "none (firmware not as expected)")
+    return "made" if fixed else "none"
 
 
 def low_power():
@@ -286,6 +361,7 @@ def install(screen, disk):
     run("fallocate", "-l", "8G", str(TARGET / "swap.img"))
     os.chmod(TARGET / "swap.img", 0o600)
     run("mkswap", str(TARGET / "swap.img"))
+    battery_fix(TARGET)
     clean_startup()
     if os.path.isdir("/sys/firmware/efi/efivars"):
         listing = run("efibootmgr", check=False)
