@@ -287,6 +287,9 @@ def keyfile_value(text):
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
 
 
+PRIVATE_ADDRESS = "cloned-mac-address=stable"
+
+
 def clean_text(value, longest):
     return isinstance(value, str) and 0 < len(value) <= longest and not re.search(r"[\x00-\x1f\x7f]", value)
 
@@ -310,8 +313,11 @@ def wifi_join(request):
     if kind == "eap" and not (clean_text(user, 128) and clean_text(password, 256)):
         raise Refused("Enter your username and password for this network.")
     identifier = str(uuid.uuid4())
+    # A private address for this network, as phones do: the same each time it's joined, and new once it's joined
+    # again from scratch (after a factory reset), so a hotel's sign-in network sees a new device, not one it remembers.
     lines = ["[connection]", "id=" + keyfile_value(ssid), "uuid=" + identifier, "type=wifi", "autoconnect=true", "",
-             "[wifi]", "mode=infrastructure", "ssid=" + ";".join(str(byte) for byte in ssid.encode()) + ";"]
+             "[wifi]", "mode=infrastructure", "ssid=" + ";".join(str(byte) for byte in ssid.encode()) + ";",
+             PRIVATE_ADDRESS]
     lines += ["hidden=true", ""] if request.get("hidden") else [""]
     if kind in ("psk", "sae"):
         lines += ["[wifi-security]", "key-mgmt=" + ("sae" if kind == "sae" else "wpa-psk"), "psk=" + keyfile_value(password), ""]
@@ -339,6 +345,15 @@ def wifi_join(request):
         stream.write("\n".join(lines))
     run(NMCLI, "connection", "reload", timeout=20)
     joined = run(NMCLI, "--wait", "45", "connection", "up", "uuid", identifier, timeout=70)
+    if joined.returncode != 0 and not re.search(r"[Ss]ecrets were required|password", joined.stdout + joined.stderr):
+        # Not a wrong password: once more with the device's own address, in case this Wi-Fi chip or network doesn't
+        # take a private one. Wi-Fi working matters more than the private address.
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(text.replace(PRIVATE_ADDRESS + "\n", ""))
+        run(NMCLI, "connection", "reload", timeout=20)
+        joined = run(NMCLI, "--wait", "45", "connection", "up", "uuid", identifier, timeout=70)
     if joined.returncode != 0:
         run(NMCLI, "connection", "delete", "uuid", identifier, timeout=20)
         if os.path.exists(path):
