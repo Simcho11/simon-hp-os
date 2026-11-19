@@ -28,7 +28,7 @@ ShellRoot {
     // or 12 an administrator's password, then 9 the new key (Settings).
     property int step: firstBoot ? 5 : resetMode ? 10 : newKeyMode ? 12 : 0
     // Where each step sits in the flow, so screens slide the way the person is going.
-    function order(step) { return [0, 1, 2, 4, 5, -3, -2, -1, 3, 2.5, 0, 1, 0][step] }
+    function order(step) { return [0, 1, 2, 4, 5, -3, -2, -1, 3, 2.5, 0, 1, 0, -1.5][step] }
     property Item activePage: null
     // Set by the first-setup service just before the restart that finishes an update: Wi-Fi and the update are done,
     // so the welcome carries on at "What's your name?" instead of starting over.
@@ -194,6 +194,8 @@ ShellRoot {
             app.scanning = false
             app.networks = answer.networks || []
             app.online = answer.online === true
+            // Already on a network that wants a web sign-in first.
+            if (answer.connectivity === "portal" && app.step === 6 && !app.chosenNetwork) { app.needSignIn(answer.signIn); return }
             // Already online (a cable, or a network joined before): straight on to updates.
             if (app.online && app.step === 6 && !app.chosenNetwork) app.startUpdate()
         })
@@ -205,11 +207,59 @@ ShellRoot {
         app.ask({ action: "wifi-join", ssid: app.chosenNetwork.ssid, secure: app.chosenNetwork.secure,
                   sae: app.chosenNetwork.sae, password: password }, answer => {
             app.joining = false
-            if (answer.ok) { app.online = true; app.startUpdate() }
+            if (answer.ok && answer.connectivity === "portal") app.needSignIn(answer.signIn)
+            else if (answer.ok) { app.online = true; app.startUpdate() }
             else app.wifiNotice = answer.error || "Couldn’t join that network."
         })
     }
     function skipWifi() { app.step = 0; nameField.input.forceActiveFocus() }
+
+    // ── A Wi-Fi network that wants a web sign-in first (hotels, cafés, airports): its page opens full screen in Chrome,
+    // which is on every HP-OS device, and setup carries on by itself as soon as the internet works. ──
+    property string signInPage: ""
+    property string signInNetwork: ""
+    property bool signInOpen: false
+    property bool mockSignedIn: false
+    readonly property string signInFolder: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/hp-os-wifi-sign-in"
+    function needSignIn(page) {
+        app.signInPage = page || "http://connectivity-check.ubuntu.com/"
+        const current = app.chosenNetwork || app.networks.find(network => network.connected) || null
+        app.signInNetwork = current ? current.ssid : ""
+        app.step = 13
+        signInWatch.start()
+    }
+    Process {
+        id: signInBrowser
+        // A throwaway profile in memory, gone when the window closes.
+        environment: ({ "HOME": app.signInFolder })
+        command: [Quickshell.env("HP_OS_CHROME") || "google-chrome-stable", "--app=" + app.signInPage,
+            "--user-data-dir=" + app.signInFolder, "--no-first-run", "--no-default-browser-check", "--disable-sync",
+            "--disable-extensions", "--disable-background-networking", "--password-store=basic", "--ozone-platform=wayland",
+            "--disable-gpu", "--class=hp-os-wifi-sign-in"]
+        onRunningChanged: app.signInOpen = signInBrowser.running
+        onExited: Quickshell.execDetached(["/bin/rm", "-rf", "--", app.signInFolder])
+    }
+    function openSignIn() {
+        if (app.preview) { app.signInOpen = true; mockSignIn.start(); return }
+        if (!signInBrowser.running) signInBrowser.running = true
+    }
+    Timer { id: mockSignIn; interval: 5000; onTriggered: { app.mockSignedIn = true; app.signInOpen = false } }
+    Timer {
+        id: signInWatch; interval: 3000; repeat: true
+        onTriggered: app.ask({ action: "wifi-connectivity" }, answer => {
+            if (answer.connectivity !== "full" || app.step !== 13) return
+            signInWatch.stop()
+            if (signInBrowser.running) signInBrowser.running = false
+            app.online = true
+            app.startUpdate()
+        })
+    }
+    function leaveSignIn(otherNetwork) {
+        signInWatch.stop()
+        if (signInBrowser.running) signInBrowser.running = false
+        if (otherNetwork) { app.chosenNetwork = null; app.step = 6; app.scanWifi() }
+        else app.skipWifi()
+    }
     function startUpdate() {
         app.step = 7
         app.updatePhase = "checking"
@@ -279,8 +329,10 @@ ShellRoot {
             const a = message.action
             if (a === "wifi-list") done({ ok: true, online: false, networks: [
                 { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
-                { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
-            else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
+                { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Café Wi-Fi", signal: 44, secure: false } ] })
+            else if (a === "wifi-join") mockLater.run(() => done(message.ssid === "Café Wi-Fi"
+                ? { ok: true, online: false, connectivity: "portal", signIn: "http://connectivity-check.ubuntu.com/" } : { ok: true, online: true }))
+            else if (a === "wifi-connectivity") done({ ok: true, connectivity: app.mockSignedIn ? "full" : "portal" })
             else if (a === "timezone-list") previewZones.load(done)
             else if (a === "recovery-key") done({ ok: true, key: mockRecovery.key })
             else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
@@ -603,6 +655,7 @@ ShellRoot {
             if (app.step === 7) app.startUpdate()
             if (app.step === 8) app.chooseTimeZone("previewpassword")
             if (app.step === 9) { app.step = 2; app.showRecoveryKey("previewpassword") }
+            if (app.step === 13) { app.chosenNetwork = { ssid: "Café Wi-Fi", secure: false }; app.needSignIn("") }
         }
     }
 
@@ -864,7 +917,7 @@ ShellRoot {
         // ── Who this is becoming: stays on screen through every step ──
         LoginAvatar {
             id: avatar
-            visible: app.step !== 5 && app.step !== 6 && app.step !== 7
+            visible: app.step !== 5 && app.step !== 6 && app.step !== 7 && app.step !== 13
             // Above the glass; it steps aside when a tall screen needs the room.
             readonly property real room: win.topFor(win.cardContent) - win.px(46) - win.px(22)
             opacity: app.appear * (avatar.room - win.px(16) >= avatar.width ? 1 : 0)
@@ -990,6 +1043,31 @@ ShellRoot {
                 text: "Set up without Wi-Fi"
                 onActivated: app.skipWifi()
             }
+        }
+
+        // ── Wi-Fi that wants a web sign-in first ──
+        Page {
+            index: 13
+            Title { text: "Sign in to Wi-Fi" }
+            Subtitle {
+                text: (app.signInNetwork || "This network") + " asks you to sign in or accept its terms on a web page before HP-OS can check for updates."
+            }
+            Gap { size: 18 }
+            Primary {
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: app.signInOpen ? "Sign-in page is open" : "Open sign-in page"
+                ready: !app.signInOpen
+                onActivated: app.openSignIn()
+            }
+            Note {
+                color: Qt.rgba(1, 1, 1, 0.8)
+                text: app.signInOpen ? "It closes by itself once you’re online. Press Ctrl+W to come back."
+                    : "Once you’re signed in, setup carries on by itself."
+            }
+            Gap { size: 4 }
+            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Choose another network"; onActivated: app.leaveSignIn(true) }
+            Gap { size: 4 }
+            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Set up without Wi-Fi"; onActivated: app.leaveSignIn(false) }
         }
 
         // ── Software update (a new device) ──
@@ -1665,6 +1743,7 @@ ShellRoot {
                 else if (app.step === 1) { app.step = 0; nameField.input.forceActiveFocus() }
                 else if (app.step === 2) { app.step = 1; win.contentItem.forceActiveFocus() }
                 else if (app.step === 8 && !app.settingZone) app.leaveTimeZone()
+                else if (app.step === 13) app.leaveSignIn(true)
                 else if (app.step === 9 && app.firstBoot) { app.heldPassword = ""; app.step = 2; passwordField.input.forceActiveFocus() }
                 else if (app.recoveryMode && !app.recoveryBusy) Qt.quit()
                 else if (app.step === 3 && !app.working) app.cancelApproval()

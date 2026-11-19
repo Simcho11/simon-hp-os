@@ -10,7 +10,7 @@ that has never been set up: it makes the device's first account, an administrato
 device is marked as new and has no administrator yet. On such a device it also answers the welcome's Wi-Fi and
 Software Update steps, and the time zone step after the password: {"action": "wifi-list" | "wifi-join" |
 "update-check" | "update-install" | "update-status" | "restart" | "timezone-list" | "timezone-set" |
-"recovery-key"}. The recovery key itself is made and kept by /opt/hp-os/device/hp-os-recovery.
+"recovery-key" | "wifi-connectivity"}. The recovery key itself is made and kept by /opt/hp-os/device/hp-os-recovery.
 """
 import ctypes
 import fcntl
@@ -196,6 +196,34 @@ def online():
     return state == "full"
 
 
+# A network that wants a web sign-in first (hotels, cafés, airports) answers this plain-HTTP address with its own page
+# or a redirect instead of the empty 204.
+PROBE = "http://connectivity-check.ubuntu.com/"
+
+
+def connectivity():
+    """("full" | "portal" | "limited" | "none" | "unknown", the page to open for a sign-in). NetworkManager's own check
+    first, asked to look again now; a direct look at PROBE when it can't tell (a device without its check set up)."""
+    try:
+        state = run(NMCLI, "networking", "connectivity", "check", timeout=25).stdout.strip()
+    except subprocess.SubprocessError:
+        state = "unknown"
+    if state in ("full", "portal") and state:
+        return state, PROBE
+    try:
+        answer = run("/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", "--max-time", "8",
+                     PROBE, timeout=15).stdout.split()
+    except subprocess.SubprocessError:
+        answer = []
+    code = answer[0] if answer else "000"
+    if code == "204":
+        return "full", PROBE
+    if code[:1] in ("2", "3"):
+        page = answer[1] if len(answer) > 1 and re.fullmatch(r"https?://[^\s]{1,2000}", answer[1]) else PROBE
+        return "portal", page
+    return state or "none", PROBE
+
+
 def split_fields(line):
     """nmcli -t separates fields with ':' and escapes ':' and '\\' inside them."""
     fields, current, escaped = [], "", False
@@ -226,7 +254,8 @@ def wifi_list():
         if name not in best or network["signal"] > best[name]["signal"]:
             best[name] = network
     networks = sorted(best.values(), key=lambda network: (not network["connected"], -network["signal"]))[:30]
-    return {"ok": True, "online": online(), "networks": networks}
+    state, page = connectivity() if any(network["connected"] for network in networks) else ("none", PROBE)
+    return {"ok": True, "online": state == "full" or online(), "connectivity": state, "signIn": page, "networks": networks}
 
 
 def keyfile_value(text):
@@ -261,7 +290,8 @@ def wifi_join(request):
             os.unlink(path)
             run(NMCLI, "connection", "reload", timeout=20)
         raise Refused("Couldn’t join %s. Check the password and try again." % ssid)
-    return {"ok": True, "online": online()}
+    state, page = connectivity()
+    return {"ok": True, "online": state == "full", "connectivity": state, "signIn": page}
 
 
 def update_status():
@@ -411,6 +441,9 @@ def welcome_step(request):
     action = request.get("action")
     if action == "recovery-key":
         return recovery_key()
+    if action == "wifi-connectivity":
+        state, page = connectivity()
+        return {"ok": True, "connectivity": state, "signIn": page}
     if action == "timezone-list":
         # A device with nothing that sets its clock (the first Intel laptops) gets it from the internet first, so the
         # times shown beside each place are right.

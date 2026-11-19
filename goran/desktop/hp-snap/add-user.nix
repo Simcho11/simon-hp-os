@@ -28,6 +28,8 @@ pkgs.runCommand "hp-os-add-user" { } ''
   #!/bin/sh
   export HP_OS_ADD_USER_HELPER="$app/accounts.py"
   export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic HP_OS_QRENCODE=${pkgs.qrencode}/bin/qrencode
+  # A Wi-Fi sign-in page during first-time setup opens in the same Chrome every account has.
+  export HP_OS_CHROME=${pkgs.google-chrome}/bin/google-chrome-stable
   case "\$1" in
     hpos-add-user:first-boot) export HP_OS_FIRST_BOOT=1 ;;
     # The login screen's "Forgot your password?": a new password with the recovery key, for that login only.
