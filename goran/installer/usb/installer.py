@@ -1,7 +1,9 @@
 """The HP-OS installer: the whole experience of the USB stick, drawn straight onto the screen."""
 import array
 import fcntl
+import fnmatch
 import glob
+import json
 import mmap
 import os
 from pathlib import Path
@@ -318,6 +320,122 @@ def save_report():
         log("no report:", repr(error))
 
 
+# ── Checking a laptop HP-OS doesn't support yet: a report on the stick, nothing changed on the laptop ──
+PRIVATE_DMI = ("product_serial", "product_uuid", "board_serial", "chassis_serial", "board_asset_tag", "chassis_asset_tag")
+
+
+def read(path, binary=False):
+    try:
+        return Path(path).read_bytes() if binary else Path(path).read_text(errors="replace").strip()
+    except OSError:
+        return b"" if binary else ""
+
+
+def driver_table(system):
+    """Every hardware pattern the installed system has a driver for: {kind: [(pattern, module)]}."""
+    table = {}
+    folder = Path(system) / "usr/lib/modules" / KERNEL
+    for name in ("modules.alias", "modules.builtin.alias"):
+        for line in read(folder / name).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "alias":
+                table.setdefault(re.match(r"[a-z0-9_]*", parts[1]).group(0), []).append((parts[1], parts[2] + (" (built in)" if "builtin" in name else "")))
+    return table
+
+
+def drivers_for(modalias, table):
+    kind = re.match(r"[a-z0-9_]*", modalias).group(0)
+    return sorted({module for pattern, module in table.get(kind, []) if fnmatch.fnmatchcase(modalias, pattern)})
+
+
+def hardware(sysfs="/sys", table=None):
+    """What this laptop is made of, from the firmware and the buses, with the driver HP-OS would use for each part."""
+    sysfs = Path(sysfs)
+    table = table or {}
+    found = {"model": {}, "devices": [], "batteries": [], "input": read("/proc/bus/input/devices"), "backlight": [],
+             "cpu": sorted({line.split(":", 1)[1].strip() for line in read("/proc/cpuinfo").splitlines()
+                            if line.split(":")[0].strip() in ("CPU implementer", "CPU part", "model name")}),
+             "memory": next((line for line in read("/proc/meminfo").splitlines() if line.startswith("MemTotal")), "")}
+    for entry in sorted((sysfs / "class/dmi/id").glob("*")):
+        if entry.is_file() and entry.name not in PRIVATE_DMI and entry.name not in ("modalias", "uevent"):
+            found["model"][entry.name] = read(entry)
+    seen = set()
+    for bus in ("pci", "usb", "acpi", "platform", "i2c", "spi", "serio", "hid", "sdio", "mhi", "auxiliary", "soundwire", "virtio"):
+        for device in sorted((sysfs / "bus" / bus / "devices").glob("*")):
+            alias = read(device / "modalias")
+            if not alias or alias in seen:
+                continue
+            seen.add(alias)
+            item = {"bus": bus, "name": device.name, "modalias": alias, "drivers": drivers_for(alias, table)}
+            bound = device / "driver"
+            if bound.exists():
+                item["bound"] = os.path.basename(os.path.realpath(bound))
+            for extra in ("vendor", "device", "class", "hid", "path", "status", "name", "product", "manufacturer"):
+                value = read(device / extra)
+                if value:
+                    item[extra] = value
+            found["devices"].append(item)
+    for supply in sorted((sysfs / "class/power_supply").glob("*")):
+        found["batteries"].append({name: read(supply / name) for name in ("type", "status", "capacity", "energy_full",
+                                   "energy_full_design", "charge_full", "voltage_now", "model_name", "manufacturer", "technology") if read(supply / name)})
+    for light in sorted((sysfs / "class/backlight").glob("*")):
+        found["backlight"].append({"name": light.name, "type": read(light / "type"), "max": read(light / "max_brightness")})
+    return found
+
+
+# Firmware's own housekeeping entries, which no driver is meant to take.
+HOUSEKEEPING = re.compile(r"^acpi:(LNX|ACPI000|ACPI001|PNP0A|PNP0C0[^9]|PNP0C80|ARML|INT33|HPIC)")
+
+
+def unhandled(found):
+    """Parts with no driver in HP-OS and none already looking after them: what may not work on this laptop."""
+    return [item for item in found["devices"] if not item["drivers"] and "bound" not in item
+            and item["bus"] in ("pci", "usb", "acpi", "i2c", "hid", "platform") and item.get("status", "15") != "0"
+            and not HOUSEKEEPING.match(item["modalias"])]
+
+
+def check_laptop(screen):
+    """Saves what HP-OS needs to know about this laptop on the stick's startup partition. Returns where."""
+    screen.frame("Checking this laptop", ["Looking at its parts. This takes about a minute."], progress=0.1)
+    table = driver_table(SOURCE / "system")
+    screen.frame("Checking this laptop", ["Looking at its parts. This takes about a minute."], progress=0.4)
+    found = hardware(table=table)
+    model = re.sub(r"[^A-Za-z0-9]+", "-", found["model"].get("product_name", "laptop")).strip("-")[:40] or "laptop"
+    name = "%s-%s" % (model, time.strftime("%Y%m%d-%H%M%S"))
+    stick = run("blkid", "-L", "HPOS-BOOT", check=False).strip()
+    if not stick.startswith("/dev/"):
+        raise Stop("The USB stick's startup partition wasn't found, so the check couldn't be saved.")
+    mount = Path("/mnt/report")
+    mount.mkdir(parents=True, exist_ok=True)
+    run("mount", stick, str(mount))
+    try:
+        folder = mount / "hp-os-check" / name
+        (folder / "acpi").mkdir(parents=True, exist_ok=True)
+        Path(folder, "hardware.json").write_text(json.dumps(found, indent=1))
+        missing = unhandled(found)
+        lines = ["HP-OS laptop check", "", "Model: %s" % found["model"].get("product_name", "?"),
+                 "Board: %s" % found["model"].get("board_name", "?"), "BIOS: %s %s" % (found["model"].get("bios_version", "?"),
+                 found["model"].get("bios_date", "")), "CPU: %s" % ", ".join(found["cpu"]), found["memory"], "",
+                 "Batteries and power: %s" % json.dumps(found["batteries"]), "Backlight: %s" % json.dumps(found["backlight"]), "",
+                 "Parts with no HP-OS driver (%d):" % len(missing)]
+        lines += ["  %s %s %s" % (item["bus"], item["modalias"], item.get("hid", "")) for item in missing]
+        Path(folder, "summary.txt").write_text("\n".join(lines) + "\n")
+        screen.frame("Checking this laptop", ["Saving the results on the USB stick..."], progress=0.7)
+        for table_file in sorted(Path("/sys/firmware/acpi/tables").glob("*")):
+            if table_file.is_file():
+                Path(folder, "acpi", table_file.name).write_bytes(read(table_file, binary=True))
+        battery_fix = SOURCE / "system/boot/goran-battery-acpi.cpio"
+        if battery_fix.is_file():
+            shutil.copyfile(battery_fix, folder / "goran-battery-acpi.cpio")
+        LOG.flush()
+        Path(folder, "startup.txt").write_text("=== installer ===\n%s\n=== drivers ===\n%s\n=== kernel ===\n%s\n" % (
+            read("/run/hp-os-install.log"), read("/proc/modules"), run("dmesg", check=False)))
+    finally:
+        run("umount", str(mount), check=False)
+        run("sync", check=False)
+    return name
+
+
 def clean_startup():
     """A new laptop goes straight into HP-OS, with no startup menu, now and after any later system update."""
     for name in ("vmlinuz-" + KERNEL, "initrd.img-" + KERNEL, "goran-battery-acpi.cpio"):
@@ -367,7 +485,18 @@ def main():
         screen.frame("Getting ready", ["Starting the HP-OS installer..."])
         source = wait_for_source()
         if not supported_hardware():
-            raise Stop("This installer is made for the HP OmniBook Ultra. Nothing on this computer was changed.")
+            # Another laptop: HP-OS can look at it and save what it finds, and never installs.
+            screen.frame("Check this laptop", ["HP-OS doesn't support this laptop yet. It can check its parts and save",
+                                               "the results on this USB stick. Nothing on this laptop is changed."],
+                         button="Press Enter to check", quiet="Press Esc to turn off")
+            if keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE, Keys.POWER}) in (Keys.ENTER, Keys.KEYPAD_ENTER):
+                name = check_laptop(screen)
+                screen.frame("Check saved", ["The results are on this USB stick, in hp-os-check/%s." % name,
+                                             "Nothing on this laptop was changed. Plug the stick into your HP-OS laptop to read them."],
+                             button="Press Enter to turn off", quiet="This laptop turns itself off after two minutes.")
+                keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE, Keys.POWER}, 120)
+            turn_off()
+            return
         disk = target_disk(source)
         while low_power():
             screen.frame("Plug in your laptop", ["Connect the charger to continue."])
