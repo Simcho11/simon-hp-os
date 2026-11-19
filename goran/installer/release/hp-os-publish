@@ -2,13 +2,21 @@
 """Publish HP-OS updates from this laptop to every enrolled device.
 
   hp-os-publish setup OWNER/REPO        once: create the private repository and this laptop's signing key
+  hp-os-publish storage                 once: connect the Cloudflare R2 bucket that holds ready-built updates
   hp-os-publish release "What changed"  build the committed code, sign it and send it out
   hp-os-publish bundle FILE             make the file that connects another device (keep it private)
   sudo hp-os-publish image ROOT         build the connection into a laptop image, mounted at ROOT
+  hp-os-publish add-system SYSTEM STORE ROOTS-FILE
+                                        add ready-built parts for another chip (such as x86_64-linux), built on
+                                        STORE, to the newest release
   hp-os-publish status                  show what was last published
 
-Only committed code is published, and only after it has built successfully from a clean copy.
+Only committed code is published, and only after it has built successfully from a clean copy. With storage
+connected, the built parts go up too, so devices download an update instead of building it. Every part is labelled
+with the chip it was built for, so each device only ever downloads its own.
 """
+import concurrent.futures
+import getpass
 import datetime
 import importlib.machinery
 import importlib.util
@@ -33,6 +41,9 @@ HOME = Path(os.environ.get("HP_OS_PUBLISH_HOME", OWNER_HOME / ".config/hp-os-rel
 CONFIG = HOME / "config.json"
 SIGNING_KEY = HOME / "signing_ed25519"
 DEPLOY_KEY = HOME / "deploy_ed25519"
+STORAGE = HOME / "storage.json"
+CACHE_KEY = HOME / "cache-signing.sec"
+PUBLIC_CACHE = "https://cache.nixos.org"
 # A key counts only with its contents: a test may mention the header on its own.
 SECRET = re.compile(rb"BEGIN (?:OPENSSH |RSA |EC |DSA |PGP )?PRIVATE KEY(?: BLOCK)?-----\s+[A-Za-z0-9+/=]{40}|ghp_[A-Za-z0-9]{30}|github_pat_[A-Za-z0-9_]{20}|AKIA[0-9A-Z]{16}")
 # sudo hides personal command folders, so look for GitHub's tool where this account keeps it.
@@ -122,11 +133,219 @@ def scan_for_secrets(folder):
 
 
 def verify_builds(folder):
+    """Builds what devices build, and returns what was built."""
     print("Building a clean copy. This proves every device can build it…", flush=True)
     flake = "path:%s" % folder
-    run("nix", "build", "--no-link", flake + "#hp-os-account-setup", flake + "#hp-os-add-user", flake + "#hp-os-login-theme")
+    built = run("nix", "build", "--no-link", "--print-out-paths", flake + "#hp-os-account-setup",
+                flake + "#hp-os-add-user", flake + "#hp-os-login-theme").split()
     expression = '((builtins.getFlake "%s").lib.hpOsAccount "hp-os-release-check").activationPackage' % flake
-    run("nix", "build", "--no-link", "--impure", "--expr", expression)
+    built += run("nix", "build", "--no-link", "--print-out-paths", "--impure", "--expr", expression).split()
+    return built
+
+
+# ── Ready-built updates ──
+# This laptop uploads to a private Cloudflare R2 bucket. Devices download through a small Cloudflare Worker (the
+# download gateway) that only answers with the download password: Ubuntu's Nix can't sign in to R2 itself.
+GATEWAY = REPO / "goran/installer/release/download-gateway"
+
+
+def storage():
+    return json.loads(STORAGE.read_text()) if STORAGE.is_file() else None
+
+
+def tool(attribute, binary):
+    """A tool from the same Nix packages this checkout pins (Ubuntu's own Nix can't upload to R2)."""
+    built = run("nix", "--extra-experimental-features", "nix-command flakes", "build", "--no-link", "--print-out-paths",
+                "--inputs-from", str(REPO), "nixpkgs#" + attribute)
+    return str(Path(built.split()[-1]) / "bin" / binary)
+
+
+def upload_url(settings):
+    url = "s3://%s?endpoint=%s&region=%s" % (settings["bucket"], settings["endpoint"], settings.get("region", "auto"))
+    if settings.get("scheme"):
+        url += "&scheme=" + settings["scheme"]
+    return url + "&secret-key=%s&compression=zstd" % CACHE_KEY
+
+
+def access(keys):
+    return {"AWS_ACCESS_KEY_ID": keys["id"], "AWS_SECRET_ACCESS_KEY": keys["secret"]}
+
+
+def cache_public_key():
+    return Path(str(CACHE_KEY) + ".pub").read_text().strip()
+
+
+def device_cache(settings):
+    """What devices need: where to download, whose signature to trust, and the download password."""
+    return {"url": settings["downloads"], "publicKey": cache_public_key(), "login": "hp-os", "password": settings["password"]}
+
+
+def make_cache_key():
+    if CACHE_KEY.exists():
+        return
+    secret = run("nix", "--extra-experimental-features", "nix-command", "key", "generate-secret", "--key-name", "hp-os-updates-1")
+    descriptor = os.open(CACHE_KEY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(secret)
+    Path(str(CACHE_KEY) + ".pub").write_text(
+        run("nix", "--extra-experimental-features", "nix-command", "key", "convert-secret-to-public", data=secret) + "\n")
+
+
+def gateway_answers(url, password):
+    """True when the gateway lets in the download password and turns everyone else away."""
+    import base64
+    import urllib.error
+    import urllib.request
+
+    def status(token):
+        request = urllib.request.Request(url.rstrip("/") + "/nix-cache-info", method="HEAD")
+        if token:
+            request.add_header("Authorization", "Basic " + base64.b64encode(("hp-os:" + token).encode()).decode())
+        try:
+            with urllib.request.urlopen(request, timeout=30) as answer:
+                return answer.status
+        except urllib.error.HTTPError as error:
+            return error.code
+        except OSError:
+            return 0
+    return status(password) in (200, 404) and status("") == 401
+
+
+def deploy_gateway(settings):
+    """Puts the download gateway on the Cloudflare account, signed in through the browser by its owner."""
+    wrangler = tool("wrangler", "wrangler")
+    with tempfile.TemporaryDirectory() as folder:
+        shutil.copy(GATEWAY / "worker.js", folder)
+        Path(folder, "wrangler.toml").write_text((GATEWAY / "wrangler.toml.in").read_text().replace("@BUCKET@", settings["bucket"]))
+        if subprocess.run([wrangler, "whoami"], cwd=folder, capture_output=True, text=True).returncode != 0 \
+                or "not authenticated" in subprocess.run([wrangler, "whoami"], cwd=folder, capture_output=True, text=True).stdout.lower():
+            print("\nA browser window opens: sign in to Cloudflare there and allow access, then come back here.", flush=True)
+            if subprocess.run([wrangler, "login"], cwd=folder).returncode != 0:
+                stop("Cloudflare sign-in didn't finish. Nothing was changed on your account.")
+        deployed = subprocess.run([wrangler, "deploy"], cwd=folder, capture_output=True, text=True)
+        if deployed.returncode != 0:
+            stop("the download gateway couldn't be set up: %s" % (deployed.stderr or deployed.stdout).strip()[-400:])
+        found = re.search(r"https://hp-os-updates\.[a-z0-9-]+\.workers\.dev", deployed.stdout + deployed.stderr)
+        if not found:
+            stop("the download gateway was set up, but its address wasn't shown. Run this again.")
+        secret = subprocess.run([wrangler, "secret", "put", "DOWNLOAD_PASSWORD"], cwd=folder, input=settings["password"] + "\n",
+                                capture_output=True, text=True)
+        if secret.returncode != 0:
+            stop("the download password couldn't be saved on Cloudflare: %s" % secret.stderr.strip()[-300:])
+    return found.group(0)
+
+
+def connect_storage():
+    """Asks for the bucket and its key here, so they never pass through anything else."""
+    import secrets
+    HOME.mkdir(parents=True, exist_ok=True)
+    os.chmod(HOME, 0o700)
+    previous = storage() or {}
+    print("Connect HP-OS updates to your Cloudflare R2 bucket. What you type here stays on this laptop.")
+    account = input("Cloudflare account ID: ").strip()
+    bucket = input("Bucket name: ").strip()
+    writer = {"id": input("R2 API token - Access Key ID: ").strip(),
+              "secret": getpass.getpass("R2 API token - Secret Access Key (hidden as you type): ").strip()}
+    if not re.fullmatch(r"[0-9a-f]{32}", account) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
+        stop("that account ID or bucket name doesn't look right. Nothing was saved.")
+    if not writer["id"] or not writer["secret"]:
+        stop("both parts of the R2 API token are needed. Nothing was saved.")
+    settings = {"bucket": bucket, "endpoint": "%s.r2.cloudflarestorage.com" % account, "region": "auto", "writer": writer,
+                "password": previous.get("password") or secrets.token_urlsafe(32)}
+    make_cache_key()
+    check = subprocess.run([tool("nix", "nix"), "--extra-experimental-features", "nix-command", "store", "info",
+                            "--store", upload_url(settings)], capture_output=True, text=True,
+                           env=dict(os.environ, **access(writer)))
+    if check.returncode != 0:
+        stop("that token couldn't reach the bucket: %s" % check.stderr.strip()[-300:])
+    settings["downloads"] = deploy_gateway(settings)
+    descriptor = os.open(STORAGE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(settings, stream, indent=2)
+    if not gateway_answers(settings["downloads"], settings["password"]):
+        print("Saved, but the download gateway isn't answering yet. New gateways can take a minute; publishing checks again.")
+    print("Connected. From the next release on, devices download updates ready-built.")
+
+
+def public_listings(paths):
+    """The public NixOS cache's listing for each part it has (None for parts only this laptop has)."""
+    import urllib.request
+
+    def listing(path):
+        try:
+            with urllib.request.urlopen("%s/%s.narinfo" % (PUBLIC_CACHE, Path(path).name.split("-")[0]), timeout=30) as answer:
+                return answer.read()
+        except Exception:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        return dict(zip(paths, pool.map(listing, paths)))
+
+
+def put_listings(settings, listings):
+    """The bucket only takes a part once everything it depends on is listed there, so the public parts get their
+    public listing (signed by NixOS). Devices still download those parts from the public cache, which they ask first."""
+    with tempfile.TemporaryDirectory() as folder:
+        for path, text in listings.items():
+            Path(folder, Path(path).name.split("-")[0] + ".narinfo").write_bytes(text)
+        # Devices ask the public cache (priority 40) first, and this bucket only for HP-OS's own parts.
+        Path(folder, "nix-cache-info").write_text("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 80\n")
+        scheme = settings.get("scheme", "https")
+        environment = {"RCLONE_S3_PROVIDER": "Cloudflare" if settings.get("region", "auto") == "auto" else "Other",
+                       "RCLONE_S3_ENDPOINT": "%s://%s" % (scheme, settings["endpoint"]),
+                       "RCLONE_S3_REGION": settings.get("region", "auto"),
+                       "RCLONE_S3_ACCESS_KEY_ID": settings["writer"]["id"],
+                       "RCLONE_S3_SECRET_ACCESS_KEY": settings["writer"]["secret"],
+                       "RCLONE_S3_NO_CHECK_BUCKET": "true", "RCLONE_CONFIG": "/dev/null"}
+        run(tool("rclone", "rclone"), "copy", "--quiet", "--checksum", "--transfers", "16", folder,
+            ":s3:" + settings["bucket"], env=environment)
+
+
+def upload_prebuilt(roots, source_store=None):
+    """Signs every part these roots need (for whichever chip they were built) and puts it in the bucket."""
+    settings = storage()
+    if settings.get("downloads") and not gateway_answers(settings["downloads"], settings["password"]):
+        stop("the download gateway isn't letting devices in. Run `hp-os-publish storage` again. Nothing was published.")
+    source = ["--store", source_store] if source_store else []
+    closure = run("nix", "--extra-experimental-features", "nix-command", "path-info", "--recursive", *source,
+                  *roots).split()
+    listings = public_listings(closure)
+    needed = [path for path in closure if listings[path] is None]
+    print("Uploading %d ready-built parts (the other %d come from the public NixOS cache)…" % (
+        len(needed), len(closure) - len(needed)), flush=True)
+    put_listings(settings, {path: text for path, text in listings.items() if text is not None})
+    if needed:
+        source = ["--from", source_store] if source_store else []
+        # Fresh lookups: the listings above were only just added.
+        run(tool("nix", "nix"), "--extra-experimental-features", "nix-command", "--option", "narinfo-cache-negative-ttl", "0",
+            "copy", "--no-recursive", *source,
+            "--to", upload_url(settings), *needed, env=access(settings["writer"]))
+    return len(needed)
+
+
+def system_of(paths, source_store=None):
+    """The chip a set of built parts is for, as Nix names it (aarch64-linux, x86_64-linux)."""
+    source = ["--store", source_store] if source_store else []
+    found = set()
+    for path in paths:
+        deriver = run("nix-store", *source, "--query", "--deriver", path)
+        if deriver.endswith(".drv"):
+            shown = json.loads(run("nix", "--extra-experimental-features", "nix-command", "derivation", "show",
+                                   *source, deriver))
+            shown = shown.get("derivations", shown)
+            found.add(next(iter(shown.values()))["system"])
+    if len(found) != 1:
+        stop("couldn't tell which chip these parts are for: %s" % (", ".join(sorted(found)) or "nothing found"))
+    return found.pop()
+
+
+def sign_and_send(settings, manifest, message):
+    """Signs a release and puts it where devices look for it."""
+    data = release.manifest_bytes(manifest)
+    signature = run("ssh-keygen", "-Y", "sign", "-q", "-f", str(SIGNING_KEY), "-n", release.NAMESPACE, data=data, text=False)
+    blob_manifest = git("hash-object", "-w", "--stdin", data=data, text=False).decode().strip()
+    blob_signature = git("hash-object", "-w", "--stdin", data=signature, text=False).decode().strip()
+    listing = "100644 blob %s\tlatest.json\n100644 blob %s\tlatest.json.sig\n" % (blob_manifest, blob_signature)
+    return commit_tree(git("mktree", data=listing), remote_head(settings, release.CHANNEL), message)
 
 
 def commit_tree(tree, parent, message):
@@ -151,27 +370,47 @@ def publish(notes, skip_build=False):
         stop("commit your changes first. Only committed code is published.")
     commit = git("rev-parse", "HEAD")
     version = next_version(settings)
+    bucket = storage()
+    prebuilt = []
     with tempfile.TemporaryDirectory() as folder:
         snapshot(commit, folder)
         scan_for_secrets(folder)
         digest = release.tree_digest(folder)
         if not skip_build:
-            verify_builds(folder)
+            built = verify_builds(folder)
+            if bucket:
+                upload_prebuilt(built)
+                prebuilt.append(system_of(built))
     tree = git("rev-parse", commit + "^{tree}")
     stable = commit_tree(tree, remote_head(settings, release.STABLE), "HP-OS " + version)
     manifest = {"version": version, "commit": stable, "digest": digest, "notes": notes.strip(),
                 "date": datetime.date.today().isoformat()}
-    data = release.manifest_bytes(manifest)
-    signature = run("ssh-keygen", "-Y", "sign", "-q", "-f", str(SIGNING_KEY), "-n", release.NAMESPACE, data=data, text=False)
-    blob_manifest = git("hash-object", "-w", "--stdin", data=data, text=False).decode().strip()
-    blob_signature = git("hash-object", "-w", "--stdin", data=signature, text=False).decode().strip()
-    listing = "100644 blob %s\tlatest.json\n100644 blob %s\tlatest.json.sig\n" % (blob_manifest, blob_signature)
-    channel = commit_tree(git("mktree", data=listing), remote_head(settings, release.CHANNEL), "HP-OS " + version)
+    if bucket and prebuilt:
+        # Devices whose chip is listed download this release ready-built; others wait until it is added.
+        manifest.update(prebuilt=sorted(prebuilt), cache=device_cache(bucket))
+    channel = sign_and_send(settings, manifest, "HP-OS " + version)
     push_git(settings, "push", "--quiet", remote(settings), "%s:refs/heads/%s" % (stable, release.STABLE),
              "%s:refs/heads/%s" % (channel, release.CHANNEL))
     settings["version"] = version
     CONFIG.write_text(json.dumps(settings, indent=2) + "\n")
     print("Published HP-OS %s. Devices will see it within a day, or right away from Settings." % version)
+
+
+def add_system(system, store, roots_file):
+    """Adds another chip's ready-built parts to the newest release (built from the same commit elsewhere)."""
+    settings, bucket = config(), storage()
+    if not bucket:
+        stop("connect storage first: hp-os-publish storage")
+    manifest = published_release(settings)
+    roots = Path(roots_file).read_text().split()
+    if not roots or system_of(roots, store) != system:
+        stop("those parts aren't built for %s." % system)
+    upload_prebuilt(roots, store)
+    manifest["prebuilt"] = sorted(set(manifest.get("prebuilt", [])) | {system})
+    manifest["cache"] = device_cache(bucket)
+    channel = sign_and_send(settings, manifest, "HP-OS %s for %s" % (manifest["version"], system))
+    push_git(settings, "push", "--quiet", remote(settings), "%s:refs/heads/%s" % (channel, release.CHANNEL))
+    print("HP-OS %s is now ready to download on %s devices." % (manifest["version"], system))
 
 
 def head_is_published():
@@ -321,6 +560,10 @@ def main():
         bundle(arguments[1])
     elif len(arguments) == 2 and arguments[0] == "image":
         build_into_image(arguments[1])
+    elif arguments == ["storage"]:
+        connect_storage()
+    elif len(arguments) == 4 and arguments[0] == "add-system":
+        add_system(arguments[1], arguments[2], arguments[3])
     elif arguments == ["is-published"]:
         sys.exit(0 if head_is_published() else 1)
     elif arguments == ["status"]:

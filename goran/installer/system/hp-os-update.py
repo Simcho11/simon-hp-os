@@ -31,6 +31,10 @@ import hp_os_release as release  # noqa: E402
 UPDATER = "hp-os-updater"
 MINIMUM_FREE_GB = 15
 MINIMUM_BATTERY = 30
+CHIPS = {"aarch64": "aarch64-linux", "arm64": "aarch64-linux", "x86_64": "x86_64-linux", "amd64": "x86_64-linux"}
+NIX_SETTINGS = "etc/nix/nix.conf"
+NETRC = "etc/nix/hp-os-updates.netrc"
+BEGIN, END = "# HP-OS ready-built updates (managed by hp-os-update)", "# end of HP-OS ready-built updates"
 GITHUB_KEY = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
 
 
@@ -142,6 +146,50 @@ class Updater:
         installed = self.installed()
         return not installed or release.version_key(manifest["version"]) > release.version_key(installed)
 
+    # ── Ready-built updates ──
+    def chip(self):
+        return CHIPS.get(os.uname().machine, os.uname().machine)
+
+    def ready_for_this_device(self, manifest):
+        """A release that lists ready-built chips is offered to a device once its own chip is among them."""
+        return "prebuilt" not in manifest or self.chip() in manifest.get("prebuilt", [])
+
+    def use_ready_built(self, manifest):
+        """Lets Nix download this release's parts (signed by the publisher) instead of building them. Returns True when
+        anything changed, so the Nix service picks it up."""
+        cache = manifest.get("cache")
+        if not isinstance(cache, dict) or not all(isinstance(cache.get(key), str) and cache[key]
+                                                  for key in ("url", "publicKey", "login", "password")):
+            return False
+        found = re.fullmatch(r"https://([a-z0-9.-]+)/?", cache["url"])
+        if not found or not re.fullmatch(r"[\w.-]+:[A-Za-z0-9+/=]+", cache["publicKey"]) \
+                or not re.fullmatch(r"[\w-]{1,32}", cache["login"]) or not re.fullmatch(r"[\w-]{20,128}", cache["password"]):
+            return False
+        changed = False
+        netrc = self.root / NETRC
+        wanted = "machine %s login %s password %s\n" % (found.group(1), cache["login"], cache["password"])
+        if not netrc.is_file() or netrc.read_text() != wanted:
+            netrc.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(netrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(wanted)
+            os.chmod(netrc, 0o600)
+            changed = True
+        settings = self.root / NIX_SETTINGS
+        current = settings.read_text() if settings.is_file() else ""
+        kept = re.sub(r"\n?%s\n.*?%s\n?" % (re.escape(BEGIN), re.escape(END)), "\n", current, flags=re.S).rstrip("\n")
+        block = "%s\nextra-substituters = %s\nextra-trusted-public-keys = %s\nnetrc-file = /%s\n%s\n" % (
+            BEGIN, cache["url"].rstrip("/"), cache["publicKey"], NETRC, END)
+        wanted_settings = (kept + "\n\n" if kept else "") + block
+        if current != wanted_settings:
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(wanted_settings)
+            changed = True
+        return changed
+
+    def restart_nix(self):
+        subprocess.run(["/usr/bin/systemctl", "try-restart", "nix-daemon.service"], check=False)
+
     def unpack(self, manifest):
         """The signed files, and only those, in their own folder."""
         target = self.versions / manifest["version"]
@@ -242,7 +290,7 @@ class Updater:
             message = str(error) if isinstance(error, Stop) else "Couldn’t reach the update server."
             return self.save(lastChecked=int(time.time()), checkError=message)
         offer = {key: manifest.get(key, "") for key in ("version", "notes", "date")}
-        if not self.newer(manifest):
+        if not self.newer(manifest) or not self.ready_for_this_device(manifest):
             state = self.status().get("state")
             return self.save(state="restart" if state == "restart" else "idle", available=None, lastChecked=int(time.time()),
                              checkError="")
@@ -257,9 +305,11 @@ class Updater:
             self.ready_to_install()
             self.fetch()
             manifest = self.latest()
-            if not self.newer(manifest):
+            if not self.newer(manifest) or not self.ready_for_this_device(manifest):
                 return self.save(state="idle", available=None, progress=0, message="")
             source = self.unpack(manifest)
+            if self.use_ready_built(manifest):
+                self.restart_nix()
             self.save(state="downloading", progress=20, message="Preparing the update. This can take a while…")
             self.build(source)
         except (Stop, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
