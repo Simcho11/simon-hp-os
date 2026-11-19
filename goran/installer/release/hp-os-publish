@@ -26,7 +26,8 @@ HOME = Path(os.environ.get("HP_OS_PUBLISH_HOME", Path.home() / ".config/hp-os-re
 CONFIG = HOME / "config.json"
 SIGNING_KEY = HOME / "signing_ed25519"
 DEPLOY_KEY = HOME / "deploy_ed25519"
-SECRET = re.compile(rb"BEGIN (OPENSSH|RSA|EC|DSA|PGP) PRIVATE KEY|ghp_[A-Za-z0-9]{30}|github_pat_[A-Za-z0-9_]{20}|AKIA[0-9A-Z]{16}")
+# A key counts only with its contents: a test may mention the header on its own.
+SECRET = re.compile(rb"BEGIN (?:OPENSSH |RSA |EC |DSA |PGP )?PRIVATE KEY(?: BLOCK)?-----\s+[A-Za-z0-9+/=]{40}|ghp_[A-Za-z0-9]{30}|github_pat_[A-Za-z0-9_]{20}|AKIA[0-9A-Z]{16}")
 IDENTITY = {"GIT_AUTHOR_NAME": "HP-OS Release", "GIT_AUTHOR_EMAIL": "release@hp-os.invalid",
             "GIT_COMMITTER_NAME": "HP-OS Release", "GIT_COMMITTER_EMAIL": "release@hp-os.invalid"}
 
