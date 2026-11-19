@@ -86,7 +86,8 @@ say "3 of 7: Copying HP-OS (this takes a while)"
 "$tools/rsync" -aHAXx --numeric-ids --info=progress2 --no-inc-recursive \
     --exclude=/nix/\* --exclude=/home/\* --exclude=/root/\* --exclude=/tmp/\* --exclude=/var/tmp/\* --exclude=/var/log/\* \
     --exclude=/swap.img --exclude=/lost+found --exclude=/var/cache/apt/\* --exclude=/var/lib/snapd/cache/\* \
-    --exclude=/var/lib/waydroid --exclude=/media/\* --exclude=/mnt/\* --exclude=/boot/efi/\* / "$system/"
+    --exclude=/var/lib/waydroid --exclude=/var/lib/snapd/\* --exclude=/var/snap/\* --exclude=/var/lib/flatpak/\* \
+    --exclude=/media/\* --exclude=/mnt/\* --exclude=/boot/efi/\* / "$system/"
 mkdir -p "$system/boot/efi/EFI"
 cp -r /boot/efi/EFI/ubuntu /boot/efi/EFI/Boot "$system/boot/efi/EFI/"
 [[ ! -d /boot/efi/EFI/HP ]] || cp -r /boot/efi/EFI/HP "$system/boot/efi/EFI/"
@@ -135,7 +136,7 @@ done
 say "6 of 7: Connecting updates and checking the result"
 "$repo/goran/installer/release/hp-os-publish" image "$system"
 flake=$(sed -n 's/^ *export HP_OS_PROFILE_FLAKE=//p' "$(readlink -f /nix/var/nix/profiles/hp-os-accounts)/bin/hp-os-account-setup")
-offline=$(HOME=$work XDG_CACHE_HOME=$work/cache nix --extra-experimental-features 'nix-command flakes' build --offline --dry-run \
+offline=$(HOME=$work XDG_CACHE_HOME=$work/cache unshare --net nix --extra-experimental-features 'nix-command flakes' build --offline --dry-run \
     --store "local?root=$system" --impure --expr "((builtins.getFlake \"$flake\").lib.hpOsAccount \"hposnewperson\").activationPackage" 2>&1) \
     || { echo "$offline" | tail -20; stop "a new account couldn't be set up without internet."; }
 ! grep -q 'will be fetched\|will be downloaded' <<<"$offline" || { echo "$offline" | tail -20; stop "some apps are missing from the installer."; }

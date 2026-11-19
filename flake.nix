@@ -35,15 +35,14 @@
         modules = [
           ./fleet/home.nix
           (import ./goran/installer/hp-os-user.nix name)
+          ./goran/desktop/hp-os-essentials.nix
           ./goran/desktop/microsoft365-standard.nix
-          ./goran/desktop/cosmic-niri.nix
           ./goran/desktop/hp-os.nix
           ./goran/desktop/niri.nix
           ./goran/desktop/launchers.nix
           ./goran/desktop/dms.nix
           ./goran/desktop/power.nix
           ./goran/desktop/hp-os-theme.nix
-          ./goran/desktop/apps.nix
         ];
       };
     in nixpkgs.lib.recursiveUpdate {

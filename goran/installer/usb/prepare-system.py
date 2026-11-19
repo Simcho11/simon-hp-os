@@ -4,7 +4,6 @@
   prepare-system.py STAGING   clean the copy at STAGING, then check that nothing personal is left
 """
 import glob
-import json
 import os
 from pathlib import Path
 import re
@@ -23,7 +22,27 @@ etc/hp-os/update etc/passwd- etc/shadow- etc/group- etc/gshadow- etc/subuid- etc
 etc/sudoers.d/simon-packages etc/sudoers.d/hpos-panel-brightness
 usr/local/bin/n1x-simon-* usr/local/bin/pi-apps etc/ssh/ssh_host_*
 usr/share/sddm/faces/[!r.]*.face.icon opt/hp-os/niri-patch/session-hpos/*.bak-*
+etc/cloud/cloud.cfg.d/*installer* etc/cloud/cloud.cfg.d/*subiquity* var/lib/cloud/* var/log/installer
+etc/netplan/90-NM-* etc/wpa_supplicant/*.conf var/lib/dhcp/* var/lib/iwd/*
+var/backups/* var/lib/sudo/* var/lib/apport/* var/lib/ubuntu-advantage/private/* var/lib/polkit-1/localauthority/*
+etc/cups/printers.conf* etc/cups/subscriptions.conf* etc/cups/ppd/* var/spool/cups/* var/cache/cups/*
+var/lib/gdm3/* var/lib/geoclue/* var/lib/sunshine var/lib/fwupd/pending.db
+etc/ssl/private/ssl-cert-snakeoil.key etc/ssl/certs/ssl-cert-snakeoil.pem
 """.split()
+# Apps that came with this laptop's setup. A new HP-OS laptop starts with the Microsoft 365 web apps only.
+REMOVED_APPS = """
+chatgpt claude-desktop waydroid pi-apps-ddbdb5a4 prismlauncher scrcpy transmission-gtk remmina rhythmbox shotwell
+libreoffice-calc libreoffice-draw libreoffice-impress libreoffice-math libreoffice-writer libreoffice-core libreoffice-common
+thunderbird-locale-en thunderbird-locale-en-gb thunderbird-locale-en-us
+""".split()
+NO_LONGER_USED = """
+var/lib/snapd var/snap snap/* var/lib/flatpak etc/flatpak
+etc/systemd/system/snap* etc/systemd/system/*.wants/snap* etc/systemd/system/*.wants/waydroid*
+etc/apt/sources.list.d/chatgpt* etc/apt/sources.list.d/claude-desktop* etc/apt/sources.list.d/waydroid*
+""".split()
+SNAP_SERVICES = ("snapd.service", "snapd.socket", "snapd.seeded.service", "snapd.apparmor.service",
+                 "snapd.autoimport.service", "snapd.core-fixup.service", "snapd.recovery-chooser-trigger.service",
+                 "snapd.snap-repair.timer", "snapd.system-shutdown.service", "snapd.mounts.target", "snapd.mounts-pre.target")
 LOOKED_AT = ("etc", "opt", "usr/local", "usr/share/sddm", "usr/share/applications", "var/lib/hp-os", "var/lib/AccountsService",
              "var/lib/sddm", "boot/grub")
 PERSONAL = re.compile(rb"/home/simon\b|simon3chong|simon-daytona|\bsimon-chong\b")
@@ -79,16 +98,50 @@ def set_identity(root):
     edit(root / "etc/nix/nix.conf", lambda text: re.sub(r"(?<=[ =])(simon-chong|simon)(?= |$)", "", text, flags=re.M))
 
 
-def clean_snaps(root):
-    """Snap's own record of who was signed in on this laptop."""
-    state = root / "var/lib/snapd/state.json"
-    if not state.is_file():
-        return
-    document = json.loads(state.read_text())
-    data = document.get("data", {})
-    for key in ("auth", "device"):
-        data.pop(key, None)
-    edit(state, lambda _: json.dumps(document))
+def app_files(root):
+    """The removed apps' own files. Anything another installed package also uses is left alone."""
+    wanted, kept = set(), set()
+    for listing in glob.glob(str(root / "var/lib/dpkg/info/*.list")):
+        package = os.path.basename(listing)[:-5].split(":")[0]
+        entries = {line.strip().lstrip("/") for line in Path(listing).read_text(errors="replace").splitlines()}
+        (wanted if package in REMOVED_APPS else kept).update(entries)
+    return sorted(entry for entry in wanted - kept if entry)
+
+
+def remove_apps(root):
+    """Takes the apps' own files out. The system's shared parts stay exactly as they are."""
+    entries = app_files(root)
+    for entry in entries:
+        path = root / entry
+        if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
+            os.unlink(path)
+    for entry in sorted(entries, key=len, reverse=True):
+        path = root / entry
+        if path.is_dir() and not path.is_symlink():
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+    for pattern in NO_LONGER_USED:
+        for path in glob.glob(str(root / pattern)):
+            remove(path)
+    (root / "snap").mkdir(exist_ok=True)
+    for service in SNAP_SERVICES:
+        link = root / "etc/systemd/system" / service
+        link.parent.mkdir(parents=True, exist_ok=True)
+        remove(link)
+        os.symlink("/dev/null", link)
+
+
+def hide_system_apps(root):
+    """Parts of the operating system stay available to it, but never appear as apps."""
+    shown = root / "usr/local/share/applications"
+    shown.mkdir(parents=True, exist_ok=True)
+    for entry in glob.glob(str(root / "usr/share/applications/*.desktop")):
+        name = os.path.basename(entry)
+        if name.startswith("hpos-") or "NoDisplay=true" in Path(entry).read_text(errors="replace"):
+            continue
+        (shown / name).write_text("[Desktop Entry]\nType=Application\nName=%s\nNoDisplay=true\nHidden=true\n" % name[:-8])
 
 
 def personal_files(root):
@@ -115,7 +168,8 @@ def prepare(root):
         for path in glob.glob(str(root / pattern)):
             remove(path)
     set_identity(root)
-    clean_snaps(root)
+    remove_apps(root)
+    hide_system_apps(root)
     (root / "etc/hp-os").mkdir(parents=True, exist_ok=True)
     (root / "etc/hp-os/standard-device").write_text("Made with the HP-OS USB installer.\n")
     for folder in ("home", "root", "tmp", "var/tmp", "var/log"):

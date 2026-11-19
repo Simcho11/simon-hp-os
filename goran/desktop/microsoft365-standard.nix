@@ -38,16 +38,42 @@ let
     };
   };
   file = app: "${entry app}/share/applications/microsoft365-${app.id}.desktop";
+  # Opens web links. It is the engine behind the web apps, so it isn't listed as an app of its own.
+  web = pkgs.makeDesktopItem {
+    name = "hp-os-web";
+    desktopName = "Web";
+    exec = ''"${launcher}" %U'';
+    noDisplay = true;
+    mimeTypes = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
+  };
+  # Everything else that arrives with the desktop's own parts stays out of the app list.
+  shown = [ "org.kde.dolphin" "hp-os-settings" "hp-os-trash" ];
+  hidden = pkgs.runCommand "hp-os-hidden-apps" { } ''
+    mkdir -p "$out"
+    for file in ${config.home.path}/share/applications/*.desktop; do
+      name=$(basename "$file")
+      case " ${lib.concatStringsSep " " shown} " in *" ''${name%.desktop} "*) continue ;; esac
+      case "$name" in microsoft365-*|hp-os-web.desktop) continue ;; esac
+      printf '[Desktop Entry]\nType=Application\nName=%s\nNoDisplay=true\nHidden=true\n' "''${name%.desktop}" > "$out/$name"
+    done
+  '';
 in {
-  home.packages = [ pkgs.google-chrome ];
   home.file = {
     ".local/bin/chrome-live-control".source = chrome;
   } // builtins.listToAttrs (map (app: {
     name = "${desktopDir}/Microsoft 365/${folder.${app.id}}.desktop";
     value = { source = file app; executable = true; };
   }) (builtins.filter (app: folder ? ${app.id}) catalogue));
-  xdg.dataFile = builtins.listToAttrs (map (app: {
+  xdg.dataFile = {
+    "applications/hp-os-web.desktop".source = "${web}/share/applications/hp-os-web.desktop";
+  } // builtins.listToAttrs (map (app: {
     name = "applications/microsoft365-${app.id}.desktop";
     value.source = file app;
   }) catalogue);
+  home.activation.hpOsHiddenApps = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+    run mkdir -p ${lib.escapeShellArg "${config.xdg.dataHome}/applications"}
+    for file in ${hidden}/*.desktop; do
+      run ln -sf "$file" ${lib.escapeShellArg "${config.xdg.dataHome}/applications"}/
+    done
+  '';
 }
