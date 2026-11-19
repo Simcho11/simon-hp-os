@@ -377,7 +377,7 @@ index f31593f..85dfd54 100644
          id: devices
          command: ["grep", "-i", "^N: Name=", "/proc/bus/input/devices"]
 diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
-index 1c9dd35..286ae40 100644
+index 1c9dd35..1779861 100644
 --- a/modules/iris/settings/IrisOptions.qml
 +++ b/modules/iris/settings/IrisOptions.qml
 @@ -889,7 +889,7 @@ QtObject {
@@ -389,7 +389,17 @@ index 1c9dd35..286ae40 100644
          { section: "general", group: "Settings window", label: "Opens as", description: "Over the desktop previews every change on the screen behind it. A window sits with your apps: Niri sizes, maximizes and moves it like any other.", path: "iris.appearance.settingsHost", kind: "choice", fallback: "overlay", choices: [{ label: "Over the desktop", value: "overlay", glyph: "layers" }, { label: "Window", value: "window", glyph: "web_asset" }], keywords: ["settings", "window", "overlay", "floating", "tile", "maximize"] },
          { section: "general", group: "Settings window", label: "Show every setting", description: "Off keeps Settings to the areas most people need. Search still finds everything.", path: "settingsUi.easyMode", invert: true, kind: "switch", fallback: true, keywords: ["simple", "easy", "advanced", "all settings", "sections"] },
          { section: "general", group: "Settings window", label: "Layout", description: "Sidebar lists every area beside the page. Rail keeps only their marks, for more room. Home opens on every area at once; each opens full width.", path: "iris.appearance.settingsLayout", kind: "choice", fallback: "sidebar", choices: [{ label: "Sidebar", value: "sidebar", glyph: "view_sidebar" }, { label: "Rail", value: "rail", glyph: "view_week" }, { label: "Home", value: "home", glyph: "grid_view" }], keywords: ["settings", "navigation", "sidebar", "rail", "grid", "home", "layout"] },
-@@ -1095,8 +1095,8 @@ QtObject {
+@@ -901,9 +901,6 @@ QtObject {
+         { section: "general", group: "Power", label: "Factory reset", description: "Erase every account and its files, and start this device again as new. Needs an administrator.", kind: "action", button: "Reset…", keywords: ["erase", "wipe", "reset"], run: () => Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-factory-reset"]) },
+         { section: "general", group: "HP-OS", label: "Weather provider", description: "Open-Meteo receives manually configured coordinates. Set latitude and longitude in weather settings, then enable weather. Automatic geolocation is disabled for HP-OS.", path: "hpos.weatherProvider", kind: "choice", fallback: "disabled", showIf: () => Config.options.panelFamily === "hpos", choices: [{label:"Disabled",value:"disabled"},{label:"Open-Meteo",value:"open-meteo"}] },
+         { section: "general", group: "HP-OS", label: "HP-OS preferences", description: "Typography, materials, accessibility and component gallery.", kind: "action", button: "Open", showIf: () => Config.options.panelFamily === "hpos", run: () => Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "hpos", "settings"]) },
+-        { section: "general", group: "Shell family", label: "Family", description: "The whole shell's look. Each family keeps its own settings, so you can come back.", path: "panelFamily", kind: "choice", fallback: "iris", choices: [{label:"HP-OS",value:"hpos",glyph:"desktop_windows"},{label:"iRiS",value:"iris",glyph:"visibility"},{label:"Material",value:"ii",glyph:"dashboard"},{label:"Windows 11",value:"waffle",glyph:"window"}], keywords: ["family", "material", "waffle", "windows", "ii", "switch", "familia"] },
+-        { section: "general", group: "Shell family", label: "Switch shortcut goes through", description: "The families the switch keybind steps through, in the order you turn them on.", path: "familyCycle", kind: "pieces", fallback: ["ii", "waffle", "iris"], choices: [{label:"iRiS",value:"iris"},{label:"Material",value:"ii"},{label:"Windows 11",value:"waffle"}], keywords: ["family", "cycle", "shortcut", "keybind", "switch"] },
+-        { section: "general", group: "Shell family", label: "Animated switch", description: "A short transition while the families swap, instead of a cut.", path: "familyTransitionAnimation", kind: "switch", fallback: true, keywords: ["family", "transition", "animation"] },
+ 
+         { section: "spotlight", group: "Web search", label: "Search the web with", description: "What ? and Search the web use in Spotlight.", path: "search.engineBaseUrl", kind: "choice", fallback: "https://www.google.com/search?q=",
+             choices: [{label:"Google",value:"https://www.google.com/search?q="},{label:"DuckDuckGo",value:"https://duckduckgo.com/?q="},{label:"Brave",value:"https://search.brave.com/search?q="},{label:"Bing",value:"https://www.bing.com/search?q="},{label:"Startpage",value:"https://www.startpage.com/do/search?q="}],
+@@ -1095,8 +1092,8 @@ QtObject {
              keywords: ["typing", "trackpad", "touchpad", "instant"]
          },
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.click-method", label: "Right click", kind: "choice", fallback: "button-areas", choices: [{label:"Bottom corner",value:"button-areas"},{label:"Two fingers",value:"clickfinger"}] },
@@ -400,6 +410,21 @@ index 1c9dd35..286ae40 100644
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.disabled-on-external-mouse", label: "Off while a mouse is plugged in", kind: "switch", fallback: false },
  
          { section: "keyboard", group: "Pointer", niri: "input", key: "cursor.xcursor-theme", read: "cursor.theme", label: "Cursor", kind: "choice", choicesFrom: "cursors", fallback: "", keywords: ["cursor", "theme", "pointer"] },
+diff --git a/modules/iris/settings/IrisSearch.qml b/modules/iris/settings/IrisSearch.qml
+index 4810e60..d26c84f 100644
+--- a/modules/iris/settings/IrisSearch.qml
++++ b/modules/iris/settings/IrisSearch.qml
+@@ -20,7 +20,9 @@ Singleton {
+ 
+     // Actions that only mean something in another family.
+     readonly property var otherFamilyActions: ["toggle-bar-autohide", "toggle-dock", "toggle-dashboard", "toggle-media-controls",
+-        "wallpaper-coverflow", "open-sidebar-left", "open-sidebar-right", "switch-family-iris"]
++        "wallpaper-coverflow", "open-sidebar-left", "open-sidebar-right", "switch-family-iris",
++        // hp-snap: HP-OS is its own family; switching away from it isn't offered.
++        "switch-family-ii", "switch-family-waffle"]
+     readonly property var categoryAreas: ({ system: "System", tools: "Tools", media: "Media", appearance: "Appearance", settings: "General", setup: "System" })
+     readonly property var aliases: ({
+         bt: ["bluetooth"], wifi: ["wi-fi", "wireless", "network"], wlan: ["wi-fi", "network"], dnd: ["disturb", "silent"],
 diff --git a/modules/settings/AccountsConfig.qml b/modules/settings/AccountsConfig.qml
 index 5e20c7c..582e9ca 100644
 --- a/modules/settings/AccountsConfig.qml
@@ -438,7 +463,7 @@ index 5e20c7c..582e9ca 100644
      }
  }
 diff --git a/modules/settings/WelcomeConfig.qml b/modules/settings/WelcomeConfig.qml
-index 4820162..8127ba0 100644
+index 4820162..1f0c98b 100644
 --- a/modules/settings/WelcomeConfig.qml
 +++ b/modules/settings/WelcomeConfig.qml
 @@ -1,12 +1,17 @@
@@ -459,7 +484,7 @@ index 4820162..8127ba0 100644
  Flickable {
      // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
      PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
-@@ -15,33 +20,138 @@ Flickable {
+@@ -15,33 +20,145 @@ Flickable {
      id: root
      contentHeight: content.implicitHeight + 64
      clip: true
@@ -604,6 +629,13 @@ index 4820162..8127ba0 100644
 +                text: Translation.tr("Start using HP-OS")
 +                emphasized: true
 +                onClicked: GlobalStates.settingsOverlayOpen = false
++            }
++            IrisButton {
++                text: Translation.tr("Show the welcome again")
++                onClicked: {
++                    GlobalStates.settingsOverlayOpen = false
++                    Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-welcome"])
++                }
 +            }
 +            IrisButton {
 +                text: Translation.tr("Check for updates")
@@ -898,6 +930,19 @@ index 0000000..3d3148b
 +    if sys.argv[1] == "keep":
 +        sys.exit(keep(sys.argv[2]))
 +    sys.exit(main(sys.argv[1], sys.argv[2]))
+diff --git a/scripts/welcome-user.sh b/scripts/welcome-user.sh
+index 2ea083b..c48010f 100644
+--- a/scripts/welcome-user.sh
++++ b/scripts/welcome-user.sh
+@@ -1,4 +1,8 @@
+ #!/bin/sh
++# hp-snap: the HP-OS welcome on the desktop (a glass window with the User Guide); Settings › Welcome where it isn't
++# installed yet.
++welcome=/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-welcome
++if [ -x "$welcome" ]; then exec "$welcome"; fi
+ set -eu
+ qs ipc -p "$1" call settings open
+ qs ipc -p "$1" call settingsNav page 30
 diff --git a/services/AppCatalog.qml b/services/AppCatalog.qml
 index 96694c8..ae753d8 100644
 --- a/services/AppCatalog.qml
@@ -993,3 +1038,17 @@ index 5b7f130..372776c 100644
          return configured
      }
  
+diff --git a/shell.qml b/shell.qml
+index 3180bd7..3a24ed4 100644
+--- a/shell.qml
++++ b/shell.qml
+@@ -1053,6 +1053,9 @@ ShellRoot {
+ 
+     function cyclePanelFamily() {
+         const currentFamily = Config.options?.panelFamily ?? "ii"
++        // hp-snap: HP-OS stays HP-OS. Its Settings has no way back from another family, so the switch shortcut
++        // (Super+Shift+W) does nothing here.
++        if (currentFamily === "hpos") return
+         const wanted = Array.from(Config.options?.familyCycle ?? families)
+         const order = wanted.filter((family, index) => families.includes(family) && wanted.indexOf(family) === index)
+         if (order.length === 0) return

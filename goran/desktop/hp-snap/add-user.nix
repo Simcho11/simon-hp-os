@@ -61,6 +61,19 @@ pkgs.runCommand "hp-os-add-user" { } ''
   sed -i 's/^  //' "$out/bin/hp-os-recovery-key"
   chmod +x "$out/bin/hp-os-recovery-key"
 
+  # The welcome on a person's desktop at their first sign-in (scripts/welcome-user.sh), and from Settings › Welcome.
+  mkdir -p "$app/welcome"
+  cp ${./add-user/welcome.qml} "$app/welcome/shell.qml"
+  cp ${./login-theme/GlassShape.qml} "$app/welcome/GlassShape.qml"
+  cp ${./login-theme/LiquidLens.qsb} "$app/welcome/LiquidLens.qsb"
+  cat > "$out/bin/hp-os-welcome" <<EOF
+  #!/bin/sh
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
+  exec ${quickshell}/bin/quickshell -n -p "$app/welcome/shell.qml"
+  EOF
+  sed -i 's/^  //' "$out/bin/hp-os-welcome"
+  chmod +x "$out/bin/hp-os-welcome"
+
   # Settings > General > Software Update.
   cat > "$out/bin/hp-os-software-update" <<EOF
   #!/bin/sh
