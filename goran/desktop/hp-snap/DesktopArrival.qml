@@ -73,7 +73,8 @@ ShellRoot {
                         sourceSize.height: height
                         onStatusChanged: if (status === Image.Ready || status === Image.Error) cover.risen = true
                     }
-                    Rectangle { anchors.fill: parent; color: "#550e1b31" }
+                    // A plain dim, like the login screen and setup: no colour of its own.
+                    Rectangle { anchors.fill: parent; color: Qt.rgba(0, 0, 0, 0.33) }
                     // Only the moving light normally; words appear only if startup takes unusually long.
                     Text {
                         visible: arrival.slow
@@ -86,6 +87,7 @@ ShellRoot {
                 // Lit from the first frame, in the place the password was on the login screen.
                 LoginActivity {
                     id: light
+                    ink: "white"
                     anchors.horizontalCenter: parent.horizontalCenter
                     y: Math.round(parent.height * arrival.lightPlace - height / 2)
                     width: Math.round(parent.height * 150 / 1080)
