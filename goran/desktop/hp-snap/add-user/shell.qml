@@ -931,7 +931,8 @@ ShellRoot {
                 failed: app.wifiNotice.length > 0
                 onAccepted: app.joinWifi(wifiPassword.text)
             }
-            Note { color: app.wifiNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8); text: app.joining ? "Joining…" : app.wifiNotice || " " }
+            // A network with a password says "Joining…" on its Join button; an open one has no button, so it says it here.
+            Note { color: app.wifiNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8); text: app.joining ? (app.chosenNetwork && app.chosenNetwork.secure ? " " : "Joining…") : app.wifiNotice || " " }
             Primary {
                 visible: !!app.chosenNetwork && app.chosenNetwork.secure
                 anchors.horizontalCenter: parent.horizontalCenter
