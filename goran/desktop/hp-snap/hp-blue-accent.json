@@ -1,0 +1,9 @@
+{
+  "iris": {
+    "appearance": {
+      "accent": "hex",
+      "accentHex": "#0096d6",
+      "oneAccent": true
+    }
+  }
+}

@@ -204,6 +204,14 @@ in {
         ${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"} \
         ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-window-space-v1"}
     '';
+    # HP blue is the system accent, once per account, for accounts still on the stock accent (one someone chose stays).
+    home.activation.hpSnapHpBlue = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
+      config=${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"}
+      if [ -f "$config" ] && ${pkgs.python3}/bin/python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("iris",{}).get("appearance",{}); sys.exit(0 if a.get("accent","blue") in ("blue","") else 1)' "$config"; then
+        run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./hp-blue-accent.json} "$config" \
+          ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-hp-blue-v1"}
+      fi
+    '';
     # The plate marking where a dragged icon will land starts off, once per account (Settings > Desktop turns it on).
     home.activation.hpSnapDropSlotOff = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
       run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./drop-slot-off.json} \

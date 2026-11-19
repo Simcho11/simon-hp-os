@@ -73,6 +73,8 @@ PYWRAP
         ${./hp-snap/glass-and-tray.json} "$out/share/hp-os/packaging/default-config.json"
       ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} \
         ${./hp-snap/window-space.json} "$out/share/hp-os/packaging/default-config.json"
+      ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} \
+        ${./hp-snap/hp-blue-accent.json} "$out/share/hp-os/packaging/default-config.json"
       ${pkgs.python3}/bin/python3 ${./hp-snap/glass-niri.py} "$out/share/hp-os/packaging/niri.kdl"
       ${pkgs.python3}/bin/python3 ${./hp-snap/window-style.py} "$out/share/hp-os/packaging/niri.kdl"
       mkdir -p "$out/share/hp-os/arrival"
