@@ -21,26 +21,19 @@ Item {
     scale: area.pressed ? 0.95 : area.containsMouse ? 1.04 : 1
     Behavior on scale { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
-    // HP-OS liquid glass: a frosted pill at rest (a hairline rim and a top sheen), brighter on hover.
+    // HP-OS liquid glass (GlassShape), brighter on hover and when pressed.
     property bool glass: true
-    Rectangle {
+    property string glassLook: String(config.irisGlassLook || "clear")
+    GlassShape {
         visible: action.glass
         anchors.fill: parent
-        radius: height / 2
-        color: Qt.rgba(1, 1, 1, 0.10)
-        border.width: 1
-        border.color: Qt.rgba(1, 1, 1, 0.22)
-        Rectangle {
-            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
-            height: parent.height / 2
-            radius: parent.radius
-            gradient: Gradient {
-                GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.16) }
-                GradientStop { position: 1; color: Qt.rgba(1, 1, 1, 0) }
-            }
-        }
+        d: action.d
+        look: action.glassLook
+        lit: area.containsMouse
+        pressed: area.pressed
     }
     Rectangle {
+        visible: !action.glass
         anchors.fill: parent
         radius: height / 2
         color: action.hover

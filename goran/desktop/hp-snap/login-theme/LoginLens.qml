@@ -183,32 +183,45 @@ LoginSurface {
         ink: root.ink
     }
 
-    Rectangle { anchors.fill: parent; color: root.core.surface }
-    Image {
-        id: picture
+    // Everything behind the sign-in: the glass bends it (glassBackdrop, GlassShape).
+    Item {
+        id: backdropLayer
         anchors.fill: parent
-        source: root.core.picture
-        fillMode: Image.PreserveAspectCrop
-        sourceSize: Qt.size(root.width, root.height)
-        asynchronous: true
-        cache: false
+        Rectangle { anchors.fill: parent; color: root.core.surface }
+        Image {
+            id: picture
+            anchors.fill: parent
+            source: root.core.picture
+            fillMode: Image.PreserveAspectCrop
+            sourceSize: Qt.size(root.width, root.height)
+            asynchronous: true
+            cache: false
+            visible: false
+        }
+        // Out of focus and dimmed, a little richer than the picture so it never reads grey; signing in brings it back.
+        MultiEffect {
+            anchors.fill: parent
+            source: picture
+            scale: 1.08 - 0.08 * root.release
+            blurEnabled: true
+            blur: 1
+            blurMax: Math.round(56 * (1 - root.release))
+            saturation: 0.12 * (1 - root.release)
+            brightness: -0.04 * (1 - root.release)
+            opacity: Math.min(1, root.entrance * 2)
+        }
+        // HP-OS: the veil takes the scene's tint (irisVeilDay/Night): HP navy by day, so a bright picture
+        // reads blue rather than grey, black at night.
+        Rectangle { anchors.fill: parent; color: Qt.rgba(root.core.veil.r, root.core.veil.g, root.core.veil.b, (0.36 + root.core.lift) * (1 - root.release)) }
+    }
+    ShaderEffectSource {
+        id: backdropTexture
+        anchors.fill: parent
+        sourceItem: backdropLayer
+        live: true
         visible: false
     }
-    // Out of focus and dimmed, a little richer than the picture so it never reads grey; signing in brings it back.
-    MultiEffect {
-        anchors.fill: parent
-        source: picture
-        scale: 1.08 - 0.08 * root.release
-        blurEnabled: true
-        blur: 1
-        blurMax: Math.round(56 * (1 - root.release))
-        saturation: 0.12 * (1 - root.release)
-        brightness: -0.04 * (1 - root.release)
-        opacity: Math.min(1, root.entrance * 2)
-    }
-    // HP-OS: the veil takes the scene's tint (irisVeilDay/Night): HP navy by day, so a bright picture
-    // reads blue rather than grey, black at night.
-    Rectangle { anchors.fill: parent; color: Qt.rgba(root.core.veil.r, root.core.veil.g, root.core.veil.b, (0.36 + root.core.lift) * (1 - root.release)) }
+    readonly property Item glassBackdrop: backdropTexture
 
     // ── The lens ──
     readonly property real clockSize: root.px(372)
@@ -232,23 +245,27 @@ LoginSurface {
         opacity: root.entrance * (1 - root.release)
         scale: 1 - 0.04 * (1 - root.entrance) + 0.06 * root.release
         transform: Translate { y: -Math.round(12 * root.d * root.stage) }
-        // A soft fall of shadow lifts the lens off the blur.
+        // HP-OS: what sits behind the time (theme.conf irisClockShade): nothing, a faint glow of light, or a light,
+        // soft shadow, instead of the heavy dark one.
+        readonly property string shade: String(config.irisClockShade || "none")
         MultiEffect {
             anchors.fill: parent
-            y: root.px(14)
+            visible: parent.shade !== "none"
+            y: parent.shade === "soft" ? root.px(6) : 0
             source: lensMask
             blurEnabled: true
             blur: 1
-            blurMax: 64
+            blurMax: parent.shade === "glow" ? 64 : 40
             colorization: 1
-            colorizationColor: "#000000"
-            opacity: 0.55
+            colorizationColor: parent.shade === "glow" ? "#ffffff" : "#000000"
+            opacity: parent.shade === "glow" ? 0.16 : 0.2
         }
         // A pale base under the lens: where the picture is dark, the figures still read lighter than the blur.
+        // HP-OS: frostier with the glow, fainter with nothing behind the time.
         MultiEffect {
             anchors.fill: parent
             source: lensMask
-            opacity: 0.3
+            opacity: parent.shade === "glow" ? 0.42 : parent.shade === "none" ? 0.16 : 0.26
         }
         MultiEffect {
             anchors.fill: parent
@@ -328,10 +345,11 @@ LoginSurface {
             height: root.px(64)
             scale: 0.92 + 0.08 * root.passwordShown
             transform: Translate { x: root.shakeX }
-            Rectangle {
+            GlassShape {
                 anchors.fill: parent
-                radius: height / 2
-                color: Qt.rgba(0, 0, 0, 0.3)
+                d: root.d
+                look: String(config.irisGlassLook || "clear")
+                lit: entry.input.activeFocus
             }
             Rectangle {
                 anchors.fill: parent

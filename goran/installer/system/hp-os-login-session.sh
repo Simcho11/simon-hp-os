@@ -96,9 +96,15 @@ fi
 own="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/home-manager/home-path/bin"
 export PATH="$own:$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin"
 [[ -x "$own/hp-os-session" ]] || finish 127 "missing $own/hp-os-session"
+# This account's wallpaper on the login screen: shared as the session starts (in the background) and again as it
+# ends, when it changed during the session.
+wallpaper=/opt/hp-os/device/hp-os-login-wallpaper
+[[ ! -x "$wallpaper" ]] || ( timeout 120 /usr/bin/python3 -I "$wallpaper" share >/dev/null 2>&1 & )
 # Not exec: this script must outlive the session to hand SDDM a clean status.
 "$own/hp-os-session"
-finish $? "HP-OS session"
+status=$?
+[[ ! -x "$wallpaper" ]] || timeout 20 /usr/bin/python3 -I "$wallpaper" share >/dev/null 2>&1 || true
+finish $status "HP-OS session"
 EOF
 bash -n "$target.new"
 chmod 755 "$target.new"

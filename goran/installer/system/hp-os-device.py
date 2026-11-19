@@ -35,6 +35,7 @@ ERASED = (
     "var/mail/*",
     "etc/NetworkManager/system-connections/*",
     "var/lib/bluetooth/*/[0-9A-F][0-9A-F]:*",
+    "var/lib/hp-os/login-wallpapers/*",
 )
 
 
