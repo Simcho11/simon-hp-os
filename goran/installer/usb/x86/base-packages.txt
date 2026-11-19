@@ -1,0 +1,26 @@
+# The Ubuntu 26.04 packages of a clean x86 HP-OS. Everything else comes from the Nix desktop.
+# Startup and kernel
+linux-generic linux-firmware firmware-sof-signed intel-microcode amd64-microcode initramfs-tools
+grub-efi-amd64-signed grub-efi-amd64-bin shim-signed efibootmgr
+systemd-sysv systemd-zram-generator dbus-user-session
+# Everyday system services
+network-manager wpasupplicant wireless-regdb bluez upower power-profiles-daemon udisks2 polkitd
+pipewire pipewire-pulse pipewire-alsa wireplumber libspa-0.2-bluetooth alsa-utils
+# Login screen
+sddm libpam-gnome-keyring gnome-keyring libpam-systemd
+qml6-module-qt5compat-graphicaleffects qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtqml-workerscript
+qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-effects qml6-module-qtquick-layouts
+qml6-module-qtquick-shapes qml6-module-qtquick-templates qml6-module-qtquick-window
+# Without these the login screen cannot open its window, or show its pictures.
+qt6-wayland qt6-image-formats-plugins
+# Used by HP-OS's own system parts: first-time setup and Add user (accounts, approval, pictures),
+# notifications, and software updates (downloaded with git over ssh, checked with ssh-keygen).
+accountsservice pkexec python3-gi gir1.2-glib-2.0 python3-pil libnotify-bin git openssh-client
+# Graphics
+libgl1-mesa-dri libegl1 libgbm1 mesa-vulkan-drivers mesa-va-drivers xwayland
+xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-gnome
+# Desktop parts the Nix desktop expects to find on the system
+yaru-theme-icon adwaita-icon-theme libglib2.0-bin desktop-file-utils xdg-utils
+# Tools
+nix-bin nix-setup-systemd sudo python3 ca-certificates curl rsync zstd dosfstools e2fsprogs gdisk
+locales tzdata console-setup kbd less nano

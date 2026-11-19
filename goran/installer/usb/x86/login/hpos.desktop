@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=HP-OS
+Comment=HP-OS desktop
+Exec=/opt/hp-os/login/session
+Type=Application
+DesktopNames=HP-OS;niri;

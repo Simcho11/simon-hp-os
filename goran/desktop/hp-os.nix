@@ -1,7 +1,13 @@
 { config, lib, pkgs, hp-os, ... }:
 let
   cfg = config.programs.goran-hp-os;
-  hpPkgs = hp-os.inputs.nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system};
+  # The ARM OmniBook's NVIDIA N1X needs its own graphics settings; x86 laptops use the standard drivers.
+  isN1x = pkgs.stdenv.hostPlatform.isAarch64;
+  ubuntuLibDir = if isN1x then "aarch64-linux-gnu" else "x86_64-linux-gnu";
+  nativePamBridge = if isN1x then ./native-pam-bridge.py else pkgs.runCommand "native-pam-bridge.py" { } ''
+    sed 's#/usr/lib/aarch64-linux-gnu#/usr/lib/${ubuntuLibDir}#' ${./native-pam-bridge.py} > "$out"
+  '';
+  hpPkgs =hp-os.inputs.nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system};
   # Files with a glass slot showing where a dropped item will land.
   filesWithDropSlot = hpPkgs.kdePackages.dolphin.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./hp-snap/files-drop-slot.patch ];
@@ -34,7 +40,7 @@ for name in ("qs", "quickshell"):
 PYWRAP
     binary="$out/bin/.quickshell-wrapped"
     rpath=$(patchelf --print-rpath "$binary")
-    patchelf --replace-needed libpam.so.0 /usr/lib/aarch64-linux-gnu/libpam.so.0 \
+    patchelf --replace-needed libpam.so.0 /usr/lib/${ubuntuLibDir}/libpam.so.0 \
       --force-rpath --set-rpath "$rpath:${lib.getLib hpPkgs.pcre2}/lib:${config.home.homeDirectory}/.local/state/hp-os/native-pam/current" "$binary"
   '';
   nativePamRun = pkgs.writeShellScript "hp-os-native-pam-run" ''
@@ -125,9 +131,7 @@ export QT_WAYLAND_DECORATION="''${QT_WAYLAND_DECORATION:-adwaita}"'
   installKeyboard = "${pkgs.python3}/bin/python3 ${./hp-os-keyboard-config.py} ${keyboardConfig}";
   launcher = pkgs.writeShellScriptBin "hp-os-session" ''
     export PATH="$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-    export GBM_BACKEND=nvidia-drm
-    export __GLX_VENDOR_LIBRARY_NAME=nvidia
-    if [[ -n "''${WAYLAND_DISPLAY:-}" ]]; then
+    ${lib.optionalString isN1x "export GBM_BACKEND=nvidia-drm\nexport __GLX_VENDOR_LIBRARY_NAME=nvidia\n"}if [[ -n "''${WAYLAND_DISPLAY:-}" ]]; then
       echo 'Start HP-OS from a login manager or a free TTY.' >&2
       exit 1
     fi
@@ -197,7 +201,7 @@ in {
       run ${installKeyboard}
     '';
     home.activation.hpOsNativePam = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      run ${pkgs.python3}/bin/python3 ${./native-pam-bridge.py} \
+      run ${pkgs.python3}/bin/python3 ${nativePamBridge} \
         "$HOME/.local/state/hp-os/native-pam/current" \
         ${lib.getLib hpPkgs.pcre2}/lib/libpcre2-8.so.0
     '';

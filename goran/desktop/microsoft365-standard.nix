@@ -7,16 +7,22 @@ let
   desktopDir = if config.xdg.userDirs.desktop != null then config.xdg.userDirs.desktop else "${config.home.homeDirectory}/Desktop";
   folder = { hub = "Microsoft 365"; word = "Word"; excel = "Excel"; powerpoint = "PowerPoint"; outlook = "Outlook";
              teams = "Teams"; onedrive = "OneDrive"; sharepoint = "SharePoint"; };
-  chrome = pkgs.writeShellScript "hp-os-chrome" ''
-    set -euo pipefail
-    export XDG_CONFIG_HOME="$HOME/.config"
+  # Video acceleration settings for the ARM OmniBook's NVIDIA chip; x86 laptops use Chrome's own defaults.
+  isN1x = pkgs.stdenv.hostPlatform.isAarch64;
+  chromeVideoEnv = lib.optionalString isN1x ''
     export LIBVA_DRIVER_NAME=nvidia
     export LIBVA_DRIVERS_PATH=${pkgs.nvidia-vaapi-driver}/lib/dri
     export NVD_BACKEND=direct
-    exec ${pkgs.google-chrome}/bin/google-chrome-stable \
+  '';
+  chromeVideoFlags = lib.optionalString isN1x ''
+    --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,PlatformHEVCDecoderSupport \
+      --ignore-gpu-blocklist --use-gl=angle --use-angle=gl '';
+  chrome = pkgs.writeShellScript "hp-os-chrome" ''
+    set -euo pipefail
+    export XDG_CONFIG_HOME="$HOME/.config"
+    ${chromeVideoEnv}exec ${pkgs.google-chrome}/bin/google-chrome-stable \
       --ozone-platform=wayland --gtk-version=4 \
-      --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,PlatformHEVCDecoderSupport \
-      --ignore-gpu-blocklist --use-gl=angle --use-angle=gl "$@"
+      ${chromeVideoFlags}"$@"
   '';
   windowClass = app:
     let parts = builtins.match "https://([^/]+)(/.*)" app.url;

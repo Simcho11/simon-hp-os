@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+# A private greeter bus keeps the setup dialog away from any user's desktop.
+# No accessibility bus: it outlives the login screen and keeps its session open.
+export NO_AT_BRIDGE=1 GTK_A11Y=none QT_ACCESSIBILITY=0
+exec /usr/bin/dbus-run-session -- /opt/hp-os/niri-patch/result-hpos/bin/niri --config /opt/hp-os/login/greeter.kdl

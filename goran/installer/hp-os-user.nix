@@ -17,7 +17,8 @@ username:
   # Same GPU userspace as Simon's account; Nix-built apps need it to draw on the NVIDIA GPU.
   targets.genericLinux.gpu = {
     enable = true;
-    nvidia = {
+    # Only the ARM OmniBook has this NVIDIA chip. x86 laptops use the standard open graphics drivers.
+    nvidia = lib.mkIf pkgs.stdenv.hostPlatform.isAarch64 {
       enable = true;
       version = "615.78.08";
       sha256 = "sha256-UHYBE1AYHoGgMfD9AS/jX+S+N8eCDWUft6qolK9Eejc=";

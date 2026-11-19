@@ -86,8 +86,10 @@ in {
       ExecStart = "${niri}/bin/niri --session";
       Environment = [
         "PATH=%h/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin"
+      ] ++ lib.optionals pkgs.stdenv.hostPlatform.isAarch64 [
         "GBM_BACKEND=nvidia-drm"
         "__GLX_VENDOR_LIBRARY_NAME=nvidia"
+      ] ++ [
         "GTK_IM_MODULE=fcitx"
         "QT_IM_MODULE=fcitx"
         "XMODIFIERS=@im=fcitx"

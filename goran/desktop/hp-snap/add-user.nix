@@ -77,8 +77,7 @@ pkgs.runCommand "hp-os-add-user" { } ''
   EOF
   cat > "$out/bin/hp-os-first-setup" <<EOF
   #!/bin/sh
-  export GBM_BACKEND=nvidia-drm __GLX_VENDOR_LIBRARY_NAME=nvidia
-  exec /usr/bin/timeout --foreground 1800 /usr/bin/dbus-run-session -- $niri --config "$app/first-setup/niri.kdl"
+  ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isAarch64 "export GBM_BACKEND=nvidia-drm __GLX_VENDOR_LIBRARY_NAME=nvidia\n"}exec /usr/bin/timeout --foreground 1800 /usr/bin/dbus-run-session -- $niri --config "$app/first-setup/niri.kdl"
   EOF
   sed -i 's/^  //' "$app/first-setup/screen" "$app/first-setup/niri.kdl" "$out/bin/hp-os-first-setup"
   chmod +x "$app/first-setup/screen" "$out/bin/hp-os-first-setup"

@@ -13,20 +13,26 @@
   outputs = { self, nixpkgs, home-manager, hp-os, codex-fleet, ghostty-upstream, dank-material-shell, dms-plugin-registry, xwayland-satellite, ... }:
     let
       system = "aarch64-linux";
+      x86System = "x86_64-linux";
       ghosttyCpuPresentation = ghostty-upstream.packages.${system}.default.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [ ./goran/desktop/ghostty-n1x-cpu-presentation.patch ];
       });
-      pkgs = import nixpkgs {
-        inherit system;
+      pkgsFor = targetSystem: import nixpkgs {
+        system = targetSystem;
         config = { allowUnfree = true; nvidia.acceptLicense = true; };
         overlays = [
           (final: prev: { cloudflared = final.callPackage ./pkgs/cloudflared-release.nix { }; })
           codex-fleet.overlays.default
+        ] ++ nixpkgs.lib.optional (targetSystem == system)
+          # Ghostty's rendering workaround is only for the ARM OmniBook's NVIDIA N1X.
           (import ./goran/desktop/ghostty-overlay.nix { ghosttyPackage = ghosttyCpuPresentation; })
+        ++ [
           (import ./goran/desktop/niri-hdr-overlay.nix)
         ];
       };
-      standardHome = name: home-manager.lib.homeManagerConfiguration {
+      pkgs = pkgsFor system;
+      x86Pkgs = pkgsFor x86System;
+      standardHomeFor = pkgs: name: home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         extraSpecialArgs = {
           inherit hp-os dank-material-shell dms-plugin-registry xwayland-satellite;
@@ -45,15 +51,9 @@
           ./goran/desktop/hp-os-theme.nix
         ];
       };
-    in nixpkgs.lib.recursiveUpdate {
-      # Used by the Ubuntu first-login installer for names that did not exist at build time.
-      # Only Simon's own laptop gives the account "simon" his personal desktop. On a device made from the
-      # USB installer (marked by /etc/hp-os/standard-device), anyone can use that name and get the shared one.
-      lib.hpOsAccount = name:
-        if name == "simon" && !builtins.pathExists "/etc/hp-os/standard-device"
-        then self.homeConfigurations.simon-daytona
-        else standardHome name;
-      packages.aarch64-linux.hp-os-account-setup = pkgs.writeShellScriptBin "hp-os-account-setup" ''
+      standardHome = standardHomeFor pkgs;
+      # The login screen and first-login pieces every HP-OS device needs, for one processor type.
+      accountSetupFor = pkgs: pkgs.writeShellScriptBin "hp-os-account-setup" ''
         export HP_OS_PROFILE_FLAKE=${self.outPath}
         # Keep locked flake inputs available for a first login after garbage collection.
         : ${builtins.concatStringsSep " " (map (item: item.src.outPath) (builtins.genericClosure {
@@ -62,21 +62,45 @@
         }))}
         exec /bin/bash ${./goran/installer/account-setup.sh} "$@"
       '';
+      loginThemeFor = pkgs: import ./goran/desktop/hp-snap/login-theme.nix {
+        inherit pkgs;
+        hposFonts = pkgs.callPackage (hp-os + "/packaging/fonts") { };
+        wallpapers = import ./goran/desktop/hp-snap/wallpapers.nix { inherit pkgs; };
+      };
+      addUserFor = pkgs: import ./goran/desktop/hp-snap/add-user.nix {
+        inherit pkgs;
+        quickshell = hp-os.inputs.nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system}.quickshell;
+      };
+    in nixpkgs.lib.recursiveUpdate {
+      # Used by the Ubuntu first-login installer for names that did not exist at build time.
+      # Only Simon's own laptop gives the account "simon" his personal desktop. On a device made from the
+      # USB installer (marked by /etc/hp-os/standard-device), anyone can use that name and get the shared one.
+      # An x86 device always gets the shared desktop.
+      lib.hpOsAccount = name:
+        if (builtins.currentSystem or system) == x86System
+        then standardHomeFor x86Pkgs name
+        else if name == "simon" && !builtins.pathExists "/etc/hp-os/standard-device"
+        then self.homeConfigurations.simon-daytona
+        else standardHome name;
+      packages.aarch64-linux.hp-os-account-setup = accountSetupFor pkgs;
+      packages.x86_64-linux.hp-os-account-setup = accountSetupFor x86Pkgs;
+      packages.x86_64-linux.hp-os-login-theme = loginThemeFor x86Pkgs;
+      packages.x86_64-linux.hp-os-add-user = addUserFor x86Pkgs;
+      # The x86 USB installer's in-memory program; assembled into a disk image by goran/installer/usb/x86/build-image.sh.
+      packages.x86_64-linux.hp-os-usb-installer = import ./goran/installer/usb/x86/usb-installer.nix {
+        pkgs = x86Pkgs;
+        hposFonts = x86Pkgs.callPackage (hp-os + "/packaging/fonts") { };
+        wallpapers = import ./goran/desktop/hp-snap/wallpapers.nix { pkgs = x86Pkgs; };
+        logo = ./goran/desktop/hp-snap/login-theme/hp-logo.png;
+      };
       homeModules.fleetApps = import ./fleet/home.nix;
       homeManagerModules.default = import ./fleet/home.nix;
       packages.x86_64-linux.upscayl = let p = import nixpkgs { system = "x86_64-linux"; config.allowUnfree = true; }; in p.callPackage ./goran/desktop/upscayl/package.nix {};
       packages.aarch64-linux.upscayl = pkgs.callPackage ./goran/desktop/upscayl/package.nix {};
       # The HP-OS login screen; installed with goran/installer/system/hp-os-login-theme.sh.
-      packages.aarch64-linux.hp-os-login-theme = import ./goran/desktop/hp-snap/login-theme.nix {
-        inherit pkgs;
-        hposFonts = pkgs.callPackage (hp-os + "/packaging/fonts") { };
-        wallpapers = import ./goran/desktop/hp-snap/wallpapers.nix { inherit pkgs; };
-      };
+      packages.aarch64-linux.hp-os-login-theme = loginThemeFor pkgs;
       # The login screen's Add user setup; installed with goran/installer/system/hp-os-add-user.sh.
-      packages.aarch64-linux.hp-os-add-user = import ./goran/desktop/hp-snap/add-user.nix {
-        inherit pkgs;
-        quickshell = hp-os.inputs.nixpkgs.legacyPackages.${system}.quickshell;
-      };
+      packages.aarch64-linux.hp-os-add-user = addUserFor pkgs;
       # The USB stick that turns a laptop into an HP-OS laptop; made with goran/installer/usb/make-usb.sh.
       packages.aarch64-linux.hp-os-usb-installer = import ./goran/installer/usb/usb-installer.nix {
         inherit pkgs;
@@ -117,6 +141,9 @@
       homeConfigurations = builtins.listToAttrs (map (name: {
         name = "hp-os-${name}";
         value = standardHome name;
-      }) (import ./hp-os-users.nix));
+      }) (import ./hp-os-users.nix)) // {
+        # The standard x86 desktop, used to build and test x86 installers.
+        hp-os-x86-standard = standardHomeFor x86Pkgs "hposperson";
+      };
     };
 }
