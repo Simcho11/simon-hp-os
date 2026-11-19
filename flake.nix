@@ -35,6 +35,7 @@
         modules = [
           ./fleet/home.nix
           (import ./goran/installer/hp-os-user.nix name)
+          ./goran/desktop/microsoft365-standard.nix
           ./goran/desktop/cosmic-niri.nix
           ./goran/desktop/hp-os.nix
           ./goran/desktop/niri.nix
@@ -47,7 +48,12 @@
       };
     in nixpkgs.lib.recursiveUpdate {
       # Used by the Ubuntu first-login installer for names that did not exist at build time.
-      lib.hpOsAccount = name: if name == "simon" then self.homeConfigurations.simon-daytona else standardHome name;
+      # Only Simon's own laptop gives the account "simon" his personal desktop. On a device made from the
+      # USB installer (marked by /etc/hp-os/standard-device), anyone can use that name and get the shared one.
+      lib.hpOsAccount = name:
+        if name == "simon" && !builtins.pathExists "/etc/hp-os/standard-device"
+        then self.homeConfigurations.simon-daytona
+        else standardHome name;
       packages.aarch64-linux.hp-os-account-setup = pkgs.writeShellScriptBin "hp-os-account-setup" ''
         export HP_OS_PROFILE_FLAKE=${self.outPath}
         # Keep locked flake inputs available for a first login after garbage collection.
@@ -71,6 +77,13 @@
       packages.aarch64-linux.hp-os-add-user = import ./goran/desktop/hp-snap/add-user.nix {
         inherit pkgs;
         quickshell = hp-os.inputs.nixpkgs.legacyPackages.${system}.quickshell;
+      };
+      # The USB stick that turns a laptop into an HP-OS laptop; made with goran/installer/usb/make-usb.sh.
+      packages.aarch64-linux.hp-os-usb-installer = import ./goran/installer/usb/usb-installer.nix {
+        inherit pkgs;
+        hposFonts = pkgs.callPackage (hp-os + "/packaging/fonts") { };
+        wallpapers = import ./goran/desktop/hp-snap/wallpapers.nix { inherit pkgs; };
+        logo = ./goran/desktop/hp-snap/login-theme/hp-logo.png;
       };
       packages.aarch64-linux.foundation-sunshine = import ./goran/remote-access/pkgs/foundation-sunshine.nix { inherit pkgs; };
       homeConfigurations.simon-daytona = home-manager.lib.homeManagerConfiguration {

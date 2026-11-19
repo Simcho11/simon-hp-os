@@ -1,0 +1,339 @@
+"""The HP-OS installer: the whole experience of the USB stick, drawn straight onto the screen."""
+import array
+import fcntl
+import glob
+import mmap
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import textwrap
+import time
+
+from PIL import Image, ImageDraw, ImageFont
+
+ASSETS = Path("/installer/assets")
+SOURCE_LABEL = "HPOS-SYSTEM"
+SOURCE = Path("/mnt/source")
+TARGET = Path("/mnt/target")
+ROOT_UUID = "d2c1c5bd-9c17-4517-abe7-90221e401acb"   # What this system's boot files expect.
+ESP_ID = "B6AFFFE5"
+MINIMUM_DISK = 200 * 1000 ** 3
+LOG = open("/run/hp-os-install.log", "a", buffering=1)
+
+
+class Stop(Exception):
+    """Something to tell the person."""
+
+
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, file=LOG)
+    if "hpos.debug=1" in Path("/proc/cmdline").read_text():
+        print(*parts, file=sys.stderr, flush=True)
+
+
+def run(*command, check=True):
+    log("$", *command)
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    log(result.stdout.strip())
+    if check and result.returncode != 0:
+        raise RuntimeError("%s failed: %s" % (command[0], result.stdout.strip()[-400:]))
+    return result.stdout
+
+
+# ── The screen ──
+class Screen:
+    FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO = 0x4600, 0x4602
+
+    def __init__(self):
+        for _ in range(100):
+            if os.path.exists("/dev/fb0"):
+                break
+            time.sleep(0.1)
+        self.fd = os.open("/dev/fb0", os.O_RDWR)
+        variable = bytearray(160)
+        fcntl.ioctl(self.fd, self.FBIOGET_VSCREENINFO, variable)
+        fields = struct.unpack("8I", bytes(variable[:32]))
+        self.width, self.height, self.bits = fields[0], fields[1], struct.unpack("I", bytes(variable[24:28]))[0]
+        fixed = bytearray(80)
+        fcntl.ioctl(self.fd, self.FBIOGET_FSCREENINFO, fixed)
+        self.stride = struct.unpack("I", bytes(fixed[48:52]))[0]
+        self.red_first = struct.unpack("I", bytes(variable[32:36]))[0] == 0
+        self.map = mmap.mmap(self.fd, self.stride * self.height)
+        self.unit = max(0.75, min(self.width / 1440, self.height / 900))
+        backdrop = Image.open(ASSETS / "backdrop.jpg").convert("RGB")
+        scale = max(self.width / backdrop.width, self.height / backdrop.height)
+        backdrop = backdrop.resize((round(backdrop.width * scale), round(backdrop.height * scale)), Image.LANCZOS)
+        left, top = (backdrop.width - self.width) // 2, (backdrop.height - self.height) // 2
+        self.backdrop = backdrop.crop((left, top, left + self.width, top + self.height))
+        logo = Image.open(ASSETS / "hp-logo.png").convert("RGBA")
+        size = self.px(30)
+        self.logo = logo.resize((size, round(size * logo.height / logo.width)), Image.LANCZOS)
+
+    def px(self, value):
+        return round(value * self.unit)
+
+    def font(self, size, bold=False):
+        font = ImageFont.truetype(str(ASSETS / ("bold.ttf" if bold else "regular.ttf")), self.px(size))
+        try:
+            font.set_variation_by_axes([700 if bold else 400])   # One font file holds every weight.
+        except (OSError, NotImplementedError):
+            pass
+        return font
+
+    def centered(self, draw, y, text, font, fill):
+        draw.text((self.width / 2, y), text, font=font, fill=fill, anchor="ma")
+
+    def frame(self, title, lines=(), progress=None, button=None, quiet=None, danger=False):
+        image = self.backdrop.copy().convert("RGBA")
+        image.alpha_composite(Image.new("RGBA", image.size, (7, 26, 63, 138)))
+        image.alpha_composite(self.logo, (self.px(36), self.px(30)))
+        draw = ImageDraw.Draw(image)
+        draw.text((self.px(78), self.px(33)), "HP-OS", font=self.font(20), fill="white")
+        y = round(self.height * 0.33)
+        self.centered(draw, y, title, self.font(42, True), "white")
+        y += self.px(76)
+        body = self.font(20)
+        for line in lines:
+            for piece in textwrap.wrap(line, 68) or [""]:
+                self.centered(draw, y, piece, body, (255, 255, 255, 225))
+                y += self.px(32)
+        y += self.px(26)
+        if progress is not None:
+            width, height = self.px(420), max(4, self.px(6))
+            left = (self.width - width) // 2
+            draw.rounded_rectangle((left, y, left + width, y + height), height / 2, fill=(255, 255, 255, 60))
+            draw.rounded_rectangle((left, y, left + max(height, round(width * progress)), y + height), height / 2, fill="white")
+            y += self.px(40)
+        if button:
+            width, height = self.px(320), self.px(56)
+            left = (self.width - width) // 2
+            fill, ink = ("#d93025", "white") if danger else ("white", "#0b2a6b")
+            draw.rounded_rectangle((left, y, left + width, y + height), height / 2, fill=fill)
+            draw.text((self.width / 2, y + height / 2), button, font=self.font(19, True), fill=ink, anchor="mm")
+            y += height + self.px(22)
+        if quiet:
+            self.centered(draw, y, quiet, self.font(17), (255, 255, 255, 200))
+        self.show(image.convert("RGB"))
+
+    def show(self, image):
+        order = "RGB" if self.red_first else "BGR"
+        data = image.tobytes("raw", order + "X" if self.bits == 32 else order)
+        row = self.width * (4 if self.bits == 32 else 3)
+        for line in range(self.height):
+            self.map[line * self.stride:line * self.stride + row] = data[line * row:(line + 1) * row]
+
+
+class TextScreen:
+    """If a laptop's firmware gives no graphics at this stage, the same words still appear."""
+
+    def frame(self, title, lines=(), progress=None, button=None, quiet=None, danger=False):
+        body = ["", "", "    HP-OS", "", "    " + title, ""] + ["    " + line for line in lines]
+        if progress is not None:
+            filled = round(progress * 40)
+            body += ["", "    [" + "#" * filled + "-" * (40 - filled) + "]"]
+        body += ["", "    " + button if button else "", "    " + quiet if quiet else ""]
+        with open("/dev/tty1", "w") as tty:
+            tty.write("\033[2J\033[H" + "\n".join(body) + "\n")
+
+
+# ── The keyboard ──
+class Keys:
+    ENTER, KEYPAD_ENTER, ESCAPE = 28, 96, 1
+
+    def wait(self, wanted):
+        while True:
+            devices = []
+            for path in glob.glob("/dev/input/event*"):
+                try:
+                    devices.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+            try:
+                ready = select.select(devices, [], [], 1)[0]
+                for device in ready:
+                    data = os.read(device, 24 * 64)
+                    for offset in range(0, len(data) - 23, 24):
+                        kind, code, value = struct.unpack("HHi", data[offset + 16:offset + 24])
+                        if kind == 1 and value == 1 and code in wanted:
+                            return code
+            except OSError:
+                pass
+            finally:
+                for device in devices:
+                    os.close(device)
+
+
+# ── Finding things ──
+def wait_for_source():
+    for _ in range(90):
+        found = run("blkid", "-L", SOURCE_LABEL, check=False).strip()
+        if found.startswith("/dev/"):
+            SOURCE.mkdir(parents=True, exist_ok=True)
+            run("mount", "-o", "ro", found, str(SOURCE))
+            if (SOURCE / "system/etc/os-release").is_file():
+                return found
+            raise Stop("This USB stick is incomplete. Please create it again.")
+        time.sleep(1)
+    raise Stop("The USB stick couldn't be read. Remove it, plug it into another port and try again.")
+
+
+def target_disk(source):
+    usb = re.sub(r"\d+$", "", source)
+    disks = []
+    for path in sorted(glob.glob("/sys/block/nvme*n*")):
+        name = os.path.basename(path)
+        size = int(Path(path, "size").read_text()) * 512
+        if not re.fullmatch(r"nvme\d+n\d+", name) or "/dev/" + name == usb or size < MINIMUM_DISK:
+            continue
+        disks.append((size, "/dev/" + name))
+    if not disks:
+        raise Stop("No internal drive was found on this laptop.")
+    return max(disks)[1]
+
+
+def supported_hardware():
+    product = Path("/sys/class/dmi/id/product_name").read_text().strip() if os.path.exists("/sys/class/dmi/id/product_name") else ""
+    return "OmniBook Ultra" in product or "hpos.any_hardware=1" in Path("/proc/cmdline").read_text()
+
+
+def low_power():
+    for battery in glob.glob("/sys/class/power_supply/BAT*"):
+        on_power = any(Path(path).read_text().strip() == "1" for path in glob.glob("/sys/class/power_supply/ADP*/online"))
+        if not on_power and int(Path(battery, "capacity").read_text()) < 40:
+            return True
+    return False
+
+
+def part(disk, number):
+    return "%sp%d" % (disk, number)
+
+
+# ── Installing ──
+def install(screen, disk):
+    def step(fraction, line):
+        screen.frame("Installing HP-OS", [line, "Please keep your laptop plugged in and open."], progress=fraction)
+
+    step(0.02, "Preparing your laptop...")
+    run("wipefs", "--all", "--force", disk)
+    run("sgdisk", "--zap-all", disk)
+    run("sgdisk", "-n", "1:2048:+512M", "-t", "1:EF00", "-c", "1:EFI system partition",
+        "-n", "2:0:0", "-t", "2:8300", "-c", "2:HP-OS", disk)
+    run("blockdev", "--rereadpt", disk)
+    run("udevadm", "settle", "--timeout=20")
+    for _ in range(50):
+        if os.path.exists(part(disk, 2)):
+            break
+        time.sleep(0.2)
+    run("mkfs.vfat", "-F", "32", "-n", "SYSTEM", "-i", ESP_ID, part(disk, 1))
+    run("mkfs.ext4", "-F", "-q", "-L", "HP-OS", "-U", ROOT_UUID, part(disk, 2))
+    TARGET.mkdir(parents=True, exist_ok=True)
+    run("mount", part(disk, 2), str(TARGET))
+    (TARGET / "boot/efi").mkdir(parents=True)
+    run("mount", part(disk, 1), str(TARGET / "boot/efi"))
+
+    copy = subprocess.Popen(["rsync", "-aHAX", "--numeric-ids", "--info=progress2", "--no-inc-recursive",
+                             "--exclude=/boot/efi/", str(SOURCE / "system") + "/", str(TARGET) + "/"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False)
+    shown, tail, buffer = -1, "", b""
+    while True:
+        chunk = copy.stdout.read(4096)
+        if not chunk:
+            break
+        buffer = (buffer + chunk)[-2048:]
+        text = buffer.decode(errors="replace")
+        tail = text[-500:]
+        found = re.findall(r"(\d{1,3})%", text)
+        if found and int(found[-1]) != shown:
+            shown = int(found[-1])
+            step(0.05 + 0.85 * min(shown, 100) / 100, "Copying HP-OS to your laptop... %d%%" % shown)
+    if copy.wait() != 0:
+        log(tail)
+        raise RuntimeError("copy failed: " + tail[-300:])
+
+    step(0.92, "Setting up startup...")
+    startup = SOURCE / "system/boot/efi"
+    for folder, _, files in os.walk(startup):     # The startup partition keeps no owners or permissions.
+        destination = TARGET / "boot/efi" / Path(folder).relative_to(startup)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            shutil.copyfile(Path(folder, name), destination / name)
+    run("fallocate", "-l", "8G", str(TARGET / "swap.img"))
+    os.chmod(TARGET / "swap.img", 0o600)
+    run("mkswap", str(TARGET / "swap.img"))
+    if os.path.isdir("/sys/firmware/efi/efivars"):
+        listing = run("efibootmgr", check=False)
+        for number, label in re.findall(r"^Boot([0-9A-Fa-f]{4})\*? (.+)$", listing, re.M):
+            if re.search(r"windows|ubuntu|hp-os", label, re.I):
+                run("efibootmgr", "-b", number, "-B", check=False)
+        run("efibootmgr", "-c", "-d", disk, "-p", "1", "-L", "HP-OS", "-l", "\\EFI\\ubuntu\\shimaa64.efi", check=False)
+    step(0.97, "Finishing up...")
+    run("sync")
+    run("umount", str(TARGET / "boot/efi"))
+    run("umount", str(TARGET))
+    run("sync")
+
+
+def power(action):
+    subprocess.run(["sync"], check=False)
+    with open("/proc/sysrq-trigger", "w") as trigger:
+        trigger.write(action)
+    time.sleep(10)
+
+
+def turn_off():
+    power("o")
+
+
+def restart():
+    power("b")
+
+
+def main():
+    try:
+        screen = Screen()
+    except (OSError, ValueError) as error:
+        log("no graphics:", repr(error))
+        screen = TextScreen()
+    keys = Keys()
+    try:
+        screen.frame("Getting ready", ["Starting the HP-OS installer..."])
+        source = wait_for_source()
+        if not supported_hardware():
+            raise Stop("This installer is made for the HP OmniBook Ultra. Nothing on this computer was changed.")
+        disk = target_disk(source)
+        while low_power():
+            screen.frame("Plug in your laptop", ["Connect the charger to continue."])
+            time.sleep(2)
+        screen.frame("Install HP-OS", ["This erases everything on this laptop, including Windows,",
+                                       "and replaces it with HP-OS. This can't be undone."],
+                     button="Press Enter to erase and install", quiet="Press Esc to turn off without changing anything", danger=True)
+        if keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE}) == Keys.ESCAPE:
+            screen.frame("Turning off", ["Nothing on this laptop was changed."])
+            time.sleep(2)
+            turn_off()
+            return
+        install(screen, disk)
+        screen.frame("HP-OS is installed", ["Remove the USB stick, then press Enter.", "Your laptop will restart and welcome you."],
+                     button="Press Enter to restart")
+        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER})
+        screen.frame("Restarting", [])
+        restart()
+    except Stop as reason:
+        screen.frame("HP-OS can't be installed", [str(reason)], button="Press Enter to turn off")
+        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE})
+        turn_off()
+    except Exception as error:     # Whatever went wrong, the person gets a clear screen, not a dead one.
+        log("failed:", repr(error))
+        screen.frame("Installation didn't finish", ["Something went wrong while installing.", "Restart from the USB stick to try again."],
+                     button="Press Enter to turn off", quiet=str(error)[:90])
+        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE})
+        turn_off()
+
+
+if __name__ == "__main__":
+    main()

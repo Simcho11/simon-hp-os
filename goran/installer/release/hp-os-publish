@@ -4,15 +4,20 @@
   hp-os-publish setup OWNER/REPO        once: create the private repository and this laptop's signing key
   hp-os-publish release "What changed"  build the committed code, sign it and send it out
   hp-os-publish bundle FILE             make the file that connects another device (keep it private)
+  sudo hp-os-publish image ROOT         build the connection into a laptop image, mounted at ROOT
   hp-os-publish status                  show what was last published
 
 Only committed code is published, and only after it has built successfully from a clean copy.
 """
 import datetime
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -22,7 +27,9 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "goran/installer/system"))
 import hp_os_release as release  # noqa: E402
 
-HOME = Path(os.environ.get("HP_OS_PUBLISH_HOME", Path.home() / ".config/hp-os-release"))
+OWNER = os.environ.get("SUDO_USER", "") if os.geteuid() == 0 else ""
+OWNER_HOME = Path(pwd.getpwnam(OWNER).pw_dir) if OWNER else Path.home()
+HOME = Path(os.environ.get("HP_OS_PUBLISH_HOME", OWNER_HOME / ".config/hp-os-release"))
 CONFIG = HOME / "config.json"
 SIGNING_KEY = HOME / "signing_ed25519"
 DEPLOY_KEY = HOME / "deploy_ed25519"
@@ -164,6 +171,17 @@ def publish(notes, skip_build=False):
     print("Published HP-OS %s. Devices will see it within a day, or right away from Settings." % version)
 
 
+def head_is_published():
+    """True when the commit checked out here is exactly the newest release."""
+    settings = config()
+    manifest = published_release(settings)
+    if git("status", "--porcelain", "--untracked-files=no"):
+        return False
+    with tempfile.TemporaryDirectory() as folder:
+        snapshot(git("rev-parse", "HEAD"), folder)
+        return release.tree_digest(folder) == manifest["digest"]
+
+
 def bundle(target):
     settings = config()
     with tempfile.TemporaryDirectory() as folder:
@@ -177,6 +195,119 @@ def bundle(target):
     print("Wrote %s. On the other device run: sudo /opt/hp-os/device/hp-os-update enroll %s" % (target, Path(target).name))
 
 
+def as_owner():
+    """Under sudo, Git and Nix still run as the person who owns this checkout and its GitHub sign-in."""
+    return ["sudo", "-u", OWNER, "-H"] if OWNER else []
+
+
+def owner_git(settings, *arguments, text=True):
+    helper = [] if settings.get("push") else ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    return run(*as_owner(), "git", "-C", str(REPO), *helper, *arguments, text=text)
+
+
+def published_release(settings):
+    """The newest release, read back from where devices get it, and only if this laptop's key signed it."""
+    owner_git(settings, "fetch", "--quiet", remote(settings), "refs/heads/%s:refs/hp-os-image/channel" % release.CHANNEL,
+              "refs/heads/%s:refs/hp-os-image/stable" % release.STABLE)
+    data = owner_git(settings, "show", "refs/hp-os-image/channel:latest.json", text=False)
+    signature = owner_git(settings, "show", "refs/hp-os-image/channel:latest.json.sig", text=False)
+    with tempfile.TemporaryDirectory() as folder:
+        Path(folder, "sig").write_bytes(signature)
+        Path(folder, "signers").write_text("%s %s" % (release.IDENTITY, Path(str(SIGNING_KEY) + ".pub").read_text()))
+        if not release.signature_valid(data, Path(folder, "sig"), Path(folder, "signers")):
+            stop("the published release isn't signed by this laptop.")
+    return json.loads(data)
+
+
+def image_account(root):
+    """The updater account as the image knows it. The image's numbers can differ from this laptop's."""
+    people = [line.split(":") for line in (root / "etc/passwd").read_text().splitlines() if line.count(":") >= 6]
+    accounts = [fields[0] for fields in people if fields[2].isdigit() and 1000 <= int(fields[2]) < 60000]
+    if accounts:
+        stop("this image still has accounts on it (%s). Factory reset the source device first." % ", ".join(accounts))
+    updater = next((fields for fields in people if fields[0] == "hp-os-updater"), None)
+    if not updater:
+        stop("this image doesn't have the update system yet. Install the current HP-OS on it first.")
+    return int(updater[2]), int(updater[3])
+
+
+def image_matches(root, source):
+    """True only when the image was installed from exactly this release."""
+    try:
+        profile = root / "nix/var/nix/profiles/hp-os-accounts"
+        installed = os.readlink(profile.parent / os.readlink(profile))
+    except OSError:
+        return False
+    built = run(*as_owner(), "nix", "build", "--no-link", "--print-out-paths", "path:%s#hp-os-account-setup" % source)
+    return built.strip() == installed
+
+
+def build_into_image(target):
+    root = Path(target).resolve()
+    if root == Path("/") or not (root / "etc/passwd").is_file():
+        stop("give the folder where the image's main partition is mounted, such as /mnt/hp-os-image.")
+    if os.geteuid() != 0:
+        stop("run this with sudo, because the image's files belong to root.")
+    uid, gid = image_account(root)
+    settings = config()
+    manifest = published_release(settings)
+    device = settings.get("device", "git@github.com:%s.git" % settings["repository"])
+
+    folder = root / "etc/hp-os/update"
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o755)
+    loader = importlib.machinery.SourceFileLoader("hp_os_update", str(REPO / "goran/installer/system/hp-os-update.py"))
+    spec = importlib.util.spec_from_loader("hp_os_update", loader)
+    updater = importlib.util.module_from_spec(spec)
+    loader.exec_module(updater)
+    (folder / "config.json").write_text(json.dumps({"repository": device}) + "\n")
+    (folder / "allowed_signers").write_text("%s %s" % (release.IDENTITY, Path(str(SIGNING_KEY) + ".pub").read_text()))
+    (folder / "known_hosts").write_text(updater.GITHUB_KEY)
+    key = folder / "deploy-key"
+    key.write_bytes(DEPLOY_KEY.read_bytes())
+    os.chown(key, uid, gid)
+    os.chmod(key, 0o600)
+
+    state = root / "var/lib/hp-os/update"
+    (state / "versions").mkdir(parents=True, exist_ok=True)
+    (state / "home").mkdir(exist_ok=True)
+    os.chown(state / "home", uid, gid)
+    status = {"enrolled": True, "state": "idle"}
+    with tempfile.TemporaryDirectory(dir=str(OWNER_HOME) if OWNER else None) as work:
+        if OWNER:
+            shutil.chown(work, OWNER)
+        archive = owner_git(settings, "archive", "refs/hp-os-image/stable", text=False)
+        with tempfile.NamedTemporaryFile() as stored:
+            stored.write(archive)
+            stored.flush()
+            with tarfile.open(stored.name) as bundled:
+                bundled.extractall(work, filter="tar")
+        if release.tree_digest(work) != manifest["digest"]:
+            stop("the published release doesn't match its signature.")
+        current = image_matches(root, work)
+        if current:
+            # The device starts on this version, with a copy to fall back to during its first update.
+            kept = state / "versions" / manifest["version"]
+            shutil.rmtree(kept, ignore_errors=True)
+            shutil.copytree(work, kept, symlinks=True)
+            (state / "installed.json").write_text(json.dumps({"version": manifest["version"], "previous": "", "at": 0}) + "\n")
+            status["installed"] = manifest["version"]
+    (state / "status.json").write_text(json.dumps(status, indent=2) + "\n")
+    os.chmod(state / "status.json", 0o644)
+
+    # New device: first-time setup, and an identity of its own on first start.
+    marks = root / "var/lib/hp-os"
+    os.chmod(marks, 0o755)
+    (marks / "first-boot.qml").write_text("import QtQuick\nItem {}\n")
+    os.chmod(marks / "first-boot.qml", 0o644)
+    for identity in (root / "etc/machine-id", root / "var/lib/dbus/machine-id"):
+        if identity.is_file() and not identity.is_symlink():
+            identity.write_text("")
+    print("This image is connected to %s." % settings["repository"])
+    print("It starts on HP-OS %s." % manifest["version"] if current
+          else "It will offer HP-OS %s after its first start, because it was installed from a different build." % manifest["version"])
+
+
 def main():
     arguments = sys.argv[1:]
     if len(arguments) == 2 and arguments[0] == "setup":
@@ -185,6 +316,10 @@ def main():
         publish(arguments[1], "--skip-build-for-tests" in arguments)
     elif len(arguments) == 2 and arguments[0] == "bundle":
         bundle(arguments[1])
+    elif len(arguments) == 2 and arguments[0] == "image":
+        build_into_image(arguments[1])
+    elif arguments == ["is-published"]:
+        sys.exit(0 if head_is_published() else 1)
     elif arguments == ["status"]:
         settings = config()
         print("Repository: %s\nLast published: %s" % (settings.get("repository"), settings.get("version", "nothing yet")))
