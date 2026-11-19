@@ -299,6 +299,13 @@ LoginSurface {
             wrapMode: Text.Wrap
             maximumLineCount: 2
             text: root.core.hint
+            font.underline: root.core.offerRecovery
+            MouseArea {
+                anchors.fill: parent
+                enabled: root.core.offerRecovery
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.core.openRecovery()
+            }
             color: root.core.hintIsWarning ? root.core.danger : root.core.highlight
             font.family: root.core.fontMain
             font.pixelSize: root.type(15)

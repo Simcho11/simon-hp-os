@@ -41,6 +41,10 @@ ERASED = (
     "var/lib/bluetooth/*/[0-9A-F][0-9A-F]:*",
     "var/lib/hp-os/login-wallpapers/*",
     "var/lib/hp-os/welcome-updated.qml",
+    # The recovery key belongs to the people being erased; the next first-time setup makes a new one.
+    "var/lib/hp-os/recovery-key",
+    "var/lib/hp-os/recovery-key.qml",
+    "var/lib/hp-os/recovery-tries",
 )
 
 

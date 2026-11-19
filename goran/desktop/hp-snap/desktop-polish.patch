@@ -365,6 +365,43 @@ index 1c9dd35..36e0dc7 100644
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.disabled-on-external-mouse", label: "Off while a mouse is plugged in", kind: "switch", fallback: false },
  
          { section: "keyboard", group: "Pointer", niri: "input", key: "cursor.xcursor-theme", read: "cursor.theme", label: "Cursor", kind: "choice", choicesFrom: "cursors", fallback: "", keywords: ["cursor", "theme", "pointer"] },
+diff --git a/modules/settings/AccountsConfig.qml b/modules/settings/AccountsConfig.qml
+index 5e20c7c..582e9ca 100644
+--- a/modules/settings/AccountsConfig.qml
++++ b/modules/settings/AccountsConfig.qml
+@@ -720,5 +720,32 @@ Flickable {
+             }
+         }
+     }
++    // hp-snap: the device's recovery key (first-time setup shows it once; the login screen's
++    // "Forgot your password?" uses it). An administrator can replace a lost one.
++    AccountCard {
++        title: Translation.tr("Recovery key")
++        icon: "key"
++        visible: root.users.some(u => u.username === Quickshell.env("USER") && u.administrator)
++        ColumnLayout {
++            Layout.fillWidth: true
++            spacing: 10
++            IrisText {
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.muted
++                text: Translation.tr("If someone forgets their password, the recovery key lets them set a new one from the login screen. Lost yours? Make a new one. The old key stops working.")
++            }
++            RippleButton {
++                Layout.fillWidth: true
++                implicitHeight: 48
++                onClicked: Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-recovery-key"])
++                contentItem: IrisText {
++                    text: Translation.tr("Make a new recovery key…")
++                    horizontalAlignment: Text.AlignHCenter
++                    verticalAlignment: Text.AlignVCenter
++                }
++            }
++        }
++    }
+     }
+ }
 diff --git a/modules/settings/WelcomeConfig.qml b/modules/settings/WelcomeConfig.qml
 index 4820162..8127ba0 100644
 --- a/modules/settings/WelcomeConfig.qml

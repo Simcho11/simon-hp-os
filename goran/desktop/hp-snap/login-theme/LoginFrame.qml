@@ -253,10 +253,17 @@ LoginSurface {
                 anchors.left: parent.left
                 anchors.leftMargin: entry.x
                 width: parent.width - entry.x
-                visible: root.core.showHint && !root.core.failed
+                visible: root.core.showHint && (!root.core.failed || root.core.offerRecovery)
                 elide: Text.ElideRight
                 text: root.core.hint
                 color: root.core.hintIsWarning ? root.wrong : root.inkSoft
+                font.underline: root.core.offerRecovery
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: root.core.offerRecovery
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.core.openRecovery()
+                }
                 font.family: root.core.fontMain
                 font.pixelSize: root.type(14)
                 font.weight: Font.Medium

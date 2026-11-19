@@ -9,7 +9,8 @@ With --first-boot it is started by the hp-os-first-setup socket instead, for the
 that has never been set up: it makes the device's first account, an administrator. It refuses unless the
 device is marked as new and has no administrator yet. On such a device it also answers the welcome's Wi-Fi and
 Software Update steps, and the time zone step after the password: {"action": "wifi-list" | "wifi-join" |
-"update-check" | "update-install" | "update-status" | "restart" | "timezone-list" | "timezone-set"}.
+"update-check" | "update-install" | "update-status" | "restart" | "timezone-list" | "timezone-set" |
+"recovery-key"}. The recovery key itself is made and kept by /opt/hp-os/device/hp-os-recovery.
 """
 import ctypes
 import fcntl
@@ -39,6 +40,7 @@ FIRST_BOOT = "/var/lib/hp-os/first-boot.qml"
 NMCLI = "/usr/bin/nmcli"
 CONNECTIONS = "/etc/NetworkManager/system-connections"
 UPDATE_STATE = "/var/lib/hp-os/update"
+RECOVERY = "/opt/hp-os/device/hp-os-recovery"
 # Left for the welcome by the restart that finishes an update, so it carries on at the name step.
 UPDATED_MARK = "/var/lib/hp-os/welcome-updated.qml"
 ADMIN_GROUPS = ("sudo", "admin", "wheel")
@@ -333,8 +335,24 @@ def set_time_zone(request):
     return {"ok": True}
 
 
+def recovery_key():
+    """The new device's recovery key, shown once after the password step. Making it again replaces it."""
+    if not os.path.isfile(RECOVERY):
+        return {"ok": False, "error": "unavailable"}
+    made = run("/usr/bin/python3", "-I", RECOVERY, "new", timeout=60)
+    try:
+        answer = json.loads(made.stdout)
+    except ValueError:
+        answer = {}
+    if made.returncode != 0 or not isinstance(answer.get("key"), str):
+        return {"ok": False, "error": "The recovery key couldn’t be made."}
+    return {"ok": True, "key": answer["key"]}
+
+
 def welcome_step(request):
     action = request.get("action")
+    if action == "recovery-key":
+        return recovery_key()
     if action == "timezone-list":
         return {"ok": True, "zones": time_zones(), "current": current_zone()}
     if action == "timezone-set":

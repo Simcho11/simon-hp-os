@@ -23,10 +23,12 @@ ShellRoot {
 
     // ── The answers ──
     // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password,
-    // 8 time zone (new device only), 3 approve or set up, 4 done
-    property int step: firstBoot ? 5 : 0
+    // 9 recovery key, 8 time zone (new device only), 3 approve or set up, 4 done.
+    // Opened as the recovery key's own window: 10 reset a forgotten password, 11 reset done (login screen),
+    // or 12 an administrator's password, then 9 the new key (Settings).
+    property int step: firstBoot ? 5 : resetMode ? 10 : newKeyMode ? 12 : 0
     // Where each step sits in the flow, so screens slide the way the person is going.
-    function order(step) { return [0, 1, 2, 4, 5, -3, -2, -1, 3][step] }
+    function order(step) { return [0, 1, 2, 4, 5, -3, -2, -1, 3, 2.5, 0, 1, 0][step] }
     property Item activePage: null
     // Set by the first-setup service just before the restart that finishes an update: Wi-Fi and the update are done,
     // so the welcome carries on at "What's your name?" instead of starting over.
@@ -83,7 +85,7 @@ ShellRoot {
     }
 
     // ── Administrator approval ──
-    LazyLoader { id: agent; active: !app.preview && !app.firstBoot; PolkitAgent {} }
+    LazyLoader { id: agent; active: !app.preview && !app.firstBoot && !app.recoveryMode; PolkitAgent {} }
     readonly property var flow: agent.item ? agent.item.flow : null
     Connections {
         target: app.flow
@@ -280,6 +282,7 @@ ShellRoot {
                 { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
             else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
             else if (a === "timezone-list") previewZones.load(done)
+            else if (a === "recovery-key") done({ ok: true, key: mockRecovery.key })
             else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
             else if (a === "update-status") { mockLater.progress = Math.min(100, mockLater.progress + 9)
                 done({ ok: true, status: { state: mockLater.progress >= 100 ? "restart" : "downloading", progress: mockLater.progress,
@@ -349,11 +352,138 @@ ShellRoot {
         app.requestAccount(password)
     }
     function leaveTimeZone() {
-        app.heldPassword = ""
         app.zoneNotice = ""
+        if (app.recoveryKey) { app.step = 9; return }
+        app.heldPassword = ""
         app.step = 2
         passwordField.input.forceActiveFocus()
     }
+
+    // ── The recovery key (hp-os-recovery keeps only its hash) ──
+    // A new device shows it once, after the password. The login screen's "Forgot your password?" opens this app
+    // as HP_OS_RECOVERY=reset:<login> to set a new password with it; Settings opens it as "new" to replace a lost one.
+    readonly property string recovery: Quickshell.env("HP_OS_RECOVERY")
+    readonly property bool resetMode: app.recovery.indexOf("reset:") === 0
+    readonly property bool newKeyMode: app.recovery === "new"
+    readonly property bool recoveryMode: app.resetMode || app.newKeyMode
+    readonly property string recoveryLogin: app.resetMode ? app.recovery.slice(6) : app.newKeyMode ? Quickshell.env("USER") : ""
+    property string recoveryKey: ""
+    property var recoveryQr: []
+    property bool showQr: false
+    property string usbState: ""               // "", saving, saved, failed
+    property string usbMessage: ""
+    property var usbAnswer: null
+    property string recoveryNotice: ""
+    property bool recoveryBusy: false
+    Process {
+        id: recoveryRequest
+        property string message: ""
+        property var answer: null
+        property var then: null
+        stdinEnabled: true
+        command: ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/recovery.sock"]
+        stdout: SplitParser { onRead: line => { try { recoveryRequest.answer = JSON.parse(line) } catch (error) {} } }
+        onStarted: { recoveryRequest.write(recoveryRequest.message + "\n"); recoveryRequest.message = "" }
+        onExited: { const done = recoveryRequest.then; recoveryRequest.then = null; if (done) done(recoveryRequest.answer || { ok: false }) }
+    }
+    function askRecovery(message, done) {
+        if (app.preview) { mockRecovery.reply(message, done); return }
+        if (recoveryRequest.running) return
+        recoveryRequest.answer = null
+        recoveryRequest.then = done
+        recoveryRequest.message = JSON.stringify(message)
+        recoveryRequest.running = true
+    }
+    // The QR code holds just the key, drawn here by qrencode (from stdin, so the key never shows in a process list).
+    Process {
+        id: qrMaker
+        stdinEnabled: true
+        command: [Quickshell.env("HP_OS_QRENCODE") || "qrencode", "-t", "ASCII", "-m", "0", "-l", "M"]
+        stdout: StdioCollector {
+            onStreamFinished: app.recoveryQr = this.text.split("\n").filter(line => line.length > 0).map(line => {
+                let row = ""
+                for (let i = 0; i < line.length; i += 2) row += line.charAt(i) === "#" ? "1" : "0"
+                return row
+            })
+        }
+        onStarted: { qrMaker.write(app.recoveryKey); qrMaker.stdinEnabled = false }
+    }
+    function useRecoveryKey(key) {
+        app.recoveryKey = key
+        app.recoveryQr = []
+        app.showQr = false
+        app.usbState = ""; app.usbMessage = ""
+        qrMaker.stdinEnabled = true
+        qrMaker.running = true
+    }
+    function showRecoveryKey(password) {
+        app.heldPassword = password
+        if (app.recoveryKey) { app.step = 9; return }
+        app.ask({ action: "recovery-key" }, answer => {
+            if (answer.ok && answer.key) { app.useRecoveryKey(String(answer.key)); app.step = 9 }
+            else app.chooseTimeZone(app.heldPassword)      // A device without the recovery helper goes straight on.
+        })
+    }
+    function recoveryKeySaved() {
+        if (app.firstBoot) app.chooseTimeZone(app.heldPassword)
+        else Qt.quit()
+    }
+    // Saving shows for at least a moment, so a quick save still reads as saved.
+    function saveToUsb() {
+        if (app.usbState === "saving" || !app.recoveryKey) return
+        app.usbState = "saving"; app.usbMessage = ""; app.usbAnswer = null
+        usbMinimum.restart()
+        app.askRecovery({ action: "save-usb", key: app.recoveryKey }, answer => { app.usbAnswer = answer; app.usbFinished() })
+    }
+    Timer { id: usbMinimum; interval: 1200; onTriggered: app.usbFinished() }
+    function usbFinished() {
+        const answer = app.usbAnswer
+        if (!answer || usbMinimum.running) return
+        app.usbAnswer = null
+        if (answer.ok) { app.usbState = "saved"; app.usbMessage = "Saved to " + (answer.saved || "the USB stick") + ". You can remove it." }
+        else { app.usbState = "failed"; app.usbMessage = answer.error || "The key couldn’t be saved. Try again." }
+    }
+    function resetPassword(key, password) {
+        if (app.recoveryBusy) return
+        app.recoveryBusy = true; app.recoveryNotice = ""
+        app.askRecovery({ action: "reset", user: app.recoveryLogin, key: key, password: password }, answer => {
+            app.recoveryBusy = false
+            if (answer.ok) { app.step = 11; return }
+            app.recoveryNotice = answer.error || "The password couldn’t be reset. Nothing was changed."
+            keyField.input.forceActiveFocus()
+        })
+    }
+    function makeNewKey(password) {
+        if (app.recoveryBusy) return
+        app.recoveryBusy = true; app.recoveryNotice = ""
+        app.askRecovery({ action: "new", password: password }, answer => {
+            app.recoveryBusy = false
+            if (answer.ok && answer.key) { app.useRecoveryKey(String(answer.key)); app.step = 9; return }
+            app.recoveryNotice = answer.error || "A new key couldn’t be made. Nothing was changed."
+            ownPasswordField.input.forceActiveFocus()
+        })
+    }
+    // Their name, for the picture at the top.
+    Process {
+        id: whoIs
+        command: ["/usr/bin/getent", "passwd", app.recoveryLogin]
+        stdout: StdioCollector { onStreamFinished: { const fields = this.text.split(":"); if (fields.length > 4) app.fullName = fields[4].split(",")[0] || fields[0] } }
+    }
+    QtObject {
+        id: mockRecovery
+        readonly property string key: "7KQM-3XRA-PL9D-W2HF-8TVN-C4ZE"
+        property var pending: null
+        function reply(message, done) {
+            const a = message.action
+            if (a === "save-usb") later(() => done({ ok: true, saved: "SanDisk 3.2Gen1" }), 1600)
+            else if (a === "reset") later(() => done(String(message.key).replace(/[^A-Za-z0-9]/g, "").toUpperCase() === key.replace(/-/g, "")
+                ? { ok: true } : { ok: false, error: "That recovery key isn’t right. Check it and try again." }), 800)
+            else if (a === "new") later(() => done(message.password === "wrong" ? { ok: false, error: "That password isn’t correct." } : { ok: true, key: key }), 800)
+            else done({ ok: false })
+        }
+        function later(job, ms) { mockRecoveryLater.job = job; mockRecoveryLater.interval = ms; mockRecoveryLater.restart() }
+    }
+    Timer { id: mockRecoveryLater; property var job: null; onTriggered: if (job) job() }
 
     function requestAccount(password) {
         app.notice = ""
@@ -431,6 +561,12 @@ ShellRoot {
         handoff.running = true
     }
     Component.onCompleted: {
+        if (app.recoveryMode) {
+            if (app.recoveryLogin) whoIs.running = true
+            Qt.callLater(() => (app.resetMode ? keyField : ownPasswordField).input.forceActiveFocus())
+            if (app.preview && Quickshell.env("HP_OS_ADD_USER_STEP") === "9") { app.useRecoveryKey(mockRecovery.key); app.step = 9 }
+            return
+        }
         Quickshell.execDetached(["/bin/rm", "-f", app.stateDir + "/account.qml", app.signInFile])
         const start = Quickshell.env("HP_OS_ADD_USER_STEP")
         if (app.preview && start) {
@@ -440,6 +576,7 @@ ShellRoot {
             if (app.step === 6) app.scanWifi()
             if (app.step === 7) app.startUpdate()
             if (app.step === 8) app.chooseTimeZone("previewpassword")
+            if (app.step === 9) { app.step = 2; app.showRecoveryKey("previewpassword") }
         }
     }
 
@@ -448,10 +585,10 @@ ShellRoot {
     FloatingWindow {
         id: win
         visible: true
-        title: "Add user"
+        title: app.resetMode ? "Reset password" : app.newKeyMode ? "Recovery key" : "Add user"
         color: "black"
-        implicitWidth: 1440
-        implicitHeight: 900
+        implicitWidth: app.newKeyMode ? 1120 : 1440
+        implicitHeight: app.newKeyMode ? 820 : 900
         readonly property real d: Math.max(0.75, Math.min(2.2, Math.min(height / 1000, width / 1500)))
         function px(n) { return Math.round(n * d) }
 
@@ -563,6 +700,58 @@ ShellRoot {
             font.pixelSize: win.px(19)
         }
         component Gap: Item { width: 1; property real size: 12; height: win.px(size) }
+        // A small white line drawing: qr, key, usb, done, or a turning arc for busy.
+        component Glyph: Canvas {
+            id: glyph
+            property string shape: ""
+            width: win.px(20); height: width
+            onShapeChanged: { if (glyph.shape !== "busy") glyph.rotation = 0; requestPaint() }
+            RotationAnimation on rotation { running: glyph.shape === "busy"; loops: Animation.Infinite; from: 0; to: 360; duration: 900 }
+            onPaint: {
+                const c = getContext("2d"), w = width, u = w / 20
+                c.reset()
+                c.strokeStyle = "white"; c.fillStyle = "white"
+                c.lineWidth = Math.max(1.2, 1.8 * u); c.lineCap = "round"; c.lineJoin = "round"
+                if (glyph.shape === "qr") {
+                    for (const [x, y] of [[2, 2], [12, 2], [2, 12]]) { c.beginPath(); c.roundedRect(x * u, y * u, 6 * u, 6 * u, 1.4 * u, 1.4 * u); c.stroke() }
+                    for (const [x, y] of [[12.5, 12.5], [16, 16], [12.5, 16.5], [16.5, 12.5]]) c.fillRect(x * u, y * u, 2.2 * u, 2.2 * u)
+                } else if (glyph.shape === "key") {
+                    c.beginPath(); c.arc(6.5 * u, 10 * u, 4 * u, 0, 2 * Math.PI); c.stroke()
+                    c.beginPath(); c.moveTo(10.5 * u, 10 * u); c.lineTo(18 * u, 10 * u); c.moveTo(15 * u, 10 * u); c.lineTo(15 * u, 13.5 * u)
+                    c.moveTo(18 * u, 10 * u); c.lineTo(18 * u, 13 * u); c.stroke()
+                } else if (glyph.shape === "usb") {
+                    c.beginPath(); c.moveTo(10 * u, 2.5 * u); c.lineTo(10 * u, 13 * u); c.moveTo(5.5 * u, 8.5 * u); c.lineTo(10 * u, 13 * u)
+                    c.lineTo(14.5 * u, 8.5 * u); c.moveTo(3.5 * u, 17.5 * u); c.lineTo(16.5 * u, 17.5 * u); c.stroke()
+                } else if (glyph.shape === "done") {
+                    c.beginPath(); c.moveTo(4 * u, 10.5 * u); c.lineTo(8.5 * u, 15 * u); c.lineTo(16.5 * u, 5.5 * u); c.stroke()
+                } else if (glyph.shape === "busy") {
+                    c.beginPath(); c.arc(10 * u, 10 * u, 7 * u, -Math.PI / 2, Math.PI); c.stroke()
+                }
+            }
+        }
+        // A see-through pill with a glyph, like the rows in the Wi-Fi and time zone lists.
+        component Tool: Rectangle {
+            id: tool
+            property string label: ""
+            property string shape: ""
+            property bool busy: false
+            signal activated()
+            width: toolRow.implicitWidth + win.px(48); height: win.px(50)
+            radius: height / 2
+            color: Qt.rgba(1, 1, 1, toolHit.pressed ? 0.24 : toolHit.containsMouse && !tool.busy ? 0.18 : 0.12)
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 0.2)
+            Behavior on color { ColorAnimation { duration: 140 } }
+            Behavior on width { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+            Row {
+                id: toolRow
+                anchors.centerIn: parent
+                spacing: win.px(10)
+                Glyph { anchors.verticalCenter: parent.verticalCenter; shape: tool.busy ? "busy" : tool.shape }
+                Label { anchors.verticalCenter: parent.verticalCenter; text: tool.label; font.pixelSize: win.px(17); font.weight: Font.Medium }
+            }
+            MouseArea { id: toolHit; anchors.fill: parent; hoverEnabled: true; enabled: !tool.busy; cursorShape: Qt.PointingHandCursor; onClicked: tool.activated() }
+        }
         component Note: Label {
             anchors.horizontalCenter: parent.horizontalCenter
             width: win.px(520)
@@ -645,7 +834,8 @@ ShellRoot {
             anchors.horizontalCenter: parent.horizontalCenter
             y: Math.round(parent.height * 0.17)
             width: win.px(app.step === 4 ? 132 : 112); height: width
-            icon: app.faceUrl(app.face)
+            icon: app.recoveryMode ? "" : app.faceUrl(app.face)
+            account: app.recoveryLogin
             name: app.fullName.trim() || " "
             fontFamily: "HarmonyOS Sans"
             Behavior on width { NumberAnimation { duration: 520; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
@@ -968,7 +1158,7 @@ ShellRoot {
                 if (!ready) return
                 const password = passwordField.text
                 passwordField.text = ""; verifyField.text = ""
-                if (app.firstBoot) app.chooseTimeZone(password)
+                if (app.firstBoot) app.showRecoveryKey(password)
                 else app.requestAccount(password)
             }
         }
@@ -1088,6 +1278,191 @@ ShellRoot {
             Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Back"; onActivated: app.leaveTimeZone() }
         }
 
+        // ── The recovery key: once on a new device, or a new one from Settings ──
+        Page {
+            index: 9
+            Title { text: app.newKeyMode ? "Your new recovery key" : "Save your recovery key" }
+            Subtitle {
+                text: app.newKeyMode ? "Your old key no longer works. If you forget your password, this one lets you set a new one."
+                    : "If you forget your password, this key lets you set a new one and keep all your files."
+            }
+            Gap { size: 14 }
+            Rectangle {
+                id: keyCard
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: win.px(440)
+                height: app.showQr ? win.px(250) : win.px(106)
+                radius: app.showQr ? win.px(30) : height / 2
+                color: "white"
+                Behavior on height { NumberAnimation { duration: 320; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
+                Behavior on radius { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+                Label {
+                    anchors.centerIn: parent
+                    opacity: app.showQr ? 0 : 1
+                    Behavior on opacity { NumberAnimation { duration: 160 } }
+                    text: app.recoveryKey.slice(0, 14) + "\n" + app.recoveryKey.slice(15)
+                    color: "#0b2a6b"
+                    font.pixelSize: win.px(28); font.weight: Font.Medium; font.letterSpacing: win.px(2)
+                    lineHeight: 1.25
+                }
+                Canvas {
+                    id: qrCanvas
+                    anchors.centerIn: parent
+                    width: win.px(210); height: width
+                    opacity: app.showQr ? 1 : 0
+                    visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: 200 } }
+                    Connections { target: app; function onRecoveryQrChanged() { qrCanvas.requestPaint() } }
+                    onWidthChanged: requestPaint()
+                    onPaint: {
+                        const c = getContext("2d"), rows = app.recoveryQr
+                        c.reset()
+                        if (rows.length === 0) return
+                        const cell = Math.floor(width / rows.length), offset = Math.floor((width - cell * rows.length) / 2)
+                        c.fillStyle = "#0b2a6b"
+                        for (let y = 0; y < rows.length; y++)
+                            for (let x = 0; x < rows[y].length; x++)
+                                if (rows[y].charAt(x) === "1") c.fillRect(offset + x * cell, offset + y * cell, cell, cell)
+                    }
+                }
+            }
+            Gap { size: 2 }
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: win.px(12)
+                Tool {
+                    visible: app.recoveryQr.length > 0
+                    shape: app.showQr ? "key" : "qr"
+                    label: app.showQr ? "Show the key" : "Show QR code"
+                    onActivated: app.showQr = !app.showQr
+                }
+                Tool {
+                    shape: app.usbState === "saved" ? "done" : "usb"
+                    busy: app.usbState === "saving"
+                    label: app.usbState === "saving" ? "Saving…" : app.usbState === "saved" ? "Saved" : "Save to USB stick"
+                    onActivated: app.saveToUsb()
+                }
+            }
+            Note {
+                color: app.usbState === "failed" ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8)
+                text: app.usbMessage.length > 0 ? app.usbMessage
+                    : app.showQr ? "Point your phone’s camera here to save the key on your phone."
+                    : "Keep it away from this laptop. You won’t see it again here."
+            }
+            Gap { size: 4 }
+            Primary {
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: "I’ve saved it"
+                ready: app.usbState !== "saving"
+                onActivated: app.recoveryKeySaved()
+            }
+            Quiet {
+                visible: app.firstBoot
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Back"
+                onActivated: { app.heldPassword = ""; app.step = 2; passwordField.input.forceActiveFocus() }
+            }
+        }
+
+        // ── Forgot password: a new one with the recovery key (opened from the login screen) ──
+        Page {
+            index: 10
+            Title { text: "Reset your password" }
+            Subtitle { text: "Type the recovery key you saved when this device was set up, then choose a new password." }
+            Gap { size: 14 }
+            Field {
+                id: keyField
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Recovery key"
+                input.maximumLength: 40
+                input.font.capitalization: Font.AllUppercase
+                input.inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferUppercase
+                input.onTextChanged: app.recoveryNotice = ""
+                onAccepted: newPasswordField.input.forceActiveFocus()
+            }
+            Field {
+                id: newPasswordField
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "New password"; secret: true
+                input.maximumLength: 256
+                onAccepted: againField.input.forceActiveFocus()
+            }
+            Field {
+                id: againField
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Verify new password"; secret: true
+                failed: resetPage.mismatch
+                input.maximumLength: 256
+                onAccepted: resetPage.go()
+            }
+            Note {
+                color: app.recoveryNotice.length > 0 || resetPage.mismatch ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.72)
+                text: app.recoveryNotice.length > 0 ? app.recoveryNotice
+                    : resetPage.mismatch ? "Those passwords don’t match."
+                    : "Use at least 8 characters."
+            }
+            Gap { size: 8 }
+            Primary {
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: app.recoveryBusy ? "Checking…" : "Reset password"
+                ready: resetPage.ready
+                onActivated: resetPage.go()
+            }
+            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Cancel"; onActivated: if (!app.recoveryBusy) Qt.quit() }
+        }
+        QtObject {
+            id: resetPage
+            readonly property bool mismatch: againField.text.length > 0 && againField.text !== newPasswordField.text
+            readonly property bool ready: !app.recoveryBusy && keyField.text.replace(/[^A-Za-z0-9]/g, "").length === 24
+                && newPasswordField.text.length >= 8 && againField.text === newPasswordField.text
+            function go() {
+                if (!ready) return
+                const key = keyField.text, password = newPasswordField.text
+                newPasswordField.text = ""; againField.text = ""
+                app.resetPassword(key, password)
+            }
+        }
+        Page {
+            index: 11
+            Title { text: "Your password is reset" }
+            Subtitle { text: "Sign in with your new password. An app that saved passwords may ask for your old one once." }
+            Gap { size: 22 }
+            Primary { anchors.horizontalCenter: parent.horizontalCenter; label: "Back to sign in"; onActivated: Qt.quit() }
+        }
+
+        // ── A new recovery key (opened from Settings): the administrator's own password first ──
+        Page {
+            index: 12
+            Title { text: "Make a new recovery key" }
+            Subtitle { text: "Your old key will stop working. Type your password to continue." }
+            Gap { size: 14 }
+            Field {
+                id: ownPasswordField
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Your password"; secret: true
+                failed: app.recoveryNotice.length > 0
+                input.maximumLength: 256
+                input.onTextChanged: if (ownPasswordField.text.length > 0) app.recoveryNotice = ""
+                onAccepted: newKeyPage.go()
+            }
+            Note { color: "#ffb4ab"; text: app.recoveryNotice.length > 0 ? app.recoveryNotice : " " }
+            Gap { size: 8 }
+            Primary {
+                id: newKeyPage
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: app.recoveryBusy ? "Checking…" : "Continue"
+                ready: !app.recoveryBusy && ownPasswordField.text.length > 0
+                function go() {
+                    if (!ready) return
+                    const password = ownPasswordField.text
+                    ownPasswordField.text = ""
+                    app.makeNewKey(password)
+                }
+                onActivated: go()
+            }
+            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Cancel"; onActivated: if (!app.recoveryBusy) Qt.quit() }
+        }
+
         // ── 4. An administrator approves ──
         Page {
             index: 3
@@ -1196,8 +1571,8 @@ ShellRoot {
 
         // Where you are: four quiet dots (name, picture, password, then approval or the time zone).
         Row {
-            readonly property int at: app.step === 8 ? 3 : app.step
-            visible: app.firstBoot ? (app.step < 3 || app.step === 8) : app.step < 4
+            readonly property int at: app.step === 8 || app.step === 9 ? 3 : app.step
+            visible: !app.recoveryMode && (app.firstBoot ? (app.step < 3 || app.step === 8 || app.step === 9) : app.step < 4)
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             anchors.bottomMargin: win.px(46)
@@ -1224,9 +1599,10 @@ ShellRoot {
         }
         Shortcut {
             sequences: ["Return", "Enter"]
-            enabled: app.step === 4 || app.step === 1 || app.step === 5
+            enabled: app.step === 4 || app.step === 1 || app.step === 5 || app.step === 11
             onActivated: {
-                if (app.step === 5) app.startWifi()
+                if (app.step === 11) Qt.quit()
+                else if (app.step === 5) app.startWifi()
                 else if (app.step === 4) app.continueToDesktop()
                 else { app.step = 2; passwordField.input.forceActiveFocus() }
             }
@@ -1242,6 +1618,8 @@ ShellRoot {
                 else if (app.step === 1) { app.step = 0; nameField.input.forceActiveFocus() }
                 else if (app.step === 2) { app.step = 1; win.contentItem.forceActiveFocus() }
                 else if (app.step === 8 && !app.settingZone) app.leaveTimeZone()
+                else if (app.step === 9 && app.firstBoot) { app.heldPassword = ""; app.step = 2; passwordField.input.forceActiveFocus() }
+                else if (app.recoveryMode && !app.recoveryBusy) Qt.quit()
                 else if (app.step === 3 && !app.working) app.cancelApproval()
             }
         }

@@ -102,6 +102,7 @@ QtObject {
         core.userIndex = (core.userIndex + 1) % userModel.count
         core.failed = false
         core.notice = ""
+        core.failures = 0
         if (core.field) { core.field.text = ""; core.field.forceActiveFocus() }
     }
     function nextSession() { core.sessionIndex = (core.sessionIndex + 1) % sessionModel.count }
@@ -144,13 +145,27 @@ QtObject {
         function onLoginFailed() {
             core.signingIn = false
             core.failed = true
+            core.failures++
             if (core.field) { core.field.text = ""; core.field.forceActiveFocus() }
             core.rejected()
         }
         function onInformationMessage(message) { core.notice = String(message || "") }
     }
+    // HP-OS: after three wrong passwords, the hint offers the recovery key (only on a device that has one).
+    // hp-os-recovery leaves the tiny QML mark so this screen can tell without any privileges.
+    property int failures: 0
+    property Loader recoveryMark: Loader { source: "file:///var/lib/hp-os/recovery-key.qml" }
+    readonly property bool offerRecovery: core.failures >= 3 && core.recoveryMark.status === Loader.Ready
+        && !core.addedChosen && core.userLogin.length > 0
+    function openRecovery() {
+        if (!core.offerRecovery) return
+        core.failures = 0
+        core.failed = false
+        Qt.openUrlExternally("hpos-add-user:recover:" + core.userLogin)
+    }
     readonly property string hint: core.signingIn ? ""
         : core.notice.length > 0 ? core.notice
+        : core.offerRecovery ? "Forgot your password? Reset it with your recovery key."
         : core.failed ? core.text.loginFailed
         : keyboard.capsLock ? core.text.capslockWarning : ""
     readonly property bool hintIsWarning: !core.signingIn && (core.failed || core.notice.length > 0)

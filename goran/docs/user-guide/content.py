@@ -39,11 +39,15 @@ chapter("setup", "Getting Started",
           "<b>What’s your name?</b> Enter your full name. HP-OS suggests a username to use behind the scenes. Click <b>Change</b> if you’d like a different one (lowercase letters, numbers, hyphens and underscores).",
           "<b>Choose a picture.</b> Keep your initial, or pick one of the pictures shown. This is how you’ll appear on this device.",
           "<b>Create a password.</b> Use at least 8 characters, then type it again to verify. You’ll use it to sign in and to approve changes to the device.",
+          "<b>Save your recovery key.</b> Setup shows a 24-character key that lets you set a new password if you ever forget yours. Write it down, choose <b>Show QR code</b> and take a photo of it with your phone, or plug in a USB stick and choose <b>Save to USB stick</b>. Then click <b>I’ve saved it</b>. You won’t see this key again.",
+          "<b>Choose your time zone.</b> Search for your country or a city, select it and click <b>Continue</b>.",
           "HP-OS prepares your desktop. When it’s ready, you’re signed in."),
     '<div class="pair">' + fig("setup-wifi.jpg", "Connect to Wi-Fi, or set up without it.", "half")
         + fig("setup-name.jpg", "The first person becomes the administrator.", "half") + "</div>",
+    '<div class="pair">' + fig("setup-recovery.jpg", "Your recovery key is shown once.", "half")
+        + fig("setup-recovery-qr.jpg", "Show QR code, then take a photo with your phone.", "half") + "</div>",
     note("The first account created during setup is an <b>administrator</b>. Administrators can add people, "
-         "install updates and reset the device. Keep your password somewhere safe."),
+         "install updates and reset the device. Keep your password and your recovery key somewhere safe, apart from the device."),
     h2("setup-first", "Your first few minutes"),
     ul("<b>Connect your Microsoft account</b>: open Word or Outlook from the <b>Microsoft 365</b> folder on the desktop and sign in.",
        "<b>Sign in to Chrome</b> to bring over your bookmarks and saved passwords.",
@@ -145,8 +149,21 @@ chapter("signin", "Signing In, Locking and Accounts",
         ["<b>Administrator</b>", "Everything a standard user can, plus add and remove people, reset passwords, install updates and reset the device."],
         ["<b>Standard</b>", "Use apps, keep files and personalize their own desktop and settings."],
     ], "compact"),
-    note("Forgot your password? Ask another administrator to reset it in <b>Users &amp; Accounts</b>. "
-         "Saved website passwords may still need your old password.", "note"),
+    h2("signin-forgot", "If you forget your password"),
+    p("After three wrong passwords, the login screen shows <b>Forgot your password? Reset it with your recovery key.</b>"),
+    steps("Click that line on the login screen.",
+          "Type your recovery key. Capital letters, spaces and dashes don’t matter.",
+          "Type a new password twice, then click <b>Reset password</b>.",
+          "Click <b>Back to sign in</b> and sign in with your new password. Your files and apps are just as you left them."),
+    p("Another administrator can also set a new password for you in <b>Users &amp; Accounts</b>."),
+    note("After five wrong recovery keys, HP-OS makes you wait a minute before trying again, and longer after each wrong key. "
+         "An app that saved passwords, such as Chrome, may ask for your old password once.", "note"),
+    h2("signin-key", "Make a new recovery key"),
+    p("Lost your recovery key? An administrator can make a new one: open <b>Settings › Users &amp; Accounts</b>, choose "
+      "<b>Make a new recovery key…</b> and type your password. The new key appears once, with the same QR code and USB stick options. "
+      "Your old key stops working straight away."),
+    note("Anyone with the recovery key can set a new password on this device. Keep it private and away from the device, "
+         "like a spare house key.", "warn"),
 )
 
 # ================================================================ 5 Desktop

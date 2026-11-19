@@ -27,8 +27,15 @@ pkgs.runCommand "hp-os-add-user" { } ''
   cat > "$out/bin/hp-os-add-user" <<EOF
   #!/bin/sh
   export HP_OS_ADD_USER_HELPER="$app/accounts.py"
-  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
-  [ "\$1" != "hpos-add-user:first-boot" ] || export HP_OS_FIRST_BOOT=1
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic HP_OS_QRENCODE=${pkgs.qrencode}/bin/qrencode
+  case "\$1" in
+    hpos-add-user:first-boot) export HP_OS_FIRST_BOOT=1 ;;
+    # The login screen's "Forgot your password?": a new password with the recovery key, for that login only.
+    hpos-add-user:recover:*)
+      who="\''${1#hpos-add-user:recover:}"
+      case "\$who" in ""|-*|*[!a-z0-9_-]*) exit 1 ;; esac
+      export HP_OS_RECOVERY="reset:\$who" ;;
+  esac
   exec ${quickshell}/bin/quickshell -n -p "$app/shell.qml"
   EOF
   sed -i 's/^  //' "$out/bin/hp-os-add-user"
@@ -42,6 +49,15 @@ pkgs.runCommand "hp-os-add-user" { } ''
   EOF
   sed -i 's/^  //' "$out/bin/hp-os-factory-reset"
   chmod +x "$out/bin/hp-os-factory-reset"
+
+  # Settings > Users & Accounts > Recovery key: an administrator makes a new one.
+  cat > "$out/bin/hp-os-recovery-key" <<EOF
+  #!/bin/sh
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic HP_OS_RECOVERY=new HP_OS_QRENCODE=${pkgs.qrencode}/bin/qrencode
+  exec ${quickshell}/bin/quickshell -n -p "$app/shell.qml"
+  EOF
+  sed -i 's/^  //' "$out/bin/hp-os-recovery-key"
+  chmod +x "$out/bin/hp-os-recovery-key"
 
   # Settings > General > Software Update.
   cat > "$out/bin/hp-os-software-update" <<EOF

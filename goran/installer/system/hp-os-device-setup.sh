@@ -17,10 +17,12 @@ state=/var/lib/hp-os
 
 if [[ "${1:-}" == --undo ]]; then
     systemctl disable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-factory-wipe.service \
-        hp-os-update.socket hp-os-update-check.timer hp-os-update-settle.service hp-os-login-wallpaper.socket 2>/dev/null || true
+        hp-os-update.socket hp-os-update-check.timer hp-os-update-settle.service hp-os-login-wallpaper.socket \
+        hp-os-recovery.socket 2>/dev/null || true
     rm -f "$units"/hp-os-update.socket "$units"/hp-os-update@.service "$units"/hp-os-update-job.service \
           "$units"/hp-os-update-check.service "$units"/hp-os-update-check.timer "$units"/hp-os-update-settle.service \
-          "$units"/hp-os-login-wallpaper.socket "$units"/hp-os-login-wallpaper@.service
+          "$units"/hp-os-login-wallpaper.socket "$units"/hp-os-login-wallpaper@.service \
+          "$units"/hp-os-recovery.socket "$units"/hp-os-recovery@.service
     rm -f "$units"/hp-os-factory-reset.socket "$units"/hp-os-factory-reset@.service "$units"/hp-os-first-setup.socket \
           "$units"/hp-os-first-setup@.service "$units"/hp-os-factory-wipe.service "$state/factory-reset-request"
     rm -rf /opt/hp-os/device
@@ -50,6 +52,8 @@ install -m 644 -o root -g root "$here/hp_os_release.py" /opt/hp-os/device/hp_os_
 /usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-login-wallpaper.py"
 install -m 755 -o root -g root "$here/hp-os-login-wallpaper.py" /opt/hp-os/device/hp-os-login-wallpaper
 install -d -m 755 "$state/login-wallpapers"
+/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-recovery.py"
+install -m 755 -o root -g root "$here/hp-os-recovery.py" /opt/hp-os/device/hp-os-recovery
 
 # Downloads and builds run as this account, which can't touch anyone's files.
 id hp-os-updater >/dev/null 2>&1 || useradd --system --home-dir "$state/update/home" --shell /usr/sbin/nologin hp-os-updater
@@ -190,6 +194,30 @@ StandardOutput=journal
 StandardError=journal
 TimeoutSec=60
 UNIT
+# The recovery key: first-time setup makes it, the login screen's Forgot password? uses it (only when asked).
+cat > "$units/hp-os-recovery.socket" <<UNIT
+[Unit]
+Description=HP-OS recovery key requests
+
+[Socket]
+ListenStream=/run/hp-os/recovery.sock
+SocketMode=0666
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+UNIT
+cat > "$units/hp-os-recovery@.service" <<UNIT
+[Unit]
+Description=HP-OS recovery key request
+
+[Service]
+ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-recovery request
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+TimeoutSec=120
+UNIT
 cat > "$units/hp-os-update-settle.service" <<UNIT
 [Unit]
 Description=Finish an HP-OS software update after its restart
@@ -217,7 +245,7 @@ WantedBy=timers.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-update.socket hp-os-update-check.timer \
-    hp-os-login-wallpaper.socket >/dev/null
+    hp-os-login-wallpaper.socket hp-os-recovery.socket >/dev/null
 systemctl enable hp-os-factory-wipe.service hp-os-update-settle.service >/dev/null
 
 # Laptops made with the USB installer show the HP logo early in startup.
