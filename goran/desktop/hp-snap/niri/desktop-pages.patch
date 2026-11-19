@@ -1,0 +1,568 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index f2477cc..9015d31 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -71,6 +71,13 @@ pub enum Request {
+     DesktopPageLayersSupported,
+     /// Query support for fixed desktop indicators above all wallpaper surfaces.
+     DesktopRailStackingSupported,
++    /// Tell the compositor which desktop pages of an output hold icons or widgets, so they stay.
++    DesktopPageContent {
++        /// Output the pages belong to.
++        output: String,
++        /// Page numbers (1 is the first page) with icons or widgets on them.
++        pages: Vec<u32>,
++    },
+     /// Drive a workspace swipe. The compositor cancels it if this connection closes.
+     DesktopSwipe(DesktopSwipe),
+     /// hp-snap patch: where each app's dock icon is on an output, so minimizing a window flies
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 2003345..702929a 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -357,6 +357,13 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+         | Request::DesktopPageLayersSupported
+         | Request::DesktopRailStackingSupported => Response::Handled,
+         Request::DesktopSwipe(_) => unreachable!("desktop swipes are connection-scoped"),
++        Request::DesktopPageContent { output, pages } => {
++            ctx.event_loop.insert_idle(move |state| {
++                state.niri.layout.set_desktop_page_content(&output, pages);
++                state.niri.queue_redraw_all();
++            });
++            Response::Handled
++        }
+         Request::SetDockIcons(dock) => {
+             let icons: Vec<(String, f64, f64)> = dock
+                 .icons
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 76f25da..74b217a 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1216,6 +1216,17 @@ impl<W: LayoutElement> Layout<W> {
+         match &mut self.monitor_set {
+             MonitorSet::Normal { monitors, .. } => {
+                 for mon in monitors {
++                    if !mon.options.layout.empty_workspace_above_first {
++                        // hp-snap patch: the desktop page rules decide which empty pages stay.
++                        let Some(idx) = mon.workspaces.iter().position(|ws| ws.has_window(window)) else {
++                            continue;
++                        };
++                        let removed = mon.workspaces[idx].remove_tile(window, transaction);
++                        if mon.workspace_switch.is_none() {
++                            mon.clean_up_workspaces();
++                        }
++                        return Some(removed);
++                    }
+                     for (idx, ws) in mon.workspaces.iter_mut().enumerate() {
+                         if ws.has_window(window) {
+                             let removed = ws.remove_tile(window, transaction);
+@@ -4635,17 +4646,36 @@ impl<W: LayoutElement> Layout<W> {
+             }
+         }
+ 
+-        // hp-snap patch: the desktop stays only when the window really went to another desktop on the same screen.
++        // hp-snap patch: from here on the page rules decide: a page left empty between pages in use stays, an
++        // empty page at the end goes.
+         if let Some(source) = kept_source {
+-            let dropped = self
+-                .workspaces_mut()
+-                .find(|ws| ws.has_window(window))
+-                .map(|ws| (ws.id(), ws.current_output().cloned()));
+-            let carried_away = self.workspaces_mut().find(|ws| ws.id() == source).is_some_and(|ws| {
+-                dropped.as_ref().is_some_and(|(id, output)| *id != source && ws.current_output() == output.as_ref())
+-            });
+-            if !carried_away {
+-                self.stop_keeping_desktop(source);
++            self.stop_keeping_desktop(source);
++        }
++    }
++
++    /// hp-snap patch: tell a screen which of its desktop pages hold icons or widgets.
++    pub fn set_desktop_page_content(&mut self, output_name: &str, pages: Vec<u32>) {
++        if let Some(mon) = self.monitors_mut().find(|mon| mon.output_name() == output_name) {
++            mon.set_content_pages(pages);
++        }
++    }
++
++    /// hp-snap patch: pages added in the Overview stay while it is open; afterwards the page rules decide.
++    fn forget_overview_pages(&mut self) {
++        let carried = match &self.interactive_move {
++            Some(InteractiveMoveState::Moving(move_)) => move_.kept_source,
++            _ => None,
++        };
++        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
++            for mon in monitors {
++                for ws in &mut mon.workspaces {
++                    if Some(ws.id()) != carried {
++                        ws.keep_empty = false;
++                    }
++                }
++                if mon.workspace_switch.is_none() {
++                    mon.clean_up_workspaces();
++                }
+             }
+         }
+     }
+@@ -4929,6 +4959,9 @@ impl<W: LayoutElement> Layout<W> {
+         )));
+ 
+         self.set_monitors_overview_state();
++        if !self.overview_open {
++            self.forget_overview_pages();
++        }
+     }
+ 
+     pub fn open_overview(&mut self) -> bool {
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 0821575..a0a054b 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -72,6 +72,8 @@ pub struct Monitor<W: LayoutElement> {
+     pub(super) workspace_switch: Option<WorkspaceSwitch>,
+     /// Output-local tile origin while carrying a window through a workspace animation.
+     carried_window: Option<(W::Id, Point<f64, Logical>)>,
++    /// hp-snap patch: page numbers (1 is the first visible page) holding desktop icons or widgets.
++    content_pages: Vec<u32>,
+     /// Indication where an interactively-moved window is about to be placed.
+     pub(super) insert_hint: Option<InsertHint>,
+     /// Insert hint element for rendering.
+@@ -348,6 +350,7 @@ impl<W: LayoutElement> Monitor<W> {
+             overview_progress: None,
+             workspace_switch: None,
+             carried_window: None,
++            content_pages: Vec::new(),
+             clock,
+             base_options,
+             options,
+@@ -463,6 +466,17 @@ impl<W: LayoutElement> Monitor<W> {
+         }
+     }
+ 
++    /// hp-snap: where the Overview's add button goes, centred below the last page.
++    pub(crate) fn overview_add_button(&self, size: f64) -> Option<Rectangle<f64, Logical>> {
++        let geos: Vec<_> = self.workspaces_render_geo().collect();
++        let last = self.visible_workspace_indices().last()?;
++        let (page, next) = (geos[last], *geos.last()?);
++        let center_x = page.loc.x + page.size.w / 2.;
++        let center_y = (page.loc.y + page.size.h + next.loc.y.max(page.loc.y + page.size.h)) / 2.;
++        let center_y = center_y.max(page.loc.y + page.size.h + size / 2. + 4.);
++        Some(Rectangle::new(Point::from((center_x - size / 2., center_y - size / 2.)), (size, size).into()))
++    }
++
+     pub(crate) fn overview_add_slot(&self) -> usize {
+         self.workspaces.len() - 1
+     }
+@@ -755,7 +769,75 @@ impl<W: LayoutElement> Monitor<W> {
+         }
+     }
+ 
++    /// hp-snap patch: the desktop page number the shell uses for this workspace (the minimize stash has none).
++    fn page_number(&self, idx: usize) -> Option<u32> {
++        self.visible_workspace_indices().position(|other| other == idx).map(|rank| rank as u32 + 1)
++    }
++
++    /// hp-snap patch: a page is in use when it has windows or a name, a window minimized from it, was kept on
++    /// purpose, or holds desktop icons or widgets.
++    pub(super) fn page_in_use(&self, idx: usize) -> bool {
++        self.workspaces[idx].is_retained()
++            || self.page_number(idx).is_some_and(|page| self.content_pages.binary_search(&page).is_ok())
++    }
++
++    /// hp-snap patch: the pages after the last page in use (all empty), in order.
++    fn spare_pages(&self) -> Vec<usize> {
++        let visible: Vec<usize> = self.visible_workspace_indices().collect();
++        let in_use = visible.iter().rposition(|&idx| self.page_in_use(idx));
++        visible[in_use.map_or(0, |rank| rank + 1)..].to_vec()
++    }
++
++    pub fn set_content_pages(&mut self, mut pages: Vec<u32>) {
++        pages.retain(|&page| (1..=64).contains(&page));
++        pages.sort_unstable();
++        pages.dedup();
++        self.content_pages = pages;
++        // Pages with icons or widgets come back after a restart, with a spare page after them.
++        if let Some(&last) = self.content_pages.last() {
++            while self.visible_workspace_indices().count() <= last as usize {
++                self.add_workspace_bottom();
++            }
++        }
++        if self.workspace_switch.is_none() {
++            self.clean_up_workspaces();
++        }
++    }
++
+     pub fn clean_up_workspaces(&mut self) {
++        if self.options.layout.empty_workspace_above_first {
++            return self.clean_up_workspaces_niri();
++        }
++        assert!(self.workspace_switch.is_none());
++
++        // hp-snap patch: every page up to the last one in use stays, empty pages between them too. After it, one
++        // empty page stays to add things to: the one showing, if it is one of them, otherwise the last.
++        let trailing = self.spare_pages();
++        if trailing.is_empty() {
++            self.add_workspace_bottom();
++            return;
++        }
++        let spare = trailing.iter().copied().find(|&idx| idx == self.active_workspace_idx)
++            .unwrap_or(*trailing.last().unwrap());
++        let mut doomed: Vec<usize> = trailing.into_iter().filter(|&idx| idx != spare).collect();
++        // An empty minimize stash goes as well; it is made again when needed.
++        doomed.extend(self.workspaces.iter().enumerate()
++            .filter(|(_, ws)| ws.is_minimize_stash && !ws.is_retained())
++            .map(|(idx, _)| idx));
++        doomed.sort_unstable();
++        doomed.dedup();
++        for idx in doomed.into_iter().rev() {
++            if idx == self.active_workspace_idx || idx == self.workspaces.len() - 1 && idx != spare {
++                continue;
++            }
++            self.workspaces.remove(idx);
++            if self.active_workspace_idx > idx {
++                self.active_workspace_idx -= 1;
++            }
++        }
++    }
++
++    fn clean_up_workspaces_niri(&mut self) {
+         assert!(self.workspace_switch.is_none());
+ 
+         let range_start = if self.options.layout.empty_workspace_above_first {
+@@ -2385,7 +2467,15 @@ impl<W: LayoutElement> Monitor<W> {
+         } else {
+             0
+         };
+-        if self.workspace_switch.is_none() {
++        if self.workspace_switch.is_none() && !self.options.layout.empty_workspace_above_first {
++            // hp-snap patch: after the last page in use, one spare page (two while the one showing is empty).
++            let trailing = self.spare_pages();
++            assert!(
++                trailing.len() == 1
++                    || trailing.len() == 2 && trailing.contains(&self.active_workspace_idx),
++                "exactly one spare page must follow the last page in use"
++            );
++        } else if self.workspace_switch.is_none() {
+             for (idx, ws) in self
+                 .workspaces
+                 .iter()
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index 43d15c1..5cb25de 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -2034,7 +2034,8 @@ fn move_to_workspace_by_idx_does_not_leave_empty_workspaces() {
+         unreachable!()
+     };
+ 
+-    assert!(monitors[0].workspaces[1].has_windows());
++    // hp-snap: the page the window left stays when it sits between pages in use.
++    assert!(monitors[0].workspaces.iter().any(|ws| ws.has_window(&0)));
+ }
+ 
+ #[test]
+@@ -3994,6 +3995,49 @@ proptest! {
+     }
+ }
+ 
++fn pages_with_windows(layout: &Layout<TestWindow>) -> Vec<bool> {
++    let monitor = layout.monitors().next().unwrap();
++    monitor.workspaces.iter().filter(|ws| !ws.is_minimize_stash).map(|ws| ws.has_windows()).collect()
++}
++
++fn three_pages_of_windows() -> Vec<Op> {
++    vec![
++        Op::AddOutput(1),
++        Op::AddWindow { params: TestWindowParams::new(1) },
++        Op::FocusWorkspaceDown,
++        Op::AddWindow { params: TestWindowParams::new(2) },
++        Op::FocusWorkspaceDown,
++        Op::AddWindow { params: TestWindowParams::new(3) },
++        Op::FocusWorkspace(0),
++        Op::CompleteAnimations,
++    ]
++}
++
++#[test]
++fn empty_pages_between_pages_in_use_stay() {
++    let mut ops = three_pages_of_windows();
++    ops.push(Op::CloseWindow(2));
++    assert_eq!(pages_with_windows(&check_ops(ops)), [true, false, true, false]);
++}
++
++#[test]
++fn empty_pages_at_the_end_go_until_one_spare_is_left() {
++    let mut ops = three_pages_of_windows();
++    ops.extend([Op::CloseWindow(2), Op::CloseWindow(3)]);
++    assert_eq!(pages_with_windows(&check_ops(ops)), [true, false]);
++}
++
++#[test]
++fn pages_with_desktop_icons_stay_and_come_back() {
++    let mut layout = check_ops([Op::AddOutput(1), Op::AddWindow { params: TestWindowParams::new(1) }]);
++    layout.set_desktop_page_content("output1", vec![3]);
++    layout.verify_invariants();
++    assert_eq!(pages_with_windows(&layout), [true, false, false, false]);
++    layout.set_desktop_page_content("output1", vec![]);
++    layout.verify_invariants();
++    assert_eq!(pages_with_windows(&layout), [true, false]);
++}
++
+ fn carry_window(switch_desktop: bool) -> Layout<TestWindow> {
+     let update = Op::InteractiveMoveUpdate { window: 1, dx: 1000., dy: 0., output_idx: 1, px: 0., py: 0. };
+     let mut ops = vec![
+diff --git a/src/niri.rs b/src/niri.rs
+index 82d22e5..50f8409 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -3367,28 +3367,23 @@ impl Niri {
+         output: &Output,
+     ) -> impl Iterator<Item = (WorkspaceControl, Rectangle<f64, Logical>)> + 'a {
+         self.layout.monitor_for_output(output).into_iter().flat_map(|mon| {
+-            mon.workspaces_with_render_geo_idx().flat_map(move |((idx, ws), geo)| {
+-                let size = 28.;
+-                let rect = |x, y| Rectangle::new(geo.loc + Point::from((x, y)), (size, size).into());
+-                let (primary, grip) = if mon.overview_can_manage(idx) {
+-                    let x = geo.size.w - size - 6.;
+-                    (
+-                        Some((WorkspaceControl::Remove(ws.id()), rect(x, 6.))),
+-                        Some((WorkspaceControl::Reorder(ws.id()), rect(x - size - 4., 6.))),
+-                    )
+-                } else if idx == mon.overview_add_slot() {
+-                    (
+-                        Some((
+-                            WorkspaceControl::Add,
+-                            rect((geo.size.w - size) / 2., (geo.size.h - size) / 2.),
+-                        )),
+-                        None,
+-                    )
+-                } else {
+-                    (None, None)
+-                };
+-                [primary, grip].into_iter().flatten()
+-            })
++            // hp-snap: a page's close button sits on that page's top-left corner and its move handle on the
++            // top-right one. The add button sits centred below the last page.
++            let size = OVERVIEW_CONTROL_SIZE;
++            let pages = mon.workspaces_with_render_geo_idx().flat_map(move |((idx, ws), geo)| {
++                let rect = |x: f64, y: f64| Rectangle::new(geo.loc + Point::from((x, y)), (size, size).into());
++                mon.overview_can_manage(idx)
++                    .then(|| {
++                        [
++                            (WorkspaceControl::Remove(ws.id()), rect(-size / 2. + 6., -size / 2. + 6.)),
++                            (WorkspaceControl::Reorder(ws.id()), rect(geo.size.w - size / 2. - 6., -size / 2. + 6.)),
++                        ]
++                    })
++                    .into_iter()
++                    .flatten()
++            });
++            let add = mon.overview_add_button(OVERVIEW_ADD_SIZE).map(|rect| (WorkspaceControl::Add, rect));
++            pages.chain(add)
+         })
+     }
+ 
+@@ -3431,63 +3426,48 @@ impl Niri {
+             })
+     }
+ 
+-    fn render_overview_workspace_controls(
++    fn render_overview_workspace_controls<R: NiriRenderer>(
+         &self,
++        renderer: &mut R,
+         output: &Output,
+-        push: &mut impl FnMut(SolidColorRenderElement),
++        push: &mut impl FnMut(OutputRenderElements<R>),
+     ) {
+         if !self.overview_workspace_controls_enabled() {
+             return;
+         }
++        let scale = output.current_scale().fractional_scale();
+         let pointer = self.seat.get_pointer().unwrap();
+         let hovered = self.output_under(pointer.current_location())
+             .filter(|(candidate, _)| *candidate == output)
+             .map(|(_, local)| local);
+-        let mut rect = |geometry, color: [f32; 4]| {
+-            push(SolidColorRenderElement::new(
+-                smithay::backend::renderer::element::Id::new(),
+-                geometry,
+-                Default::default(),
+-                color.into(),
+-                Kind::Unspecified,
+-            ));
+-        };
+         for (control, bounds) in self.overview_workspace_controls(output) {
+-            let center = bounds.loc + bounds.size.to_point().downscale(2.);
+-            let mut stroke = |x, y, w, h| {
+-                let geo = Rectangle::new(center + Point::from((x, y)), (w, h).into());
+-                rect(geo, [0.97, 0.98, 1., 1.]);
++            let hover = hovered.is_some_and(|p| bounds.contains(p));
++            let Some(buffer) = overview_control_icon(control, hover, bounds.size.w, scale) else {
++                continue;
+             };
+-            match control {
+-                WorkspaceControl::Add => {
+-                    stroke(-7., -1., 14., 2.);
+-                    stroke(-1., -7., 2., 14.);
+-                }
+-                WorkspaceControl::Reorder(_) => {
+-                    for y in [-6., -1., 4.] {
+-                        stroke(-6., y, 12., 2.);
+-                    }
+-                }
+-                WorkspaceControl::Remove(_) => {
+-                    for offset in -3..=3 {
+-                        let offset = f64::from(offset) * 2.;
+-                        stroke(offset - 1., offset - 1., 2., 2.);
+-                        if offset != 0. {
+-                            stroke(offset - 1., -offset - 1., 2., 2.);
+-                        }
+-                    }
+-                }
+-            }
+-            let background = match (control, hovered.is_some_and(|p| bounds.contains(p))) {
+-                (WorkspaceControl::Remove(_), true) => [0.60, 0.16, 0.20, 1.],
+-                (_, true) => [0.14, 0.36, 0.56, 1.],
+-                (_, false) => [0.15, 0.18, 0.23, 1.],
++            let Ok(texture) = TextureBuffer::from_memory_buffer(renderer.as_gles_renderer(), &buffer) else {
++                continue;
+             };
+-            rect(bounds, background);
++            let location = bounds.loc.to_physical_precise_round(scale).to_logical(scale);
++            let elem = crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
++                texture,
++                location,
++                1.,
++                None,
++                None,
++                Kind::Unspecified,
++            );
++            push(PrimaryGpuTextureRenderElement(elem).into());
+         }
+         if let Some((_, id)) = self.overview_workspace_drag.as_ref().filter(|(source, _)| source == output) {
+             if let Some((_, line)) = hovered.and_then(|pos| self.overview_workspace_drop_target(output, pos, *id)) {
+-                rect(line, [0.38, 0.73, 1., 1.]);
++                push(SolidColorRenderElement::new(
++                    smithay::backend::renderer::element::Id::new(),
++                    line,
++                    Default::default(),
++                    [0.38, 0.73, 1., 1.].into(),
++                    Kind::Unspecified,
++                ).into());
+             }
+         }
+     }
+@@ -4627,7 +4607,7 @@ impl Niri {
+                     &mut |elem| push(elem.into()),
+                 );
+ 
+-            self.render_overview_workspace_controls(output, &mut |elem| push(elem.into()));
++            self.render_overview_workspace_controls(ctx.renderer, output, &mut |elem| push(elem));
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 
+             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+@@ -4660,7 +4640,7 @@ impl Niri {
+                     &mut |elem| push(elem.into()),
+                 );
+ 
+-            self.render_overview_workspace_controls(output, &mut |elem| push(elem.into()));
++            self.render_overview_workspace_controls(ctx.renderer, output, &mut |elem| push(elem));
+             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+ 
+             // Macro instead of closure to avoid borrowing push().
+@@ -6873,6 +6853,98 @@ niri_render_elements! {
+     }
+ }
+ 
++// hp-snap: the Overview's page buttons, drawn once per look and scale.
++const OVERVIEW_CONTROL_SIZE: f64 = 30.;
++const OVERVIEW_ADD_SIZE: f64 = 40.;
++
++thread_local! {
++    static OVERVIEW_CONTROL_ICONS: std::cell::RefCell<HashMap<(u8, bool, u64, u64), Option<crate::render_helpers::memory::MemoryBuffer>>> =
++        std::cell::RefCell::new(HashMap::new());
++}
++
++fn overview_control_icon(
++    control: WorkspaceControl,
++    hovered: bool,
++    size: f64,
++    scale: f64,
++) -> Option<crate::render_helpers::memory::MemoryBuffer> {
++    let kind = match control {
++        WorkspaceControl::Add => 0,
++        WorkspaceControl::Remove(_) => 1,
++        WorkspaceControl::Reorder(_) => 2,
++    };
++    let key = (kind, hovered, size.to_bits(), scale.to_bits());
++    OVERVIEW_CONTROL_ICONS.with(|cache| {
++        cache.borrow_mut().entry(key)
++            .or_insert_with(|| draw_overview_control(kind, hovered, size, scale).ok())
++            .clone()
++    })
++}
++
++/// A round glass button: a soft shadow, a translucent disc with a fine light rim, and a white symbol.
++fn draw_overview_control(kind: u8, hovered: bool, size: f64, scale: f64) -> anyhow::Result<crate::render_helpers::memory::MemoryBuffer> {
++    use pangocairo::cairo::{self, ImageSurface};
++    use std::f64::consts::TAU;
++
++    let pixels = (size * scale).ceil() as i32;
++    let surface = ImageSurface::create(cairo::Format::ARgb32, pixels, pixels)?;
++    let cr = cairo::Context::new(&surface)?;
++    cr.scale(scale, scale);
++    let c = size / 2.;
++
++    cr.arc(c, c + 1., c - 1., 0., TAU);
++    cr.set_source_rgba(0., 0., 0., 0.22);
++    cr.fill()?;
++
++    cr.arc(c, c, c - 1.5, 0., TAU);
++    match (kind, hovered) {
++        (1, true) => cr.set_source_rgba(0.85, 0.22, 0.25, 0.92),
++        (_, true) => cr.set_source_rgba(0.30, 0.42, 0.62, 0.85),
++        _ => cr.set_source_rgba(0.10, 0.14, 0.22, 0.62),
++    }
++    cr.fill_preserve()?;
++    cr.set_source_rgba(1., 1., 1., if hovered { 0.75 } else { 0.5 });
++    cr.set_line_width(1.);
++    cr.stroke()?;
++
++    cr.set_source_rgba(1., 1., 1., 1.);
++    cr.set_line_width(if kind == 0 { 2.5 } else { 2. });
++    cr.set_line_cap(cairo::LineCap::Round);
++    let arm = size * 0.2;
++    match kind {
++        0 => {
++            cr.move_to(c - arm, c);
++            cr.line_to(c + arm, c);
++            cr.move_to(c, c - arm);
++            cr.line_to(c, c + arm);
++        }
++        1 => {
++            let arm = arm * 0.85;
++            cr.move_to(c - arm, c - arm);
++            cr.line_to(c + arm, c + arm);
++            cr.move_to(c + arm, c - arm);
++            cr.line_to(c - arm, c + arm);
++        }
++        _ => {
++            for dy in [-arm * 0.6, 0., arm * 0.6] {
++                cr.move_to(c - arm * 0.8, c + dy);
++                cr.line_to(c + arm * 0.8, c + dy);
++            }
++        }
++    }
++    cr.stroke()?;
++    drop(cr);
++
++    let data = surface.take_data().map_err(|_| anyhow::anyhow!("button image is still in use"))?;
++    Ok(crate::render_helpers::memory::MemoryBuffer::new(
++        data.to_vec(),
++        Fourcc::Argb8888,
++        (pixels, pixels),
++        scale,
++        smithay::utils::Transform::Normal,
++    ))
++}
++
+ fn desktop_page_id(namespace: &str) -> Option<u64> {
+     namespace.strip_prefix("quickshell:hpos-desktop-page-")?.parse().ok()
+ }

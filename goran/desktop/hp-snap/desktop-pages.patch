@@ -1,0 +1,69 @@
+--- a/modules/background/Background.qml
++++ b/modules/background/Background.qml
+@@ -516,6 +516,47 @@
+             && !GlobalStates.irisEdit && !GlobalStates.widgetEditMode
+             && !GlobalStates.shellLayoutEditMode && !GameMode.active
+ 
++        // hp-snap: niri keeps every page up to the last one holding windows, icons or widgets (empty pages between
++        // them too) and one empty page after it; it learns here which pages hold icons or widgets.
++        readonly property var pageWidgetDefaults: ({
++            battery: false, calendarUpcoming: false, clock: true, controls: false, customImage: false, dateBadge: false,
++            dayProgress: false, editorial: false, imageConverter: false, japaneseTypography: false, mascot: false,
++            mediaControls: false, monthCalendar: false, newsTicker: false, notes: false, screenTime: false, shape: false,
++            systemMonitor: false, timers: false, todo: false, uptime: false, userCard: false, visualizer: false,
++            weather: false, worldClock: false
++        })
++        function pagesWithContent(): var {
++            if (!bgRoot.separatePages || !DesktopItems.ready)
++                return []
++            const pages = new Set()
++            const add = value => { const page = Number(value ?? 1); if (page >= 1) pages.add(Math.floor(page)) }
++            for (const item of DesktopItems.listForPage(bgRoot.screenName, 0))
++                add(item.workspacePage)
++            const keys = Object.keys(bgRoot.pageWidgetDefaults)
++                .filter(key => bgRoot._widgetEnabled(key, bgRoot.pageWidgetDefaults[key]))
++            const mascots = Config.getNestedValue("background.widgets.mascotInstances", {}) ?? {}
++            for (const id of Object.keys(mascots))
++                if (Config.getNestedValue("background.widgets.mascotInstances." + id + ".enable", false))
++                    keys.push("mascotInstances." + id)
++            if (CustomWidgets.ready)
++                for (const widget of CustomWidgets.widgets)
++                    keys.push("custom." + widget.id)
++            for (const key of keys)
++                add(DesktopWidgetLayout.value(bgRoot.screenName, key, "workspacePage", 1))
++            return [...pages].sort((a, b) => a - b)
++        }
++        readonly property string pageContentReport: JSON.stringify(bgRoot.pagesWithContent())
++        function sendPageContent(): void {
++            if (bgRoot.screenName.length > 0 && bgRoot.separatePages)
++                NiriService.send({ DesktopPageContent: { output: bgRoot.screenName, pages: JSON.parse(bgRoot.pageContentReport) } })
++        }
++        onPageContentReportChanged: pageContentTimer.restart()
++        Timer { id: pageContentTimer; interval: 300; onTriggered: bgRoot.sendPageContent() }
++        Connections {
++            target: NiriService
++            function onActionReadyChanged() { if (NiriService.actionReady) pageContentTimer.restart() }
++        }
++
+         function registerPage(workspaceId: var, page: Item, remove: bool): void {
+             const next = Object.assign({}, bgRoot.pageViews)
+             if (remove) {
+--- a/modules/iris/background/IrisWorkspacePages.qml
++++ b/modules/iris/background/IrisWorkspacePages.qml
+@@ -397,6 +397,8 @@
+         width: rail.evenCrisp(root.railWidth)
+         height: rail.harmony ? rail.evenCrisp(root.dotCount * rail.hStep + 20 * rail.hUnit)
+             : root.dotCount * rail.pitch + rail.evenCrisp(6)
++        // hp-snap: when a page is added or an empty one at the end goes, the glass grows or shrinks smoothly.
++        Behavior on height { NumberAnimation { duration: IrisStyle.duration(420); easing.type: Easing.OutCubic } }
+         Accessible.ignored: !root.acceptsIndicatorInput
+         Accessible.role: Accessible.PageTabList
+         Accessible.name: Translation.tr("Workspaces")
+@@ -543,6 +545,7 @@
+             width: rail.width
+             anchors.verticalCenter: parent.verticalCenter
+             height: root.dotCount * (rail.harmony ? rail.hStep : rail.pitch)
++            Behavior on height { NumberAnimation { duration: IrisStyle.duration(420); easing.type: Easing.OutCubic } }
+ 
+             Repeater {
+                 // Keep delegates and rail geometry stable when the active workspace changes.
