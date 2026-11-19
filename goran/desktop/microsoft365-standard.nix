@@ -47,7 +47,7 @@ let
     mimeTypes = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
   };
   # Everything else that arrives with the desktop's own parts stays out of the app list.
-  shown = [ "org.kde.dolphin" "hp-os-settings" "hp-os-trash" ];
+  shown = [ "org.kde.dolphin" "hp-os-settings" "hp-os-trash" "com.mitchellh.ghostty" "google-chrome" ];
   hidden = pkgs.runCommand "hp-os-hidden-apps" { } ''
     mkdir -p "$out"
     for file in ${config.home.path}/share/applications/*.desktop; do

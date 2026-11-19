@@ -5,6 +5,7 @@
   home.packages = with pkgs; [
     grim slurp wl-clipboard wl-clip-persist cliphist libnotify playerctl brightnessctl
     desktop-file-utils xdg-utils imagemagick ffmpegthumbnailer
+    ghostty google-chrome   # every HP-OS account gets a terminal and Google Chrome
     fcitx5 fcitx5-rime hunspell hunspellDicts.en_US
     nerd-fonts.jetbrains-mono noto-fonts noto-fonts-cjk-sans noto-fonts-cjk-serif noto-fonts-color-emoji
   ];
