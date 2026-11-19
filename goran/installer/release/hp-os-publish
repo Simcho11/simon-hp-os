@@ -6,6 +6,11 @@
   hp-os-publish release "What changed"  build the committed code, sign it and send it out
   hp-os-publish bundle FILE             make the file that connects another device (keep it private)
   sudo hp-os-publish image ROOT         build the connection into a laptop image, mounted at ROOT
+  hp-os-publish builder SYSTEM STORE    once per chip: the computer that builds for it, as a Nix store, e.g.
+                                        builder x86_64-linux 'ssh-ng://me@tower?ssh-key=~/.ssh/tower'
+                                        (`builder SYSTEM off` forgets it). Every release is then built there too.
+  hp-os-publish builders                list them
+  hp-os-publish add-system SYSTEM       build the newest release on that chip's builder and add its parts
   hp-os-publish add-system SYSTEM STORE ROOTS-FILE
                                         add ready-built parts for another chip (such as x86_64-linux), built on
                                         STORE, to the newest release
@@ -132,15 +137,74 @@ def scan_for_secrets(folder):
         stop("these files look like they hold secrets, so nothing was published:\n  " + "\n  ".join(found))
 
 
-def verify_builds(folder):
-    """Builds what devices build, and returns what was built."""
-    print("Building a clean copy. This proves every device can build it…", flush=True)
+def verify_builds(folder, system=None, store=None):
+    """Builds what devices build, and returns what was built. With a builder, this laptop works out what to build for
+    that chip and the builder builds it into its own store (Nix's --eval-store auto)."""
+    print("Building a clean copy%s. This proves every device can build it…" % (" for %s" % system if system else ""),
+          flush=True)
     flake = "path:%s" % folder
-    built = run("nix", "build", "--no-link", "--print-out-paths", flake + "#hp-os-account-setup",
-                flake + "#hp-os-add-user", flake + "#hp-os-login-theme").split()
+    elsewhere = ["--system", system, "--eval-store", "auto", "--store", store] if store else []
+    built = run("nix", "--extra-experimental-features", "nix-command flakes", "build", "--no-link",
+                "--print-out-paths", *elsewhere, flake + "#hp-os-account-setup", flake + "#hp-os-add-user",
+                flake + "#hp-os-login-theme").split()
+    # lib.hpOsAccount picks the desktop for the chip it is evaluated for (builtins.currentSystem, set by --system).
     expression = '((builtins.getFlake "%s").lib.hpOsAccount "hp-os-release-check").activationPackage' % flake
-    built += run("nix", "build", "--no-link", "--print-out-paths", "--impure", "--expr", expression).split()
+    built += run("nix", "--extra-experimental-features", "nix-command flakes", "build", "--no-link",
+                 "--print-out-paths", *elsewhere, "--impure", "--expr", expression).split()
     return built
+
+
+# ── Other chips ──
+# Each chip HP-OS ships for (x86_64-linux on Intel and AMD laptops) has a builder: a computer of that kind this laptop
+# reaches as a Nix store, kept in config.json. Releases are built there from the same commit, and its parts are uploaded
+# beside this laptop's. A chip whose build fails doesn't hold back the others: its devices wait for `add-system`.
+def builders(settings):
+    return dict(settings.get("builders", {}))
+
+
+def builder_store(store):
+    """A store URL with ~ in ssh-key= expanded, as Nix doesn't."""
+    return re.sub(r"(ssh-key=)~", lambda found: found.group(1) + str(OWNER_HOME), store)
+
+
+def set_builder(system, store):
+    settings = config()
+    found = builders(settings)
+    if store == "off":
+        found.pop(system, None)
+    else:
+        if not re.fullmatch(r"[a-z0-9_]+-linux", system):
+            stop("name the chip as Nix does, such as x86_64-linux.")
+        print("Checking %s can build for HP-OS…" % system, flush=True)
+        answer = subprocess.run(["nix", "--extra-experimental-features", "nix-command", "store", "info", "--store",
+                                 builder_store(store)], capture_output=True, text=True, timeout=120)
+        said = answer.stdout + answer.stderr      # Nix writes this report to stderr
+        if answer.returncode != 0 or "Trusted: 1" not in said:
+            stop("that builder didn't answer as a trusted Nix store:\n" + said.strip())
+        found[system] = store
+    settings["builders"] = found
+    CONFIG.write_text(json.dumps(settings, indent=2) + "\n")
+    print("Releases are now built for: %s." % ", ".join(sorted([this_system()] + list(found))))
+
+
+def this_system():
+    return run("nix", "--extra-experimental-features", "nix-command", "eval", "--impure", "--raw", "--expr",
+               "builtins.currentSystem")
+
+
+def build_elsewhere(folder, system, store):
+    """Builds and uploads one chip's parts on its builder. Returns the chip, or None if that build failed."""
+    store = builder_store(store)
+    try:
+        built = verify_builds(folder, system, store)
+        if system_of(built, store) != system:
+            raise RuntimeError("the builder made parts for another chip")
+        upload_prebuilt(built, store)
+        return system
+    except (SystemExit, RuntimeError, subprocess.SubprocessError, OSError) as error:
+        print("Couldn't build for %s (%s). Its devices keep their current version until you run\n"
+              "  hp-os-publish add-system %s" % (system, error, system), flush=True)
+        return None
 
 
 # ── Ready-built updates ──
@@ -344,11 +408,17 @@ def system_of(paths, source_store=None):
     found = set()
     for path in paths:
         deriver = run("nix-store", *source, "--query", "--deriver", path)
-        if deriver.endswith(".drv"):
-            shown = json.loads(run("nix", "--extra-experimental-features", "nix-command", "derivation", "show",
-                                   *source, deriver))
-            shown = shown.get("derivations", shown)
-            found.add(next(iter(shown.values()))["system"])
+        if not deriver.endswith(".drv"):
+            continue
+        # A builder keeps the plans it built from; this laptop keeps the ones it worked out for it (--eval-store).
+        for where in ([source, []] if source else [[]]):
+            answer = subprocess.run(["nix", "--extra-experimental-features", "nix-command", "derivation", "show",
+                                     *where, deriver], capture_output=True, text=True)
+            if answer.returncode == 0:
+                shown = json.loads(answer.stdout)
+                shown = shown.get("derivations", shown)
+                found.add(next(iter(shown.values()))["system"])
+                break
     if len(found) != 1:
         stop("couldn't tell which chip these parts are for: %s" % (", ".join(sorted(found)) or "nothing found"))
     return found.pop()
@@ -397,6 +467,9 @@ def publish(notes, skip_build=False):
             if bucket:
                 upload_prebuilt(built)
                 prebuilt.append(system_of(built))
+                for system, store in sorted(builders(settings).items()):
+                    if build_elsewhere(folder, system, store):
+                        prebuilt.append(system)
     tree = git("rev-parse", commit + "^{tree}")
     stable = commit_tree(tree, remote_head(settings, release.STABLE), "HP-OS " + version)
     manifest = {"version": version, "commit": stable, "digest": digest, "notes": notes.strip(),
@@ -412,16 +485,29 @@ def publish(notes, skip_build=False):
     print("Published HP-OS %s. Devices will see it within a day, or right away from Settings." % version)
 
 
-def add_system(system, store, roots_file):
-    """Adds another chip's ready-built parts to the newest release (built from the same commit elsewhere)."""
+def add_system(system, store=None, roots_file=None):
+    """Adds another chip's ready-built parts to the newest release (built from the same commit elsewhere): on the chip's
+    builder, or from parts already built in STORE."""
     settings, bucket = config(), storage()
     if not bucket:
         stop("connect storage first: hp-os-publish storage")
     manifest = published_release(settings)
-    roots = Path(roots_file).read_text().split()
-    if not roots or system_of(roots, store) != system:
-        stop("those parts aren't built for %s." % system)
-    upload_prebuilt(roots, store)
+    if roots_file is None:
+        store = builders(settings).get(system)
+        if not store:
+            stop("no builder for %s yet: hp-os-publish builder %s STORE" % (system, system))
+        with tempfile.TemporaryDirectory() as folder:
+            owner_git(settings, "fetch", "--quiet", remote(settings), manifest["commit"])
+            snapshot(manifest["commit"], folder)
+            if release.tree_digest(folder) != manifest["digest"]:
+                stop("the newest release's code doesn't match what was signed. Nothing was added.")
+            if not build_elsewhere(folder, system, store):
+                sys.exit(1)
+    else:
+        roots = Path(roots_file).read_text().split()
+        if not roots or system_of(roots, store) != system:
+            stop("those parts aren't built for %s." % system)
+        upload_prebuilt(roots, store)
     manifest["prebuilt"] = sorted(set(manifest.get("prebuilt", [])) | {system})
     manifest["cache"] = device_cache(bucket)
     channel = sign_and_send(settings, manifest, "HP-OS %s for %s" % (manifest["version"], system))
@@ -580,6 +666,13 @@ def main():
         connect_storage()
     elif len(arguments) == 4 and arguments[0] == "add-system":
         add_system(arguments[1], arguments[2], arguments[3])
+    elif len(arguments) == 2 and arguments[0] == "add-system":
+        add_system(arguments[1])
+    elif len(arguments) == 3 and arguments[0] == "builder":
+        set_builder(arguments[1], arguments[2])
+    elif arguments == ["builders"]:
+        found = builders(config())
+        print("\n".join("%s: %s" % item for item in sorted(found.items())) or "Only this laptop's chip. Add one with: hp-os-publish builder SYSTEM STORE")
     elif arguments == ["is-published"]:
         sys.exit(0 if head_is_published() else 1)
     elif arguments == ["status"]:
