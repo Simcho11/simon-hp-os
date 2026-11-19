@@ -78,6 +78,8 @@ let
 in {
   home.file = {
     ".local/bin/chrome-live-control".source = chrome;
+    # Google Chrome on every desktop, beside the Microsoft 365 folder.
+    "${desktopDir}/Google Chrome.desktop" = { source = "${listedApps}/google-chrome.desktop"; executable = true; };
   } // builtins.listToAttrs (map (app: {
     name = "${desktopDir}/Microsoft 365/${folder.${app.id}}.desktop";
     value = { source = file app; executable = true; };
