@@ -30,9 +30,14 @@ Item {
         anchors.fill: parent
         z: 20
         visible: main.firstBoot && !(styleLoader.item && styleLoader.item.core && String(styleLoader.item.core.addedLogin || "").length > 0)
-        color: "#071a3f"
+        // Black, like the setup screens fading in over it; its button only shows if setup hasn't opened by then.
+        color: "black"
         MouseArea { anchors.fill: parent; hoverEnabled: true }
+        id: setupCover
+        property bool late: false
+        Timer { running: setupCover.visible; interval: 9000; onTriggered: setupCover.late = true }
         Rectangle {
+            visible: setupCover.late
             anchors.centerIn: parent
             width: Math.round(parent.width * 0.17); height: Math.round(width * 0.24)
             radius: height / 2

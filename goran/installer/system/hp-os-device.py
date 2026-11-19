@@ -34,6 +34,10 @@ ERASED = (
     "var/crash/*",
     "var/mail/*",
     "etc/NetworkManager/system-connections/*",
+    # Ubuntu saves networks joined on the desktop through Netplan, and copies them under /run at every start.
+    "etc/netplan/90-NM-*",
+    "run/NetworkManager/system-connections/netplan-NM-*",
+    "run/NetworkManager/system-connections/netplan-*90-NM-*",
     "var/lib/bluetooth/*/[0-9A-F][0-9A-F]:*",
     "var/lib/hp-os/login-wallpapers/*",
     "var/lib/hp-os/welcome-updated.qml",
@@ -184,6 +188,8 @@ class Device:
                 shutil.rmtree(home, ignore_errors=True)
         for path in extras + self.leftovers():
             self.remove(path)
+        # Should the network service already be running, it forgets the Wi-Fi networks erased above too.
+        self.run(["/usr/bin/nmcli", "connection", "reload"])
         self.run(["/usr/bin/journalctl", "--rotate"])
         self.run(["/usr/bin/journalctl", "--vacuum-time=1s"])
         if self.people():

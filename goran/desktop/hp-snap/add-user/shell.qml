@@ -24,6 +24,7 @@ ShellRoot {
     // ── The answers ──
     // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password, 3 approve, 4 done
     property int step: firstBoot ? 5 : 0
+    property Item activePage: null
     // Set by the first-setup service just before the restart that finishes an update: Wi-Fi and the update are done,
     // so the welcome carries on at "What's your name?" instead of starting over.
     Loader { id: updatedMark; source: app.firstBoot ? "file:///var/lib/hp-os/welcome-updated.qml" : "" }
@@ -427,17 +428,9 @@ ShellRoot {
                 x: page.current ? 0 : (app.step > page.index ? -win.px(70) : win.px(70))
                 Behavior on x { NumberAnimation { duration: 480; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
             }
-            GlassShape {
-                readonly property real pad: win.px(46)
-                width: Math.max(win.px(660), holder.width + 2 * pad)
-                height: holder.height + 2 * pad
-                x: Math.round((parent.width - width) / 2)
-                y: holder.y - pad
-                radius: win.px(44)
-                d: win.d
-                backdropItem: backdropTexture
-                hostItem: win.contentItem
-            }
+            readonly property Item holderItem: holder
+            onCurrentChanged: if (page.current) app.activePage = page
+            Component.onCompleted: if (page.current) app.activePage = page
             Column {
                 id: holder
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -490,12 +483,45 @@ ShellRoot {
             // A plain dim, like the login screen at night: no colour of its own.
             Rectangle { anchors.fill: parent; color: Qt.rgba(0, 0, 0, 0.30) }
         }
+        // What the glass sees: the same picture, frosted further and lifted a little, like HP-OS's thick glass.
+        Item {
+            id: frostLayer
+            anchors.fill: parent
+            visible: false
+            MultiEffect {
+                anchors.fill: parent
+                source: backdropLayer
+                blurEnabled: true; blur: 1; blurMax: 48
+                saturation: 0.18
+                brightness: 0.05
+            }
+        }
         ShaderEffectSource {
             id: backdropTexture
             anchors.fill: parent
-            sourceItem: backdropLayer
+            sourceItem: frostLayer
             live: true
             visible: false
+        }
+
+        // ── One pane of glass holding each screen: it changes size smoothly from one screen to the next ──
+        GlassShape {
+            id: card
+            readonly property Item holder: app.activePage ? app.activePage.holderItem : null
+            readonly property real pad: win.px(46)
+            width: card.holder ? Math.max(win.px(660), card.holder.width + 2 * card.pad) : win.px(660)
+            height: card.holder ? card.holder.height + 2 * card.pad : win.px(260)
+            x: Math.round((win.contentItem.width - card.width) / 2)
+            y: Math.round(win.contentItem.height * 0.36) - card.pad
+            opacity: app.appear
+            scale: 0.97 + 0.03 * app.appear
+            radius: win.px(44)
+            d: win.d
+            frost: 1
+            backdropItem: backdropTexture
+            hostItem: win.contentItem
+            Behavior on width { NumberAnimation { duration: 560; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
+            Behavior on height { NumberAnimation { duration: 560; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
         }
 
         // ── Who this is becoming: stays on screen through every step ──
@@ -516,7 +542,7 @@ ShellRoot {
         Page {
             index: 5
             Gap { size: 20 }
-            Title { text: "Welcome to HP-OS" }
+            Title { text: "Hello" }
             Subtitle { text: "Let’s get your device ready. It only takes a few minutes." }
             Gap { size: 26 }
             Primary {

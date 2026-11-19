@@ -274,10 +274,23 @@ LoginSurface {
             }
         }
     }
+    // What the glass sees: the same picture, frosted further and lifted a little, like HP-OS's thick glass.
+    Item {
+        id: frostLayer
+        anchors.fill: parent
+        visible: false
+        MultiEffect {
+            anchors.fill: parent
+            source: backdropLayer
+            blurEnabled: true; blur: 1; blurMax: 48
+            saturation: 0.18
+            brightness: 0.05
+        }
+    }
     ShaderEffectSource {
         id: backdropTexture
         anchors.fill: parent
-        sourceItem: backdropLayer
+        sourceItem: frostLayer
         live: true
         visible: false
     }

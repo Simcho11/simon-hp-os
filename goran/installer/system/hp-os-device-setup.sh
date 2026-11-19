@@ -84,7 +84,8 @@ cat > "$units/hp-os-factory-wipe.service" <<UNIT
 Description=Erase this device (HP-OS factory reset)
 ConditionPathExists=$state/factory-reset-request
 After=local-fs.target
-Before=display-manager.service systemd-user-sessions.service
+# Before the network and Bluetooth start, so they never load the saved networks and pairings it erases.
+Before=display-manager.service systemd-user-sessions.service NetworkManager.service bluetooth.service
 
 [Service]
 Type=oneshot

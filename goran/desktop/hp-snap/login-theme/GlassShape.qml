@@ -15,6 +15,8 @@ Item {
     property string look: "clear"
     property real sheenDepth: 0.44
     property real sheenStrength: 1
+    // 0 the clear lens; 1 frosted like HP-OS's thick glass: a milkier pane with a softer rim.
+    property real frost: 1
 
     // Or given directly: the picture to bend, and the item whose coordinates it is drawn in.
     property Item backdropItem: null
@@ -51,9 +53,9 @@ Item {
         property real refraction: 0.75 + 0.25 * glass.boost
         property real pixelRatio: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1
         property real presence: 1
-        property real highlight: 1.05 + 0.35 * glass.boost
+        property real highlight: (1.05 - 0.35 * glass.frost) + 0.35 * glass.boost
         property vector4d crop: Qt.vector4d(0, 0, 1, 1)
-        property vector4d tint: Qt.vector4d(1, 1, 1, 0.06 + 0.08 * glass.boost)
+        property vector4d tint: Qt.vector4d(1, 1, 1, 0.06 + 0.10 * glass.frost + 0.08 * glass.boost)
     }
     // Without a background to bend (another login style), a plain clear pane.
     Rectangle {

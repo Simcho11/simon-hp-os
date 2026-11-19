@@ -214,10 +214,23 @@ LoginSurface {
         // reads blue rather than grey, black at night.
         Rectangle { anchors.fill: parent; color: Qt.rgba(root.core.veil.r, root.core.veil.g, root.core.veil.b, (0.36 + root.core.lift) * (1 - root.release)) }
     }
+    // What the glass sees: the same picture, frosted further and lifted a little, like HP-OS's thick glass.
+    Item {
+        id: frostLayer
+        anchors.fill: parent
+        visible: false
+        MultiEffect {
+            anchors.fill: parent
+            source: backdropLayer
+            blurEnabled: true; blur: 1; blurMax: 48
+            saturation: 0.18
+            brightness: 0.05
+        }
+    }
     ShaderEffectSource {
         id: backdropTexture
         anchors.fill: parent
-        sourceItem: backdropLayer
+        sourceItem: frostLayer
         live: true
         visible: false
     }
