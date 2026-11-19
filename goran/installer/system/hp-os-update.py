@@ -7,6 +7,7 @@
   hp-os-update request        answer Settings (socket activated)
   hp-os-update enroll FILE    connect this device to its publisher, from the bundle made on the publishing laptop
   hp-os-update status         print the current state
+  hp-os-update clock          set the clock from the internet, on a device with nothing else that does
 
 Nothing is changed until a release has passed every check: signed by the publisher, exactly the files that were
 signed, newer than what is installed, and fully built. People's files are never touched, and if installing fails
@@ -14,6 +15,7 @@ the version that was working is put back.
 """
 import importlib.machinery
 import importlib.util
+import email.utils
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,10 @@ NETRC = "etc/nix/hp-os-updates.netrc"
 BEGIN, END = "# HP-OS ready-built updates (managed by hp-os-update)", "# end of HP-OS ready-built updates"
 PUBLIC_CACHE = "https://cache.nixos.org"
 UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+# Where a device without its own time service (chrony, timesyncd) reads the time: two HTTPS sites the updater uses
+# anyway. Their Date headers have to agree, and TLS keeps them honest.
+CLOCK_SOURCES = ("https://cache.nixos.org/nix-cache-info", "https://github.com/")
+TIME_SERVICES = ("usr/sbin/chronyd", "lib/systemd/systemd-timesyncd", "usr/lib/systemd/systemd-timesyncd")
 GITHUB_KEY = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
 
 
@@ -51,6 +57,39 @@ def device_tools():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def internet_time(run=subprocess.run):
+    """The time now, from the Date headers of CLOCK_SOURCES, or None if they can't be reached or don't agree."""
+    found = []
+    for url in CLOCK_SOURCES:
+        started = time.time()
+        try:
+            headers = run(["/usr/bin/curl", "-fsSI", "--max-time", "8", url], capture_output=True, text=True, timeout=12).stdout
+            date = re.search(r"^date:[ \t]*(.+?)\r?$", headers, re.IGNORECASE | re.MULTILINE)
+            if date:
+                found.append(email.utils.parsedate_to_datetime(date.group(1)).timestamp() + (time.time() - started) / 2)
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            continue
+    if not found or (len(found) > 1 and max(found) - min(found) > 30):
+        return None
+    return sum(found) / len(found)
+
+
+def set_clock(root=Path("/"), run=subprocess.run, now=time.time):
+    """On a device with no time service, a clock more than a minute out is set from the internet, and its hardware
+    clock too, so the next start is right. Returns how many seconds it moved (0 when it was left alone)."""
+    if any((root / service).exists() for service in TIME_SERVICES):
+        return 0
+    actual = internet_time(run)
+    if actual is None or abs(actual - now()) < 60:
+        return 0
+    moved = actual - now()
+    if run(["/usr/bin/date", "-u", "-s", "@%d" % round(actual)], capture_output=True, check=False).returncode != 0:
+        return 0
+    if (root / "usr/sbin/hwclock").exists():
+        run(["/usr/sbin/hwclock", "--systohc", "--utc"], capture_output=True, check=False)
+    return moved
 
 
 class Updater:
@@ -349,6 +388,11 @@ class Updater:
 
     # ── The three things this device can be asked to do ──
     def check(self):
+        if self.root == Path("/"):          # Only the real device's clock.
+            try:
+                set_clock(self.root)
+            except OSError:
+                pass
         if not self.enrolled():
             return self.save(state="idle")
         self.settle()
@@ -488,6 +532,8 @@ def main():
     updater = Updater()
     if command == "check":
         updater.check()
+    elif command == "clock":
+        print(json.dumps({"moved": round(set_clock())}))
     elif command == "settle":
         updater.settle()
     elif command == "job":

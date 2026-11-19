@@ -412,6 +412,14 @@ def welcome_step(request):
     if action == "recovery-key":
         return recovery_key()
     if action == "timezone-list":
+        # A device with nothing that sets its clock (the first Intel laptops) gets it from the internet first, so the
+        # times shown beside each place are right.
+        updater = "/opt/hp-os/device/hp-os-update"
+        if os.path.isfile(updater):
+            try:
+                run("/usr/bin/python3", "-I", updater, "clock", timeout=40)
+            except subprocess.SubprocessError:
+                pass
         return {"ok": True, "zones": time_zones(), "current": current_zone()}
     if action == "timezone-set":
         return set_time_zone(request)
