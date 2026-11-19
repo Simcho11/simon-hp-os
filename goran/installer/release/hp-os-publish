@@ -149,8 +149,10 @@ def verify_builds(folder):
 GATEWAY = REPO / "goran/installer/release/download-gateway"
 
 
-def storage():
-    return json.loads(STORAGE.read_text()) if STORAGE.is_file() else None
+def storage(finished=True):
+    """The connected bucket; a setup that stopped before the download gateway doesn't count yet."""
+    found = json.loads(STORAGE.read_text()) if STORAGE.is_file() else None
+    return found if found and (found.get("downloads") or not finished) else None
 
 
 def tool(attribute, binary):
@@ -224,7 +226,11 @@ def deploy_gateway(settings):
                 stop("Cloudflare sign-in didn't finish. Nothing was changed on your account.")
         deployed = subprocess.run([wrangler, "deploy"], cwd=folder, capture_output=True, text=True)
         if deployed.returncode != 0:
-            stop("the download gateway couldn't be set up: %s" % (deployed.stderr or deployed.stdout).strip()[-400:])
+            found = re.search(r"https://dash\.cloudflare\.com/\S+/workers/onboarding", deployed.stdout + deployed.stderr)
+            if found:
+                stop("your Cloudflare account needs a workers.dev address first. Open %s , choose any name, then run "
+                     "this again. Your bucket and token are saved." % found.group(0))
+            stop("the download gateway couldn't be set up: %s" % (deployed.stdout + deployed.stderr).strip()[-600:])
         found = re.search(r"https://hp-os-updates\.[a-z0-9-]+\.workers\.dev", deployed.stdout + deployed.stderr)
         if not found:
             stop("the download gateway was set up, but its address wasn't shown. Run this again.")
@@ -240,28 +246,37 @@ def connect_storage():
     import secrets
     HOME.mkdir(parents=True, exist_ok=True)
     os.chmod(HOME, 0o700)
-    previous = storage() or {}
+    previous = storage(finished=False) or {}
     print("Connect HP-OS updates to your Cloudflare R2 bucket. What you type here stays on this laptop.")
-    account = input("Cloudflare account ID: ").strip()
-    bucket = input("Bucket name: ").strip()
-    writer = {"id": input("R2 API token - Access Key ID: ").strip(),
-              "secret": getpass.getpass("R2 API token - Secret Access Key (hidden as you type): ").strip()}
-    if not re.fullmatch(r"[0-9a-f]{32}", account) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
-        stop("that account ID or bucket name doesn't look right. Nothing was saved.")
-    if not writer["id"] or not writer["secret"]:
-        stop("both parts of the R2 API token are needed. Nothing was saved.")
-    settings = {"bucket": bucket, "endpoint": "%s.r2.cloudflarestorage.com" % account, "region": "auto", "writer": writer,
-                "password": previous.get("password") or secrets.token_urlsafe(32)}
+    if previous.get("bucket") and previous.get("writer") and not previous.get("downloads"):
+        # A setup that stopped at the download gateway: the bucket and token were already checked.
+        print("Using the bucket and token you entered before (%s)." % previous["bucket"])
+        settings = previous
+    else:
+        account = input("Cloudflare account ID: ").strip()
+        bucket = input("Bucket name: ").strip()
+        writer = {"id": input("R2 API token - Access Key ID: ").strip(),
+                  "secret": getpass.getpass("R2 API token - Secret Access Key (hidden as you type): ").strip()}
+        if not re.fullmatch(r"[0-9a-f]{32}", account) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
+            stop("that account ID or bucket name doesn't look right. Nothing was saved.")
+        if not writer["id"] or not writer["secret"]:
+            stop("both parts of the R2 API token are needed. Nothing was saved.")
+        settings = {"bucket": bucket, "endpoint": "%s.r2.cloudflarestorage.com" % account, "region": "auto",
+                    "writer": writer, "password": previous.get("password") or secrets.token_urlsafe(32)}
     make_cache_key()
     check = subprocess.run([tool("nix", "nix"), "--extra-experimental-features", "nix-command", "store", "info",
                             "--store", upload_url(settings)], capture_output=True, text=True,
                            env=dict(os.environ, **access(writer)))
     if check.returncode != 0:
         stop("that token couldn't reach the bucket: %s" % check.stderr.strip()[-300:])
+
+    def save():
+        descriptor = os.open(STORAGE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(settings, stream, indent=2)
+    save()     # Kept if the gateway step stops, so running this again picks up from there.
     settings["downloads"] = deploy_gateway(settings)
-    descriptor = os.open(STORAGE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        json.dump(settings, stream, indent=2)
+    save()
     if not gateway_answers(settings["downloads"], settings["password"]):
         print("Saved, but the download gateway isn't answering yet. New gateways can take a minute; publishing checks again.")
     print("Connected. From the next release on, devices download updates ready-built.")
