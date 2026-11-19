@@ -7,6 +7,14 @@ pkgs.runCommand "hp-os-add-user" { } ''
   cp ${./add-user/shell.qml} "$app/shell.qml"
   cp ${./add-user/accounts.py} "$app/accounts.py"
   cp ${./add-user/SetupBar.qml} "$app/SetupBar.qml"
+  cp ${./add-user/device-client.py} "$app/device-client.py"
+  mkdir -p "$app/factory-reset"
+  cp ${./add-user/factory-reset.qml} "$app/factory-reset/shell.qml"
+  cp ${./add-user/device-client.py} "$app/factory-reset/device-client.py"
+  cp ${./login-theme/LoginActivity.qml} "$app/factory-reset/LoginActivity.qml"
+  mkdir -p "$app/software-update"
+  cp ${./add-user/software-update.qml} "$app/software-update/shell.qml"
+  cp ${./add-user/device-client.py} "$app/software-update/device-client.py"
   mkdir -p "$app/first-setup"
   cp ${./add-user/first-setup.qml} "$app/first-setup/shell.qml"
   cp ${./add-user/SetupBar.qml} "$app/first-setup/SetupBar.qml"
@@ -18,10 +26,29 @@ pkgs.runCommand "hp-os-add-user" { } ''
   #!/bin/sh
   export HP_OS_ADD_USER_HELPER="$app/accounts.py"
   export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
+  [ "\$1" != "hpos-add-user:first-boot" ] || export HP_OS_FIRST_BOOT=1
   exec ${quickshell}/bin/quickshell -n -p "$app/shell.qml"
   EOF
   sed -i 's/^  //' "$out/bin/hp-os-add-user"
   chmod +x "$out/bin/hp-os-add-user"
+
+  # Settings > General > Factory reset.
+  cat > "$out/bin/hp-os-factory-reset" <<EOF
+  #!/bin/sh
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
+  exec ${quickshell}/bin/quickshell -n -p "$app/factory-reset/shell.qml"
+  EOF
+  sed -i 's/^  //' "$out/bin/hp-os-factory-reset"
+  chmod +x "$out/bin/hp-os-factory-reset"
+
+  # Settings > General > Software Update.
+  cat > "$out/bin/hp-os-software-update" <<EOF
+  #!/bin/sh
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
+  exec ${quickshell}/bin/quickshell -n -p "$app/software-update/shell.qml"
+  EOF
+  sed -i 's/^  //' "$out/bin/hp-os-software-update"
+  chmod +x "$out/bin/hp-os-software-update"
 
   # First sign-in of an account that isn't set up yet: HP logo and a progress bar on black.
   niri=/opt/hp-os/niri-patch/result-hpos/bin/niri

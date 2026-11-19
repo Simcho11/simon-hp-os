@@ -20,6 +20,8 @@ greeter_backup=$greeter.bak-before-add-user
 niri=/opt/hp-os/niri-patch/result-hpos/bin/niri
 
 if [[ "${1:-}" == --undo ]]; then
+    "$here/hp-os-settings-access.sh" --undo
+    "$here/hp-os-device-setup.sh" --undo
     rm -f "$launcher"
     update-desktop-database -q /usr/share/applications || true
     "$here/hp-os-login-theme.sh" --undo-last
@@ -55,6 +57,11 @@ EOF
 chmod 644 "$launcher"
 update-desktop-database -q /usr/share/applications
 
+# Brightness, touchpad feedback and AirDrop for every account. Before the accounts are updated below,
+# because their setup links the AirDrop published here.
+"$here/hp-os-settings-access.sh"
+# First-time setup on a new device, and factory reset in Settings.
+"$here/hp-os-device-setup.sh"
 "$here/hp-os-login-theme.sh"
 # Publishes first-time setup with its progress, and the sign-in step that shows it.
 "$here/hp-os-login-session.sh"

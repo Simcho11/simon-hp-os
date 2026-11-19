@@ -1,0 +1,662 @@
+--- a/modules/background/desktopItems/DesktopDragGhost.qml
++++ b/modules/background/desktopItems/DesktopDragGhost.qml
+@@ -33,6 +33,11 @@
+     // The first desktop switch hands the icon to the system's drag-and-drop first (the icon asks for it): a drag
+     // held by the desktop page it started on does not survive that page moving away.
+     property bool lifted: false
++    // Handed to drag-and-drop: the pointer is over the desktop itself, not a window, the Dock or a folder.
++    property bool overDesktop: false
++    // The held icon's top-left exactly under the pointer, even past the edge where it would land.
++    property real heldX: 0
++    property real heldY: 0
+     signal liftRequested()
+     property var _pendingSwitch: null
+     Timer {
+@@ -148,6 +153,8 @@
+     // The pointer at (px, py) on the screen and the icon's top-left at (x, y).
+     function move(px: real, py: real, x: real, y: real): void {
+         const w = root.work
++        root.heldX = x
++        root.heldY = y
+         root.x = w.width > 0 ? Math.max(w.x, Math.min(w.x + w.width - root.width, x)) : x
+         root.y = w.height > 0 ? Math.max(w.y, Math.min(w.y + w.height - root.height, y)) : y
+         root.movedSinceSwitch = true
+--- a/modules/background/desktopItems/DesktopDragGhostView.qml
++++ b/modules/background/desktopItems/DesktopDragGhostView.qml
+@@ -34,7 +34,8 @@
+     // slot to slot (off with iris.desktopDropIndicator).
+     Repeater {
+         // a count, not the list: the plates stay the same items while the slots change, so they glide
+-        model: root.showing && (Config.options?.iris?.desktopDropIndicator ?? true) ? DesktopDragGhost.plan.length : 0
++        model: root.showing && (!DesktopDragGhost.lifted || DesktopDragGhost.overDesktop)
++            && (Config.options?.iris?.desktopDropIndicator ?? false) ? DesktopDragGhost.plan.length : 0
+         delegate: Rectangle {
+             id: dropSlot
+             required property int index
+@@ -65,14 +66,18 @@
+     // showing, under the pointer, with live liquid glass behind each, so the glass keeps bending the wallpaper as
+     // the desktops slide and as they are moved (a drag-and-drop picture is a still snapshot).
+     Repeater {
+-        model: root.mine && DesktopDragGhost.lifted && DesktopDragGhost.activeIndex === root.page
+-            ? DesktopDragGhost.group : []
++        // A file's picture comes from drag-and-drop so it can cross windows; over the desktop the glass goes under it.
++        readonly property bool fileDrag: (DesktopDragGhost.owner?.fileUris?.length ?? 0) > 0
++        model: !root.mine || !DesktopDragGhost.lifted || DesktopDragGhost.activeIndex !== root.page ? []
++            : !fileDrag ? DesktopDragGhost.group
++            : DesktopDragGhost.overDesktop ? DesktopDragGhost.group.slice(0, 1) : []
+         delegate: Item {
+             id: ghost
+             required property var modelData
+             z: 1000
+-            x: DesktopDragGhost.x + modelData.dx - root.origin.x
+-            y: DesktopDragGhost.y + modelData.dy - root.origin.y - root.shift
++            readonly property bool glassOnly: (DesktopDragGhost.owner?.fileUris?.length ?? 0) > 0
++            x: (ghost.glassOnly ? DesktopDragGhost.heldX : DesktopDragGhost.x + modelData.dx) - root.origin.x
++            y: (ghost.glassOnly ? DesktopDragGhost.heldY : DesktopDragGhost.y + modelData.dy) - root.origin.y - root.shift
+             width: DesktopDragGhost.width
+             height: DesktopDragGhost.height
+ 
+@@ -85,6 +90,7 @@
+             }
+             Item {
+                 id: plate
++                visible: !ghost.glassOnly
+                 anchors.top: parent.top
+                 anchors.topMargin: 7
+                 anchors.horizontalCenter: parent.horizontalCenter
+@@ -98,6 +104,7 @@
+                 }
+             }
+             StyledText {
++                visible: !ghost.glassOnly
+                 readonly property bool lightDesktop: !HposTokens.dark
+                 anchors.left: parent.left
+                 anchors.right: parent.right
+--- a/modules/background/desktopItems/DesktopDropCoordinator.qml
++++ b/modules/background/desktopItems/DesktopDropCoordinator.qml
+@@ -8,6 +8,7 @@
+ import qs.modules.common
+ import qs.modules.common.functions
+ import qs.modules.iris.field
++import qs.modules.hpos.design
+ 
+ Item {
+     id: root
+@@ -75,6 +76,52 @@
+         root._processNext()
+     }
+ 
++    // hp-snap: where files coming from a window will land, while they are held over the desktop.
++    property var _incomingSlots: []
++    function _showIncoming(drag): void {
++        if (!drag.hasUrls || (DesktopDragGhost.active && DesktopDragGhost.lifted)) {
++            root._incomingSlots = []
++            return
++        }
++        root._dropX = drag.x
++        root._dropY = drag.y
++        const count = Math.max(1, Array.from(drag.urls ?? []).length)
++        const slots = []
++        for (let index = 0; index < count; index++) slots.push(root._position(index))
++        root._incomingSlots = slots
++    }
++
++    // hp-snap: files dragged to the desktop land in the Desktop folder, where they were let go.
++    property var _arrivals: []
++    function _bringIn(urls, x, y): void {
++        root._arrivals = root._arrivals.concat([{ urls: urls, x: x, y: y, page: root.page }])
++        root._nextArrival()
++    }
++    function _nextArrival(): void {
++        if (bringIn.running || root._arrivals.length === 0) return
++        bringIn.job = root._arrivals[0]
++        root._arrivals = root._arrivals.slice(1)
++        bringIn.command = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py"), "auto", DesktopFolder.folder]
++            .concat(bringIn.job.urls)
++        bringIn.running = true
++    }
++    function _landed(lines: var, job: var): void {
++        root._dropX = job.x
++        root._dropY = job.y
++        root._firstCreatedId = ""
++        lines.forEach((line, index) => {
++            const landed = JSON.parse(line)
++            const target = "file://" + landed.path
++            const position = root._position(index)
++            const known = Object.keys(DesktopItems.items).find(id => DesktopItems.items[id].target === target)
++            const place = { output: root.outputName, workspacePage: job.page || undefined, x: position.x, y: position.y }
++            if (known) DesktopItems.update(known, place)
++            else root._recordCreated(DesktopItems.create(Object.assign({ kind: landed.kind, target: target,
++                label: root._labelFor(landed.path), desktopFile: true }, place)))
++        })
++        DesktopFolder.rescan()
++    }
++
+     function createAccesses(urls, x, y): void {
+         root._enqueue(urls, x, y)
+     }
+@@ -152,7 +199,9 @@
+         keys: ["application/x-hpos-desktop-item", "application/x-inir-desktop-entry", "text/uri-list", "text/plain"]
+         onEntered: drag => {
+             root.dropHover = true
+-            drag.accept(drag.keys.includes("application/x-hpos-desktop-item") ? Qt.MoveAction : Qt.CopyAction)
++            DesktopDragGhost.overDesktop = true
++            root._showIncoming(drag)
++            drag.accept(drag.supportedActions & Qt.MoveAction ? Qt.MoveAction : Qt.CopyAction)
+             if (drag.y >= Number(root.workArea.bottom ?? root.canvasHeight) - 32) pageEdgeDelay.restart()
+         }
+         onPositionChanged: drag => {
+@@ -165,14 +214,17 @@
+                 pageEdgeDelay.stop()
+                 return
+             }
++            root._showIncoming(drag)
+             if (drag.y >= Number(root.workArea.bottom ?? root.canvasHeight) - 32) {
+                 if (!pageEdgeDelay.running) pageEdgeDelay.start()
+             } else pageEdgeDelay.stop()
+         }
+-        onExited: { root.dropHover = false; pageEdgeDelay.stop() }
++        onExited: { root.dropHover = false; DesktopDragGhost.overDesktop = false; root._incomingSlots = []; pageEdgeDelay.stop() }
+         onDropped: drop => {
+             pageEdgeDelay.stop()
+             root.dropHover = false
++            DesktopDragGhost.overDesktop = false
++            root._incomingSlots = []
+             if (drop.keys.includes("application/x-hpos-desktop-item")) {
+                 const id = drop.getDataAsString("application/x-hpos-desktop-item")
+                 const item = DesktopItems.get(id)
+@@ -185,6 +237,7 @@
+                 // hp-snap: a carried icon (and the selection with it) lands where its picture is, placed as an
+                 // ordinary drag places it
+                 if (carried) {
++                    if (DesktopDragGhost.owner) DesktopDragGhost.owner._placedHere = true
+                     drop.accept(Qt.MoveAction)
+                     DesktopDragGhost.placeAll(root.page)
+                     return
+@@ -226,28 +279,50 @@
+                 return
+             }
+ 
+-            const imageUrls = []
+-            const otherUrls = []
++            const files = [], others = []
+             for (const url of drop.urls) {
+-                const path = root._pathFromDropUrl(url)
+-                if (root._isImage(path)) imageUrls.push(url)
+-                else otherUrls.push(url)
++                const text = String(url)
++                if (text.startsWith("file:") && !text.endsWith(".desktop")) files.push(text)
++                else others.push(text)
+             }
+-            if (otherUrls.length > 0)
+-                root._enqueue(otherUrls, drop.x, drop.y)
+-            if (imageUrls.length > 0)
+-                root.requestImageChoice(imageUrls, drop.x, drop.y)
+-            drop.accept(Qt.CopyAction)
++            if (others.length > 0)
++                root._enqueue(others, drop.x, drop.y)
++            if (files.length > 0)
++                root._bringIn(files, drop.x, drop.y)
++            drop.accept(drop.supportedActions & Qt.MoveAction ? Qt.MoveAction : Qt.CopyAction)
+         }
+     }
+ 
+-    Rectangle {
+-        anchors.fill: parent
+-        visible: root.dropHover
+-        color: ColorUtils.applyAlpha(Appearance.colors.colPrimary, 0.08)
+-        border.width: 2
+-        border.color: Appearance.colors.colPrimary
+-        radius: Appearance.rounding.normal
++    Repeater {
++        model: (Config.options?.iris?.desktopDropIndicator ?? false) ? root._incomingSlots.length : 0
++        delegate: Rectangle {
++            id: incomingSlot
++            required property int index
++            readonly property var slot: root._incomingSlots[incomingSlot.index] ?? ({ x: 0, y: 0 })
++            property bool placed: false
++            x: Number(root.workArea.left ?? 0) + slot.x + 2
++            y: Number(root.workArea.top ?? 0) + slot.y + 2
++            width: DesktopItems.itemWidth - 4
++            height: DesktopItems.itemHeight - 4
++            radius: Appearance.rounding.large
++            color: HposTokens.dark ? Qt.rgba(1, 1, 1, 0.30) : Qt.rgba(1, 1, 1, 0.50)
++            border.width: 1.5
++            border.color: Qt.rgba(1, 1, 1, HposTokens.dark ? 0.80 : 0.95)
++            opacity: placed ? 1 : 0
++            Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
++            Behavior on x { enabled: incomingSlot.placed; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
++            Behavior on y { enabled: incomingSlot.placed; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
++            Component.onCompleted: Qt.callLater(() => incomingSlot.placed = true)
++        }
++    }
++
++    Process {
++        id: bringIn
++        property var job: ({})
++        stdout: StdioCollector {
++            onStreamFinished: root._landed(text.split("\n").filter(line => line.length > 0), bringIn.job)
++        }
++        onExited: root._nextArrival()
+     }
+ 
+     Process {
+--- a/modules/background/desktopItems/DesktopItemDelegate.qml
++++ b/modules/background/desktopItems/DesktopItemDelegate.qml
+@@ -631,6 +631,146 @@
+         Keys.onEscapePressed: root.finishEdit(false)
+     }
+ 
++    // DesktopItems stores raw paths. Escape each component before exporting a file URI.
++    readonly property var fileUris: {
++        const ids = root._groupLeading ? GlobalStates.selectedDesktopItemIds() : [root.itemId]
++        const urls = []
++        for (const id of ids) {
++            const item = DesktopItems.get(id)
++            if (!item?.desktopFile || item.locked) return []
++            const path = DesktopFolder.pathOf(item.target)
++            if (!path.startsWith("/")) return []
++            urls.push("file://" + path.split("/").map(encodeURIComponent).join("/"))
++        }
++        return urls
++    }
++
++    // A folder takes what is dragged onto it, and the Trash throws it away. No menu: the drive decides, as on macOS.
++    DropArea {
++        id: folderDrop
++        anchors.fill: parent
++        enabled: root.dragEnabled && !root._lifted && !root._groupFollowing
++            && (root.isFolder || root.target === "hp-os-trash")
++        keys: ["text/uri-list"]
++        property bool wanted: false
++
++        function welcome(event): bool {
++            const carried = DesktopDragGhost.active && DesktopDragGhost.lifted
++                && event.keys.includes("application/x-hpos-desktop-item")
++            return !(carried && DesktopDragGhost.group.some(member => member.id === root.itemId))
++        }
++        function answer(event): void {
++            wanted = welcome(event)
++            if (wanted) event.accept(event.supportedActions & Qt.MoveAction ? Qt.MoveAction : Qt.CopyAction)
++            else event.accepted = false
++        }
++        onEntered: event => answer(event)
++        onPositionChanged: event => answer(event)
++        onExited: wanted = false
++        onDropped: event => {
++            wanted = false
++            if (!event.hasUrls || !event.urls.length || !welcome(event)) {
++                event.accepted = false
++                return
++            }
++            const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py")]
++            const urls = Array.from(event.urls, String)
++            Quickshell.execDetached(helper.concat(root.isFolder ? ["auto", root._pathForProbe()] : ["trash"], urls))
++            event.accept(event.supportedActions & Qt.MoveAction ? Qt.MoveAction : Qt.CopyAction)
++        }
++    }
++    // Held over a folder, it springs open so the file can go deeper.
++    Timer {
++        interval: 800
++        running: root.isFolder && folderDrop.containsDrag && folderDrop.wanted
++        onTriggered: ShellExec.openDirectory(root._pathForProbe(), "Browse drop destination")
++    }
++    Rectangle {
++        anchors.centerIn: iconPlate
++        width: iconPlate.width + 10
++        height: iconPlate.height + 10
++        radius: 14
++        visible: folderDrop.containsDrag && folderDrop.wanted
++        color: ColorUtils.applyAlpha(Appearance.colors.colPrimary, 0.30)
++    }
++
++    // The picture that follows the pointer, over windows too: the icon and its name, or a stack and how many.
++    readonly property var _dragIcons: (root._groupLeading ? GlobalStates.selectedDesktopItemIds() : [root.itemId])
++        .map(id => AppSearch.resolveIcon(String(DesktopItems.get(id)?.icon ?? ""), "text-x-generic"))
++    property bool _picturing: false
++    property var _pictureHeld: null
++    function _takePicture(): void {
++        root._liftImage = ""
++        root._picturing = false
++        if (root.fileUris.length > 0) Qt.callLater(() => root._picturing = true)
++    }
++    Loader {
++        active: root._picturing
++        x: -4 * root.width
++        sourceComponent: Item {
++            width: root.width
++            height: root.height
++            Repeater {
++                model: root._dragIcons.slice(0, 3).reverse()
++                Image {
++                    required property var modelData
++                    required property int index
++                    readonly property int step: root._dragIcons.slice(0, 3).length - 1 - index
++                    x: (parent.width - width) / 2 + step * 7
++                    y: 7 + (54 - height) / 2 - step * 5
++                    width: DesktopItems.itemIconSize * 0.92
++                    height: width
++                    sourceSize: Qt.size(width * 2, height * 2)
++                    source: modelData
++                    asynchronous: false
++                    smooth: true
++                    mipmap: true
++                }
++            }
++            Rectangle {
++                visible: root._dragIcons.length > 1
++                anchors.right: parent.right
++                anchors.rightMargin: 12
++                y: 2
++                width: Math.max(22, count.implicitWidth + 12)
++                height: 22
++                radius: 11
++                color: "#ff3b30"
++                Text {
++                    id: count
++                    anchors.centerIn: parent
++                    text: root._dragIcons.length
++                    color: "white"
++                    font.pixelSize: 13
++                    font.weight: Font.DemiBold
++                }
++            }
++            Text {
++                visible: root._dragIcons.length === 1
++                anchors.left: parent.left
++                anchors.right: parent.right
++                anchors.margins: 5
++                y: 63
++                horizontalAlignment: Text.AlignHCenter
++                text: root.label
++                elide: Text.ElideRight
++                maximumLineCount: 2
++                wrapMode: Text.Wrap
++                color: HposTokens.dark ? "white" : "#1b1d21"
++                style: Text.Raised
++                styleColor: HposTokens.dark ? "#b3000000" : "#99ffffff"
++                font.pixelSize: 16
++                font.weight: Font.Medium
++            }
++            Component.onCompleted: Qt.callLater(() => grabToImage(result => {
++                root._pictureHeld = result
++                root._liftImage = result.url
++                root._picturing = false
++                root._carryMove()      // a quick drag may already be waiting for its picture
++            }, Qt.size(root.width, root.height)))
++        }
++    }
++
+     MouseArea {
+         id: mouse
+         anchors.fill: parent
+@@ -676,8 +816,10 @@
+                 mouse.drag.target = null
+             else if (root.locked || !root.dragEnabled)
+                 mouse.drag.target = null
+-            else
++            else {
+                 root._positionOverride = true
++                root._takePicture()
++            }
+         }
+         onReleased: event => {
+             mouse.drag.target = root
+@@ -787,18 +929,33 @@
+     property bool _lifted: false
+     property url _liftImage: ""
+     // A selection carried with it is drawn by the desktop showing too (DesktopDragGhostView).
+-    opacity: root._lifted || (root._groupFollowing && DesktopDragGhost.lifted) ? 0 : 1
++    // A file stays dimmed where it was while it is carried, then goes once it has landed somewhere else.
++    property bool _leaving: false
++    property bool _placedHere: false
++    Timer { id: leaveTimer; interval: 1500; onTriggered: root._leaving = false }
++    opacity: root._leaving ? 0 : root._lifted || (root._groupFollowing && DesktopDragGhost.lifted)
++        ? (root.fromFolder ? 0.4 : 0) : 1
+     Drag.active: root._lifted
+     Drag.dragType: Drag.Automatic
+-    Drag.supportedActions: Qt.MoveAction
++    Drag.supportedActions: root.fileUris.length ? Qt.CopyAction | Qt.MoveAction : Qt.MoveAction
+     Drag.proposedAction: Qt.MoveAction
+-    Drag.keys: ["application/x-hpos-desktop-item"]
+-    Drag.mimeData: ({ "application/x-hpos-desktop-item": root.itemId })
++    Drag.keys: root.fileUris.length ? ["application/x-hpos-desktop-item", "text/uri-list"] : ["application/x-hpos-desktop-item"]
++    Drag.mimeData: root.fileUris.length
++        ? ({ "application/x-hpos-desktop-item": root.itemId, "text/uri-list": root.fileUris.join("\r\n") })
++        : ({ "application/x-hpos-desktop-item": root.itemId })
++    // Only ever the prepared picture: an icon file on its own would be drawn at its full, huge size.
++    Drag.imageSource: root.fileUris.length ? root._liftImage : ""
+     // No picture: the desktop showing draws the icon with live glass (DesktopDragGhostView).
+     Drag.hotSpot.x: root._pressOffset.x
+     Drag.hotSpot.y: root._pressOffset.y
+     Drag.onDragFinished: dropAction => {
+         root._lifted = false
++        if (dropAction === Qt.MoveAction && !root._placedHere && root.fileUris.length) {
++            root._leaving = true
++            leaveTimer.restart()
++            DesktopFolder.rescan()
++        }
++        root._placedHere = false
+         if (root._groupLeading) {       // not dropped on a desktop: the selection goes back too
+             root._groupLeading = false
+             GlobalStates.desktopGroupAction("dragCancel")
+@@ -830,7 +987,7 @@
+     // A selection let go on its own desktop: where each lands, worked out before the carry ends.
+     property var _homePlan: []
+     function _carryMove(): void {
+-        if (!root._carryable || !mouse.drag.active) return
++        if ((!root._carryable && !root.fileUris.length) || !mouse.drag.active || root._lifted) return
+         const host = root.QsWindow.contentItem
+         if (!host) return
+         if (!DesktopDragGhost.active) {
+@@ -851,6 +1008,13 @@
+         const px = p.x
+         const py = p.y + DesktopDragGhost.pageShift(root.page)
+         DesktopDragGhost.move(px, py, px - root._pressOffset.x, py - root._pressOffset.y)
++        if (root.fileUris.length && root._liftImage.toString().length > 0) {
++            root.x = root._pressX
++            root.y = root._pressY
++            DesktopDragGhost.overDesktop = true      // the glass is under it from the first moment
++            DesktopDragGhost.lifted = true
++            root._lifted = true
++        }
+     }
+     // Let go on another desktop: the icon moves there, where it was dropped (or the nearest free place).
+     function _carryDrop(): bool {
+--- a/modules/common/Config.qml
++++ b/modules/common/Config.qml
+@@ -3964,7 +3964,7 @@
+                 property bool desktopWorkspaceFollowSwipe: true
+                 property int desktopWorkspaceMouseSensitivity: 100 // hp-snap: desktop page scrolling with a mouse wheel, 50..200 %
+                 property int desktopWorkspaceTouchpadSensitivity: 100 // hp-snap: desktop page scrolling with a touchpad, 50..200 %
+-                property bool desktopDropIndicator: true // hp-snap: a bright plate in the slot a dragged desktop icon will land in
++                property bool desktopDropIndicator: false // hp-snap: a bright plate in the slot a dragged desktop icon will land in
+                 property string workspaceRailStyle: "liquid" // hp-snap: the workspace dots: "liquid" (dots flow into the selection) or "slider"
+                 property bool workspaceLocalApps: false
+                 property bool workspacePageContents: true
+--- a/modules/iris/dock/IrisDock.qml
++++ b/modules/iris/dock/IrisDock.qml
+@@ -891,6 +891,31 @@
+                                 onDockIconIdsChanged: if (!entry.separator) root.noteDockIcon(entry.modelData.appId, appSlot.dockIconIds, appSlot.dockIconCentre)
+                                 Component.onCompleted: if (!entry.separator) root.noteDockIcon(entry.modelData.appId, appSlot.dockIconIds, appSlot.dockIconCentre)
+                                 Component.onDestruction: root.noteDockIcon(entry.modelData.appId, [], null)
++                                // hp-snap: drop files on the Trash to throw them away, or on an app to open them with it.
++                                DropArea {
++                                    id: fileDrop
++                                    anchors.fill: parent
++                                    keys: ["text/uri-list"]
++                                    readonly property bool trash: entry.modelData.appId === "hp-os-trash"
++                                    enabled: !entry.separator && (trash || /%[fFuU]/.test(String(appSlot.desktopEntry?.execString ?? "")))
++                                    onEntered: drag => drag.accept(trash && (drag.supportedActions & Qt.MoveAction) ? Qt.MoveAction : Qt.CopyAction)
++                                    onDropped: drop => {
++                                        if (!drop.hasUrls || !drop.urls.length) { drop.accepted = false; return }
++                                        const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py")]
++                                        const urls = Array.from(drop.urls, String)
++                                        Quickshell.execDetached(helper.concat(fileDrop.trash ? ["trash"]
++                                            : ["open", String(appSlot.desktopEntry?.id ?? entry.modelData.appId)], urls))
++                                        drop.accept(fileDrop.trash && (drop.supportedActions & Qt.MoveAction) ? Qt.MoveAction : Qt.CopyAction)
++                                    }
++                                }
++                                Rectangle {
++                                    anchors.centerIn: parent
++                                    width: root.iconSize * 1.25
++                                    height: width
++                                    radius: width * 0.28
++                                    visible: fileDrop.containsDrag
++                                    color: Qt.rgba(1, 1, 1, 0.28)
++                                }
+                                 Binding {
+                                     target: GlobalStates
+                                     property: "irisDockHome"
+--- a/modules/iris/settings/IrisOptions.qml
++++ b/modules/iris/settings/IrisOptions.qml
+@@ -791,7 +791,7 @@
+         { section: "desktop", group: "Workspaces", label: "Apps on the current desktop", description: "Show running apps from the current workspace in the dock. Dock pins stay available as launch shortcuts.", path: "iris.workspaceLocalApps", kind: "switch", fallback: false, showIf: () => Config.options?.panelFamily === "hpos", keywords: ["desktops", "dock", "apps", "windows"] },
+         { section: "desktop", group: "Workspaces", label: "Separate desktop contents", description: "Keep each workspace's icons and widgets on its own page while the wallpaper stays in place.", path: "iris.workspacePageContents", kind: "switch", fallback: true, showIf: () => Config.options?.panelFamily === "hpos", keywords: ["icons", "widgets", "wallpaper", "pages"] },
+         // hp-snap: the plate showing where a dragged desktop icon will land
+-        { section: "desktop", group: "Icons", label: "Show where a dragged icon will land", description: "While you drag an icon, a bright plate marks the slot it will drop into, like HarmonyOS.", path: "iris.desktopDropIndicator", kind: "switch", fallback: true, keywords: ["drop", "drag", "slot", "indicator", "highlight", "icon", "placement", "grid", "harmonyos"] },
++        { section: "desktop", group: "Icons", label: "Show where a dragged icon will land", description: "While you drag an icon, a bright plate marks the slot it will drop into, like HarmonyOS.", path: "iris.desktopDropIndicator", kind: "switch", fallback: false, keywords: ["drop", "drag", "slot", "indicator", "highlight", "icon", "placement", "grid", "harmonyos"] },
+         { section: "desktop", group: "Widgets", label: "Desktop widgets", description: "Turning this off also unloads their data providers.", path: "iris.modules.desktopWidgets", kind: "switch", fallback:true },
+         { section: "desktop", group: "Overview backdrop", label: "Wallpaper behind the overview", description: "Shown around workspaces when Niri's overview is open.", path: "background.backdrop.enable", kind: "switch", fallback:true },
+         { section: "desktop", group: "Overview backdrop", label: "Same wallpaper as the desktop", description: "Off keeps the overview's own wallpaper; choose it in the gallery with Overview as the target.", path: "background.backdrop.useMainWallpaper", kind: "switch", fallback: true },
+diff --git a/scripts/hp-snap/folder_drop.py b/scripts/hp-snap/folder_drop.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/hp-snap/folder_drop.py
+@@ -0,0 +1,136 @@
++"""Where a dragged file lands, decided the way macOS decides it.
++
++  folder_drop.py auto FOLDER URL...   move within the same drive, copy to another drive
++  folder_drop.py copy FOLDER URL...   always copy
++  folder_drop.py trash URL...         put in the Trash
++  folder_drop.py open APP URL...      open with the app (a desktop file id)
++
++auto and copy print one JSON line {"path", "kind"} for each item, wherever it ended up. Nothing is ever
++overwritten: a name already taken gets a number, as in "Report 2.pdf".
++"""
++import ctypes
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++from tempfile import TemporaryDirectory
++from urllib.parse import unquote, urlsplit
++
++AT_FDCWD = -100
++RENAME_NOREPLACE = 1
++LIBC = ctypes.CDLL(None, use_errno=True)
++
++
++def local_path(uri):
++    url = urlsplit(uri)
++    if url.scheme != "file" or url.netloc not in ("", "localhost") or not url.path.startswith("/"):
++        raise ValueError("Only files on this device can be dropped here.")
++    return Path(unquote(url.path, errors="strict"))
++
++
++def numbered(folder, name, number):
++    if number == 1:
++        return folder / name
++    path = Path(name)
++    stem, suffix = (name, "") if name.startswith(".") and path.suffix == "" else (path.stem, path.suffix)
++    return folder / f"{stem} {number}{suffix}"
++
++
++def rename_new(source, dest):
++    """Renames only if dest doesn't exist. Returns False when the name is taken."""
++    done = LIBC.renameat2(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(dest), RENAME_NOREPLACE)
++    if done == 0:
++        return True
++    error = ctypes.get_errno()
++    if error == 17:  # EEXIST
++        return False
++    if error in (22, 38):  # This filesystem can't promise it, so look first.
++        if os.path.lexists(dest):
++            return False
++        os.rename(source, dest)
++        return True
++    raise OSError(error, os.strerror(error), str(source))
++
++
++def put(source, folder, name):
++    number = 1
++    while not rename_new(source, numbered(folder, name, number)):
++        number += 1
++    return numbered(folder, name, number)
++
++
++def copy_item(source, staged):
++    if source.is_dir() and not source.is_symlink():
++        shutil.copytree(source, staged, symlinks=True)
++    else:
++        shutil.copy2(source, staged, follow_symlinks=False)
++
++
++def transfer(action, folder, url):
++    source = local_path(url)
++    if not os.path.lexists(source) or not source.name:
++        raise ValueError(f"{source.name or source} is no longer available.")
++    real_dir = source.is_dir() and not source.is_symlink()
++    if source.parent.resolve() == folder and action == "auto":
++        return source
++    if real_dir and folder.is_relative_to(source.resolve()):
++        raise ValueError(f"{source.name} can't be put inside itself.")
++    if action == "auto" and os.lstat(source).st_dev == os.stat(folder).st_dev:
++        return put(source, folder, source.name)
++    # Hidden until complete, so a half-copied file never shows up.
++    with TemporaryDirectory(prefix=".hp-os-copy-", dir=folder) as staging:
++        staged = Path(staging) / "item"
++        copy_item(source, staged)
++        return put(staged, folder, source.name)
++
++
++def bring(action, folder, urls):
++    folder = Path(folder).resolve(strict=True)
++    if not folder.is_dir():
++        raise ValueError("That folder is no longer available.")
++    errors = []
++    for url in urls:
++        try:
++            path = transfer(action, folder, url)
++        except (OSError, ValueError, shutil.Error) as error:
++            errors.append(str(error))
++            continue
++        kind = "folder" if path.is_dir() and not path.is_symlink() else "file"
++        print(json.dumps({"path": str(path), "kind": kind}), flush=True)
++    if errors:
++        raise ValueError("\n".join(errors))
++
++
++def desktop_file(app):
++    home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
++    stem = app[:-8] if app.endswith(".desktop") else app
++    for base in [home] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
++        candidate = Path(base) / "applications" / (stem + ".desktop")
++        if candidate.is_file():
++            return candidate
++    raise ValueError(f"{stem} is no longer installed.")
++
++
++def main(action, args):
++    if action in ("auto", "copy") and len(args) > 1:
++        bring(action, args[0], args[1:])
++    elif action == "trash" and args:
++        subprocess.run(["gio", "trash", "--"] + [str(local_path(url)) for url in args], check=True)
++    elif action == "open" and len(args) > 1:
++        app = desktop_file(args[0])
++        urls = args[1:]
++        if "inode/directory" in app.read_text(errors="replace"):  # Files shows the folder a file is in.
++            urls = [path.as_uri() if path.is_dir() else path.parent.as_uri() for path in map(local_path, urls)]
++        subprocess.run(["gio", "launch", str(app)] + list(dict.fromkeys(urls)), check=True)
++    else:
++        raise ValueError("That drop isn't possible.")
++
++
++if __name__ == "__main__":
++    try:
++        main(sys.argv[1], sys.argv[2:])
++    except (IndexError, OSError, ValueError, subprocess.CalledProcessError) as error:
++        subprocess.run(["notify-send", "Couldn’t move that item", str(error)], check=False)
++        sys.exit(1)

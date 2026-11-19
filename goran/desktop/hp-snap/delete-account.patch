@@ -1,6 +1,6 @@
 --- a/scripts/accounts.py
 +++ b/scripts/accounts.py
-@@ -24,8 +24,28 @@
+@@ -24,8 +24,32 @@
          data = call(path, "org.freedesktop.DBus.Properties", "GetAll", "(s)", (USER,))[0]
          if not data.get("SystemAccount"):
              result.append({"username": data["UserName"], "name": data["RealName"],
@@ -15,6 +15,10 @@
 +    if not target or not target["local"] or target["uid"] < 1000:
 +        raise ValueError("Select a local login account.")
 +    uid = target["uid"]
++    # userdel removes the home folder, so only ever hand it the account's own folder under /home.
++    import pwd
++    if pwd.getpwuid(uid).pw_dir != "/home/" + target["username"]:
++        raise ValueError("This account's home folder is in an unexpected place, so nothing was deleted.")
 +    if uid == os.getuid():
 +        raise ValueError("Sign in with a different administrator account to delete this account.")
 +    if target["administrator"] and not any(user["local"] and user["administrator"]
@@ -25,11 +29,11 @@
 +                             Gio.DBusCallFlags.NONE, 10000, None).unpack()[0]
 +    if any(session[1] == uid for session in sessions):
 +        raise ValueError("Sign this account out of all sessions before deleting it.")
-+    call(ROOT, SERVICE, "DeleteUser", "(xb)", (uid, False))
++    call(ROOT, SERVICE, "DeleteUser", "(xb)", (uid, True))
  
  def password_hash(password):
      if not isinstance(password, str) or not password or "\0" in password:
-@@ -44,6 +64,9 @@
+@@ -44,6 +68,9 @@
      action = request.get("action")
      if action == "list":
          return {"ok": True, "users": users()}
@@ -60,7 +64,7 @@
 +                        username.text = ""
 +                        fullName.text = ""
 +                    }
-+                    root.message = result.deleted ? Translation.tr("Account deleted. Home folder kept.") : result.ok ? Translation.tr("Account information updated.") : result.error
++                    root.message = result.deleted ? Translation.tr("Account and its files deleted.") : result.ok ? Translation.tr("Account information updated.") : result.error
                  } catch (error) {
                      root.message = Translation.tr("Unable to read account information.")
                  }
@@ -90,7 +94,7 @@
 +                IrisText {
 +                    Layout.fillWidth: true
 +                    wrapMode: Text.WordWrap
-+                    text: root.deletion ? Translation.tr("Delete the login account %1? Its home folder and files will be kept.").arg(root.deletion.username) : ""
++                    text: root.deletion ? Translation.tr("Delete the account %1? Its home folder and all of its files will be permanently deleted. This can’t be undone.").arg(root.deletion.username) : ""
 +                }
 +                RowLayout {
 +                    Button {

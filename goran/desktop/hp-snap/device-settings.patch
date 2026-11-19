@@ -1,0 +1,158 @@
+--- a/modules/common/ToastManager.qml
++++ b/modules/common/ToastManager.qml
+@@ -88,7 +88,10 @@
+         root._lastReloadToastTime = now
+         const source = root._pendingReloadSource
+         root._pendingReloadSource = ""
+-        
++
++        // hp-snap: a reload that worked needs no announcement; failures still show.
++        if (Config.options?.panelFamily === "hpos") return
++
+         if (source === "quickshell") {
+             root.addToast(
+                 "Quickshell reloaded",
+--- a/modules/iris/settings/IrisOptions.qml
++++ b/modules/iris/settings/IrisOptions.qml
+@@ -4,6 +4,7 @@
+ import QtQuick
+ import Quickshell
+ import qs.modules.common
++import qs.modules.common.functions
+ import qs.services
+ import qs.modules.iris.style
+ import qs.modules.iris.pieces
+@@ -894,6 +895,10 @@
+         { section: "general", group: "Settings window", label: "Layout", description: "Sidebar lists every area beside the page. Rail keeps only their marks, for more room. Home opens on every area at once; each opens full width.", path: "iris.appearance.settingsLayout", kind: "choice", fallback: "sidebar", choices: [{ label: "Sidebar", value: "sidebar", glyph: "view_sidebar" }, { label: "Rail", value: "rail", glyph: "view_week" }, { label: "Home", value: "home", glyph: "grid_view" }], keywords: ["settings", "navigation", "sidebar", "rail", "grid", "home", "layout"] },
+         { section: "general", group: "Performance", label: "Low power", description: "Turns glass, blur and heavy wallpaper effects off everywhere.", path: "performance.lowPower", kind: "switch", fallback: false, keywords: ["performance", "battery", "effects", "glass", "blur", "rendimiento"] },
+ 
++        // hp-snap: the device itself
++        { section: "general", group: "Power", label: "Sleep", description: "Rest this device. Everything stays open.", kind: "action", button: "Sleep", keywords: ["suspend", "power"], run: () => Session.suspend() },
++        { section: "general", group: "Power", label: "Shut down", description: "Turn this device off.", kind: "action", button: "Shut down", keywords: ["power off", "turn off"], run: () => Session.poweroff() },
++        { section: "general", group: "Power", label: "Factory reset", description: "Erase every account and its files, and start this device again as new. Needs an administrator.", kind: "action", button: "Reset…", keywords: ["erase", "wipe", "reset"], run: () => Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-factory-reset"]) },
+         { section: "general", group: "HP-OS", label: "Weather provider", description: "Open-Meteo receives manually configured coordinates. Set latitude and longitude in weather settings, then enable weather. Automatic geolocation is disabled for HP-OS.", path: "hpos.weatherProvider", kind: "choice", fallback: "disabled", showIf: () => Config.options.panelFamily === "hpos", choices: [{label:"Disabled",value:"disabled"},{label:"Open-Meteo",value:"open-meteo"}] },
+         { section: "general", group: "HP-OS", label: "HP-OS preferences", description: "Typography, materials, accessibility and component gallery.", kind: "action", button: "Open", showIf: () => Config.options.panelFamily === "hpos", run: () => Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "hpos", "settings"]) },
+         { section: "general", group: "Shell family", label: "Family", description: "The whole shell's look. Each family keeps its own settings, so you can come back.", path: "panelFamily", kind: "choice", fallback: "iris", choices: [{label:"HP-OS",value:"hpos",glyph:"desktop_windows"},{label:"iRiS",value:"iris",glyph:"visibility"},{label:"Material",value:"ii",glyph:"dashboard"},{label:"Windows 11",value:"waffle",glyph:"window"}], keywords: ["family", "material", "waffle", "windows", "ii", "switch", "familia"] },
+--- a/modules/iris/settings/IrisSettings.qml
++++ b/modules/iris/settings/IrisSettings.qml
+@@ -976,6 +976,11 @@
+                                 visible: root.browsing && root.section === "gaming"
+                             }
+ 
++                            IrisUpdateCard {
++                                id: softwareUpdate
++                                visible: root.browsing && root.section === "general" && softwareUpdate.status.enrolled === true
++                            }
++
+                             IrisWallpaperCard {
+                                 screen: root.screen
+                                 visible: root.browsing && root.section === "general"
+--- a/modules/iris/settings/qmldir
++++ b/modules/iris/settings/qmldir
+@@ -14,6 +14,7 @@
+ IrisShortcutsPage 1.0 IrisShortcutsPage.qml
+ singleton IrisNiri 1.0 IrisNiri.qml
+ IrisGameModeCard 1.0 IrisGameModeCard.qml
++IrisUpdateCard 1.0 IrisUpdateCard.qml
+ IrisNiriMotionGallery 1.0 IrisNiriMotionGallery.qml
+ 
+ IrisDisplayVisibility 1.0 IrisDisplayVisibility.qml
+diff --git a/modules/iris/settings/IrisUpdateCard.qml b/modules/iris/settings/IrisUpdateCard.qml
+new file mode 100644
+--- /dev/null
++++ b/modules/iris/settings/IrisUpdateCard.qml
+@@ -0,0 +1,94 @@
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import Quickshell
++import Quickshell.Io
++import qs.services
++import qs.modules.common
++import qs.modules.common.functions
++import qs.modules.common.widgets
++import qs.modules.iris.components
++import qs.modules.iris.style
++
++// hp-snap: Software Update at the top of General, on devices connected to a publisher.
++Rectangle {
++    id: card
++
++    readonly property real d: IrisStyle.density
++    property var status: ({})
++    readonly property string state: String(card.status.state ?? "idle")
++    readonly property var offer: card.status.available ?? null
++    readonly property bool busy: card.state === "downloading" || card.state === "installing" || card.state === "restoring"
++    readonly property bool attention: !!card.offer || card.state === "restart" || card.state === "error"
++    readonly property string title: card.state === "restart" ? Translation.tr("Restart to finish updating")
++        : card.busy ? Translation.tr("Updating HP-OS")
++        : card.state === "error" ? Translation.tr("Update not installed")
++        : card.offer ? Translation.tr("HP-OS %1 is available").arg(card.offer.version)
++        : Translation.tr("HP-OS is up to date")
++    readonly property string detail: card.busy || card.state === "error" ? String(card.status.message ?? "")
++        : card.state === "restart" ? Translation.tr("Version %1 is installed.").arg(card.status.installed ?? "")
++        : card.offer ? Translation.tr("A software update is ready to install.")
++        : card.status.installed ? Translation.tr("Version %1").arg(card.status.installed) : Translation.tr("Software Update")
++
++    function open(): void {
++        Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-software-update"])
++    }
++
++    Layout.fillWidth: true
++    implicitHeight: Math.round(84 * card.d)
++    radius: IrisStyle.radiusTile
++    color: card.attention ? IrisStyle.tintFill(IrisStyle.identity.blue) : IrisStyle.readingCard
++
++    FileView {
++        path: Quickshell.env("HP_OS_UPDATE_STATUS") || "/var/lib/hp-os/update/status.json"
++        watchChanges: true
++        onFileChanged: reload()
++        onLoaded: {
++            try { card.status = JSON.parse(text()) } catch (error) { card.status = ({}) }
++        }
++    }
++
++    RowLayout {
++        anchors.fill: parent
++        anchors.leftMargin: 18 * card.d
++        anchors.rightMargin: 14 * card.d
++        spacing: 16 * card.d
++
++        IrisSquircle {
++            implicitWidth: Math.round(46 * card.d)
++            implicitHeight: implicitWidth
++            tint: IrisStyle.identity.blue
++            glyph: "system_update"
++            glyphShare: 0.6
++        }
++        ColumnLayout {
++            Layout.fillWidth: true
++            spacing: 2 * card.d
++            IrisText {
++                Layout.fillWidth: true
++                text: card.title
++                elide: Text.ElideRight
++                font.family: IrisStyle.fontTitle
++                font.pixelSize: IrisStyle.typeTitle
++                font.weight: IrisStyle.weight(Font.DemiBold)
++            }
++            IrisText {
++                Layout.fillWidth: true
++                text: card.detail
++                color: IrisStyle.subtext
++                elide: Text.ElideRight
++                font.pixelSize: IrisStyle.typeLabel
++            }
++        }
++        IrisButton {
++            Layout.alignment: Qt.AlignVCenter
++            text: card.state === "restart" ? Translation.tr("Restart")
++                : card.offer && !card.busy ? Translation.tr("Update now") : Translation.tr("Details")
++            emphasized: card.attention
++            quiet: !card.attention
++            buttonRadius: height / 2
++            onClicked: card.state === "restart" ? Session.reboot() : card.open()
++        }
++    }
++}

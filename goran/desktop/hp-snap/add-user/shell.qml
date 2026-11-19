@@ -12,6 +12,8 @@ ShellRoot {
     id: app
 
     readonly property bool preview: Quickshell.env("HP_OS_ADD_USER_PREVIEW") === "1"
+    // The very first start of a new device: no one to ask, and this person becomes its administrator.
+    readonly property bool firstBoot: Quickshell.env("HP_OS_FIRST_BOOT") === "1"
     readonly property string helper: Quickshell.env("HP_OS_ADD_USER_HELPER")
     readonly property string stateDir: Quickshell.env("HP_OS_ADD_USER_STATE") || (Quickshell.env("HOME") + "/.local/state/hp-os-add-user")
     readonly property string themeDir: "file:///opt/hp-os/login/themes/hpos/"
@@ -20,7 +22,7 @@ ShellRoot {
     readonly property var expressive: [0.16, 1, 0.3, 1, 1, 1]
 
     // ── The answers ──
-    property int step: 0                       // 0 name, 1 picture, 2 password, 3 approve, 4 done
+    property int step: firstBoot ? 5 : 0       // 5 hello (new device), 0 name, 1 picture, 2 password, 3 approve, 4 done
     property string fullName: ""
     readonly property var faces: ["daybreak", "tide", "bloom", "dune", "aurora"]
     property string face: ""                   // empty: their initial
@@ -68,7 +70,7 @@ ShellRoot {
     }
 
     // ── Administrator approval ──
-    LazyLoader { id: agent; active: !app.preview; PolkitAgent {} }
+    LazyLoader { id: agent; active: !app.preview && !app.firstBoot; PolkitAgent {} }
     readonly property var flow: agent.item ? agent.item.flow : null
     Connections {
         target: app.flow
@@ -93,7 +95,8 @@ ShellRoot {
         id: create
         stdinEnabled: true
         environment: ({ "SHELL": "/bin/bash" })
-        command: ["/usr/bin/pkexec", "/usr/bin/python3", "-I", app.helper]
+        command: app.firstBoot ? ["/usr/bin/python3", "-I", Quickshell.shellPath("device-client.py"), "/run/hp-os/first-setup.sock"]
+            : ["/usr/bin/pkexec", "/usr/bin/python3", "-I", app.helper]
         property var answer: null
         stdout: SplitParser {
             onRead: line => {
@@ -113,16 +116,17 @@ ShellRoot {
             app.signInPassword = ""
             app.step = 2
             app.notice = answer && answer.error ? answer.error
+                : app.firstBoot ? "Your account couldn’t be created. Please try again."
                 : "Approval was cancelled, so no account was created."
         }
     }
     function requestAccount(password) {
         app.notice = ""
-        app.phase = "waiting"
+        app.phase = app.firstBoot ? "creating" : "waiting"
         app.step = 3
         app.pendingPassword = password
         app.signInPassword = password
-        if (app.preview) { app.pendingPassword = ""; mockAsk.start() } else create.running = true
+        if (app.preview) { app.pendingPassword = ""; if (app.firstBoot) mockCreate.start(); else mockAsk.start() } else create.running = true
     }
     function submitApproval(password) {
         app.notice = ""
@@ -359,6 +363,7 @@ ShellRoot {
         // ── Who this is becoming: stays on screen through every step ──
         LoginAvatar {
             id: avatar
+            visible: app.step !== 5
             anchors.horizontalCenter: parent.horizontalCenter
             y: Math.round(parent.height * 0.17)
             width: win.px(app.step === 4 ? 132 : 112); height: width
@@ -368,11 +373,25 @@ ShellRoot {
             Behavior on width { NumberAnimation { duration: 520; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
         }
 
+        // ── Hello: only on a new device ──
+        Page {
+            index: 5
+            Gap { size: 20 }
+            Title { text: "Welcome to HP-OS" }
+            Subtitle { text: "Let’s get your device ready. It only takes a few minutes." }
+            Gap { size: 26 }
+            Primary {
+                anchors.horizontalCenter: parent.horizontalCenter
+                label: "Get started"
+                onActivated: { app.step = 0; nameField.input.forceActiveFocus() }
+            }
+        }
+
         // ── 1. Name ──
         Page {
             index: 0
             Title { text: "What’s your name?" }
-            Subtitle { text: "This is how you’ll appear on this device." }
+            Subtitle { text: app.firstBoot ? "You’ll be the administrator of this device." : "This is how you’ll appear on this device." }
             Gap { size: 14 }
             Field {
                 id: nameField
@@ -381,7 +400,7 @@ ShellRoot {
                 input.maximumLength: 64
                 input.onTextChanged: app.fullName = nameField.text
                 onAccepted: nameNext.go()
-                Component.onCompleted: input.forceActiveFocus()
+                Component.onCompleted: if (!app.firstBoot) input.forceActiveFocus()
             }
             Field {
                 id: usernameField
@@ -422,7 +441,11 @@ ShellRoot {
                 function go() { if (ready) { app.step = 1; win.contentItem.forceActiveFocus() } }
                 onActivated: go()
             }
-            Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Cancel"; onActivated: app.leave("", "") }
+            Quiet {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: app.firstBoot ? "Back" : "Cancel"
+                onActivated: { if (app.firstBoot) app.step = 5; else app.leave("", "") }
+            }
         }
 
         // ── 2. Picture ──
@@ -628,13 +651,13 @@ ShellRoot {
 
         // Where you are: four quiet dots.
         Row {
-            visible: app.step < 4
+            visible: app.step < (app.firstBoot ? 3 : 4)
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             anchors.bottomMargin: win.px(46)
             spacing: win.px(10)
             Repeater {
-                model: 4
+                model: app.firstBoot ? 3 : 4
                 Rectangle {
                     required property int index
                     width: win.px(index === app.step ? 22 : 8); height: win.px(8)
@@ -655,9 +678,10 @@ ShellRoot {
         }
         Shortcut {
             sequences: ["Return", "Enter"]
-            enabled: app.step === 4 || app.step === 1
+            enabled: app.step === 4 || app.step === 1 || app.step === 5
             onActivated: {
-                if (app.step === 4) app.continueToDesktop()
+                if (app.step === 5) { app.step = 0; nameField.input.forceActiveFocus() }
+                else if (app.step === 4) app.continueToDesktop()
                 else { app.step = 2; passwordField.input.forceActiveFocus() }
             }
         }
@@ -666,7 +690,8 @@ ShellRoot {
         Shortcut {
             sequence: "Escape"
             onActivated: {
-                if (app.step === 0) app.leave("", "")
+                if (app.step === 0 && app.firstBoot) app.step = 5
+                else if (app.step === 0) app.leave("", "")
                 else if (app.step === 1) { app.step = 0; nameField.input.forceActiveFocus() }
                 else if (app.step === 2) { app.step = 1; win.contentItem.forceActiveFocus() }
                 else if (app.step === 3 && !app.working) app.cancelApproval()

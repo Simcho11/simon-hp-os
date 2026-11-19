@@ -1,0 +1,386 @@
+diff --git a/src/kitemviews/kfileitemmodel.cpp b/src/kitemviews/kfileitemmodel.cpp
+index 5492177..d3ca169 100644
+--- a/src/kitemviews/kfileitemmodel.cpp
++++ b/src/kitemviews/kfileitemmodel.cpp
+@@ -593,6 +593,26 @@ int KFileItemModel::indexForKeyboardSearch(const QString &text, int startFromInd
+     return -1;
+ }
+ 
++int KFileItemModel::indexForDroppedUrl(const QUrl &url) const
++{
++    ItemData dropped;
++    dropped.item = KFileItem(url);
++    dropped.parent = nullptr;
++
++    int result = 0;
++    for (int i = 0; i < m_itemData.count(); ++i) {
++        const ItemData *existing = m_itemData.at(i);
++        if (existing->parent) {
++            continue; // Only the folder's own items take part, not expanded children.
++        }
++        if (!lessThan(existing, &dropped, m_collator)) {
++            break;
++        }
++        result = i + 1;
++    }
++    return result;
++}
++
+ bool KFileItemModel::supportsDropping(int index) const
+ {
+     KFileItem item;
+diff --git a/src/kitemviews/kfileitemmodel.h b/src/kitemviews/kfileitemmodel.h
+index 0ac5d92..7b7cc85 100644
+--- a/src/kitemviews/kfileitemmodel.h
++++ b/src/kitemviews/kfileitemmodel.h
+@@ -109,6 +109,12 @@ public:
+ 
+     bool supportsDropping(int index) const override;
+ 
++    /**
++     * @return The index a file like @p url would get if it were added to this
++     *         folder with the current sorting.
++     */
++    int indexForDroppedUrl(const QUrl &url) const;
++
+     bool canEnterOnHover(int index) const override;
+ 
+     QString roleDescription(const QByteArray &role) const override;
+diff --git a/src/kitemviews/kitemlistcontroller.cpp b/src/kitemviews/kitemlistcontroller.cpp
+index b1927fc..fe13ab4 100644
+--- a/src/kitemviews/kitemlistcontroller.cpp
++++ b/src/kitemviews/kitemlistcontroller.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "kitemlistcontroller.h"
+ 
++#include "kfileitemmodel.h"
+ #include "kitemlistselectionmanager.h"
+ #include "kitemlistview.h"
+ #include "private/kitemlistkeyboardsearchmanager.h"
+@@ -817,6 +818,8 @@ bool KItemListController::dragLeaveEvent(QGraphicsSceneDragDropEvent *event, con
+     m_autoActivationTimer->stop();
+     m_view->setAutoScroll(false);
+     m_view->hideDropIndicator();
++    m_view->hideDropSlot();
++    m_draggedUrls.clear();
+ 
+     KItemListWidget *widget = hoveredWidget();
+     if (widget) {
+@@ -886,14 +889,31 @@ bool KItemListController::dragMoveEvent(QGraphicsSceneDragDropEvent *event, cons
+         m_view->hideDropIndicator();
+     }
+ 
+-    if (DragAndDropHelper::urlListMatchesUrl(event->mimeData()->urls(), hoveredDir)) {
++    // A file under the pointer doesn't take the drop: what is dropped there goes into this folder.
++    const bool overDropTarget = index >= 0 && m_model->supportsDropping(index);
++    if (index >= 0 && !overDropTarget) {
++        index = -1;
++    }
++
++    if (m_draggedUrls.isEmpty()) {
++        m_draggedUrls = event->mimeData()->urls();
++    }
++
++    if (DragAndDropHelper::urlListMatchesUrl(m_draggedUrls, hoveredDir)) {
++        m_view->hideDropSlot();
+         event->setDropAction(Qt::IgnoreAction);
+         event->ignore();
+     } else {
+         if (m_model->supportsDropping(index)) {
++            if (overDropTarget) {
++                m_view->hideDropSlot();
++            } else {
++                updateDropSlot();
++            }
+             event->setDropAction(event->proposedAction());
+             event->accept();
+         } else {
++            m_view->hideDropSlot();
+             event->setDropAction(Qt::IgnoreAction);
+             event->ignore();
+         }
+@@ -909,6 +929,9 @@ bool KItemListController::dropEvent(QGraphicsSceneDragDropEvent *event, const QT
+ 
+     m_autoActivationTimer->stop();
+     m_view->setAutoScroll(false);
++    // The slot stays until the new item arrives in it.
++    QTimer::singleShot(1500, m_view, &KItemListView::hideDropSlot);
++    m_draggedUrls.clear();
+ 
+     const QPointF pos = transform.map(event->pos());
+ 
+@@ -1487,6 +1510,40 @@ KItemListWidget *KItemListController::widgetForPos(const QPointF &pos) const
+     return nullptr;
+ }
+ 
++void KItemListController::updateDropSlot()
++{
++    const auto *fileModel = qobject_cast<KFileItemModel *>(m_model);
++    const QList<QUrl> &urls = m_draggedUrls;
++    if (!fileModel || urls.isEmpty()) {
++        m_view->hideDropSlot();
++        return;
++    }
++
++    const QUrl source = urls.first();
++    const QUrl folder = fileModel->directory();
++    if (source.adjusted(QUrl::RemoveFilename | QUrl::StripTrailingSlash).matches(folder, QUrl::StripTrailingSlash)) {
++        m_view->hideDropSlot(); // Already here: dropping it changes nothing.
++        return;
++    }
++
++    if (source != m_dropSlotSource || folder != m_dropSlotFolder) {
++        m_dropSlotSource = source;
++        m_dropSlotFolder = folder;
++        m_dropSlotTarget = fileModel->indexForDroppedUrl(source);
++    }
++
++    // Items only step aside when no folder moves, so a folder never slides out from under the pointer.
++    bool openGap = !m_model->groupedSorting();
++    const auto widgets = m_view->visibleItemListWidgets();
++    for (const KItemListWidget *widget : widgets) {
++        if (widget->index() >= m_dropSlotTarget && m_model->isDir(widget->index())) {
++            openGap = false;
++            break;
++        }
++    }
++    m_view->showDropSlot(m_dropSlotTarget, openGap);
++}
++
+ KItemListWidget *KItemListController::widgetForDropPos(const QPointF &pos) const
+ {
+     Q_ASSERT(m_view);
+diff --git a/src/kitemviews/kitemlistcontroller.h b/src/kitemviews/kitemlistcontroller.h
+index 38a4b60..0a299f3 100644
+--- a/src/kitemviews/kitemlistcontroller.h
++++ b/src/kitemviews/kitemlistcontroller.h
+@@ -14,7 +14,9 @@
+ #include "dolphin_export.h"
+ #include "kitemset.h"
+ 
++#include <QMimeData>
+ #include <QObject>
++#include <QUrl>
+ #include <QPointF>
+ #include <QScroller>
+ 
+@@ -277,6 +279,13 @@ private:
+      */
+     KItemListWidget *widgetForDropPos(const QPointF &pos) const;
+ 
++    /** Shows where the dragged items will land in this folder, unless they are already in it. */
++    void updateDropSlot();
++    QList<QUrl> m_draggedUrls; // Read once per drag: each read asks the app the drag came from.
++    QUrl m_dropSlotSource;
++    QUrl m_dropSlotFolder;
++    int m_dropSlotTarget = -1;
++
+     /**
+      * Updates m_keyboardAnchorIndex and m_keyboardAnchorPos. If no anchor is
+      * set, it will be adjusted to the current item. If it is set it will be
+diff --git a/src/kitemviews/kitemlistview.cpp b/src/kitemviews/kitemlistview.cpp
+index 5ff1be1..656f3ae 100644
+--- a/src/kitemviews/kitemlistview.cpp
++++ b/src/kitemviews/kitemlistview.cpp
+@@ -31,6 +31,8 @@
+ #include <QPropertyAnimation>
+ #include <QStyleOptionRubberBand>
+ #include <QTimer>
++#include <QGraphicsScene>
++#include <QLinearGradient>
+ #include <QVariantAnimation>
+ 
+ namespace
+@@ -834,6 +836,49 @@ void KItemListView::paint(QPainter *painter, const QStyleOptionGraphicsItem *opt
+         style()->drawControl(QStyle::CE_RubberBand, &opt, painter);
+     }
+ 
++    if (m_dropSlotIndex >= 0) {
++        // Liquid glass: a bright sheen over the accent colour, a soft shadow and a clear rim.
++        const QRectF cell = dropSlotCell(m_dropSlotIndex).adjusted(4, 4, -4, -4);
++        const QColor accent = palette().highlight().color();
++        const bool dark = palette().window().color().lightness() < 128;
++
++        painter->save();
++        painter->setRenderHint(QPainter::Antialiasing);
++
++        painter->setBrush(Qt::NoBrush);
++        for (int i = 3; i >= 1; --i) {
++            QColor shadow = accent;
++            shadow.setAlpha(26 / i);
++            painter->setPen(QPen(shadow, i * 2));
++            painter->drawRoundedRect(cell, 14, 14);
++        }
++
++        QColor tintTop = accent;
++        tintTop.setAlpha(dark ? 95 : 62);
++        QColor tintBottom = accent;
++        tintBottom.setAlpha(dark ? 130 : 104);
++        QLinearGradient glass(cell.topLeft(), cell.bottomLeft());
++        glass.setColorAt(0, tintTop);
++        glass.setColorAt(1, tintBottom);
++        QColor edge = accent;
++        edge.setAlpha(215);
++        painter->setPen(QPen(edge, 1.5));
++        painter->setBrush(glass);
++        painter->drawRoundedRect(cell, 14, 14);
++
++        // The sheen across the top half, and the bright inner rim.
++        QLinearGradient sheen(cell.topLeft(), QPointF(cell.left(), cell.center().y()));
++        sheen.setColorAt(0, QColor(255, 255, 255, dark ? 80 : 165));
++        sheen.setColorAt(1, QColor(255, 255, 255, 0));
++        painter->setPen(Qt::NoPen);
++        painter->setBrush(sheen);
++        painter->drawRoundedRect(cell.adjusted(2, 2, -2, -cell.height() / 2), 12, 12);
++        painter->setPen(QPen(QColor(255, 255, 255, dark ? 110 : 225), 1.25));
++        painter->setBrush(Qt::NoBrush);
++        painter->drawRoundedRect(cell.adjusted(2, 2, -2, -2), 12, 12);
++        painter->restore();
++    }
++
+     if (!m_dropIndicator.isEmpty()) {
+         const QRectF r = m_dropIndicator.toRect();
+ 
+@@ -1188,6 +1233,8 @@ void KItemListView::updatePalette()
+ 
+ void KItemListView::slotItemsInserted(const KItemRangeList &itemRanges)
+ {
++    m_dropSlotIndex = -1; // What was dropped has arrived: it takes the slot.
++
+     if (m_itemSize.isEmpty()) {
+         updatePreferredColumnWidths(itemRanges);
+     }
+@@ -1916,7 +1963,7 @@ void KItemListView::doLayout(LayoutAnimationHint hint, int changedIndex, int cha
+     for (int i = firstVisibleIndex; i <= lastVisibleIndex; ++i) {
+         bool applyNewPos = true;
+ 
+-        const QRectF itemBounds = m_layouter->itemRect(i);
++        const QRectF itemBounds = placedItemRect(i);
+         const QPointF newPos = itemBounds.topLeft();
+         KItemListWidget *widget = m_visibleItems.value(i);
+         if (!widget) {
+@@ -2680,6 +2727,91 @@ int KItemListView::showDropIndicator(const QPointF &pos)
+     return (pos.y() <= firstItemRect.top()) ? 0 : -1;
+ }
+ 
++QRectF KItemListView::dropSlotCell(int index) const
++{
++    const int count = m_model ? m_model->count() : 0;
++    if (index < count) {
++        return m_layouter->itemRect(index);
++    }
++    if (count == 0) {
++        const QSizeF cell = itemSize();
++        const qreal margin = styleOption().horizontalMargin;
++        return QRectF(margin, margin, cell.width() > 0 ? cell.width() : size().width() - 2 * margin, cell.height() > 0 ? cell.height() : 48);
++    }
++
++    // The cell after the last item.
++    const QRectF first = m_layouter->itemRect(0);
++    const QRectF last = m_layouter->itemRect(count - 1);
++    const QRectF second = count > 1 ? m_layouter->itemRect(1) : QRectF();
++    if (scrollOrientation() == Qt::Vertical) {
++        const qreal stepX = (count > 1 && qFuzzyCompare(second.top(), first.top())) ? second.left() - first.left() : last.width() + styleOption().horizontalMargin;
++        if (last.right() + stepX <= size().width()) {
++            return last.translated(stepX, 0);
++        }
++        qreal stepY = last.height() + styleOption().verticalMargin;
++        for (int i = 1; i < count; ++i) {
++            const QRectF other = m_layouter->itemRect(i);
++            if (other.top() > first.top()) {
++                stepY = other.top() - first.top();
++                break;
++            }
++        }
++        return QRectF(first.left(), last.top() + stepY, last.width(), last.height());
++    }
++
++    const qreal stepY = (count > 1 && qFuzzyCompare(second.left(), first.left())) ? second.top() - first.top() : last.height() + styleOption().verticalMargin;
++    if (last.bottom() + stepY <= size().height()) {
++        return last.translated(0, stepY);
++    }
++    return QRectF(last.right() + styleOption().horizontalMargin, first.top(), last.width(), last.height());
++}
++
++QRectF KItemListView::placedItemRect(int index) const
++{
++    if (m_dropSlotIndex >= 0 && m_dropSlotOpensGap && index >= m_dropSlotIndex) {
++        return QRectF(dropSlotCell(index + 1).topLeft(), m_layouter->itemRect(index).size());
++    }
++    return m_layouter->itemRect(index);
++}
++
++void KItemListView::moveWidgetsForDropSlot()
++{
++    QHashIterator<int, KItemListWidget *> it(m_visibleItems);
++    while (it.hasNext()) {
++        it.next();
++        const QPointF target = placedItemRect(it.key()).topLeft();
++        if (it.value()->pos() != target) {
++            m_animation->start(it.value(), KItemListViewAnimation::MovingAnimation, target);
++        }
++    }
++    update();
++    // Once the items have stepped aside, repaint everything so none of them leaves a trace behind.
++    QTimer::singleShot(320, this, [this]() {
++        if (scene()) {
++            scene()->update();
++        }
++    });
++}
++
++void KItemListView::showDropSlot(int index, bool openGap)
++{
++    if (m_dropSlotIndex == index && m_dropSlotOpensGap == openGap) {
++        return;
++    }
++    m_dropSlotIndex = index;
++    m_dropSlotOpensGap = openGap;
++    moveWidgetsForDropSlot();
++}
++
++void KItemListView::hideDropSlot()
++{
++    if (m_dropSlotIndex < 0) {
++        return;
++    }
++    m_dropSlotIndex = -1;
++    moveWidgetsForDropSlot();
++}
++
+ void KItemListView::hideDropIndicator()
+ {
+     if (!m_dropIndicator.isNull()) {
+diff --git a/src/kitemviews/kitemlistview.h b/src/kitemviews/kitemlistview.h
+index 20c34ce..01cbcbd 100644
+--- a/src/kitemviews/kitemlistview.h
++++ b/src/kitemviews/kitemlistview.h
+@@ -678,6 +678,13 @@ private:
+     int showDropIndicator(const QPointF &pos);
+     void hideDropIndicator();
+ 
++    /**
++     * Shows a glass slot at the place an item dropped into this folder will take.
++     * With @p openGap the items after it step aside to make room.
++     */
++    void showDropSlot(int index, bool openGap);
++    void hideDropSlot();
++
+     /**
+      * Applies the height of the group header to the layouter. The height
+      * depends on the used scroll orientation.
+@@ -799,6 +806,13 @@ private:
+     // by KItemListView::showDropIndicator() and KItemListView::hideDropIndicator().
+     QRectF m_dropIndicator;
+ 
++    // The glass slot of showDropSlot().
++    QRectF dropSlotCell(int index) const;
++    QRectF placedItemRect(int index) const;
++    void moveWidgetsForDropSlot();
++    int m_dropSlotIndex = -1;
++    bool m_dropSlotOpensGap = false;
++
+     QList<QVariantAnimation *> m_rubberBandAnimations;
+ 
+     KItemListSizeHintResolver *m_sizeHintResolver;

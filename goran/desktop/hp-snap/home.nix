@@ -19,6 +19,16 @@ let
     rm -f "''${XDG_RUNTIME_DIR:?}/hp-snap.sock"
     exec ${quickshell}/bin/quickshell -n -p ${./snap-app}
   '';
+  # Settings' touchpad feedback and click pressure.
+  touchpadHaptics = pkgs.writeScript "touchpad-haptics"
+    ("#!${pkgs.python3}/bin/python3\n" + builtins.readFile ./touchpad-haptics.py);
+  # AirDrop is published for every account by goran/installer/system/hp-os-settings-access.sh.
+  airdrop = "/nix/var/nix/profiles/hp-os-airdrop/share/omdrop";
+  airdropSetup = pkgs.writeShellScript "hp-os-airdrop-setup" ''
+    [[ -r ${airdrop}/OmdropPanel.qml ]] || exit 0
+    cli=$(${pkgs.gnused}/bin/sed -n 's/.*property string cli: "\(.*\)".*/\1/p' ${airdrop}/OmdropPanel.qml)
+    exec "$cli" setup
+  '';
   snapCommand = pkgs.writeShellScript "hp-snap" ''
     printf '%s\n' "$*" | ${pkgs.netcat-openbsd}/bin/nc -UN "''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hp-snap.sock"
   '';
@@ -161,11 +171,44 @@ in {
           default-window-height { fixed 900; }
       }
     '';
+    # Commands the shell's settings call: the icon theme for KDE apps and the on-screen keyboard.
+    home.packages = [ pkgs.kdePackages.kconfig pkgs.ydotool ];
+    # Touchpad feedback and click pressure. An account that already has the tool keeps its own.
+    home.activation.hpSnapTouchpadHaptics = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      target=${lib.escapeShellArg "${config.home.homeDirectory}/.local/share/hp-snap/bin/touchpad-haptics"}
+      if [[ ! -e "$target" ]]; then
+        run mkdir -p "$(dirname "$target")"
+        run ln -sfn ${touchpadHaptics} "$target"
+      fi
+    '';
+    # The AirDrop tile. An account that already has AirDrop keeps its own.
+    home.activation.hpSnapAirdrop = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      target=${lib.escapeShellArg "${config.xdg.configHome}/hp-os/omdrop"}
+      if [[ ! -e "$target" && -r ${airdrop}/OmdropPanel.qml ]]; then
+        run mkdir -p "$(dirname "$target")"
+        run ln -sfn ${airdrop} "$target"
+      fi
+    '';
+    # AirDrop's per-account pieces (its certificate and receiver), once. Exits straight away afterwards.
+    systemd.user.services.hp-os-airdrop-setup = {
+      Unit = {
+        Description = "Prepare AirDrop for this account";
+        ConditionPathExists = "!%h/.config/systemd/user/airdrop-receiver.service";
+      };
+      Service = { Type = "oneshot"; ExecStart = "${airdropSetup}"; };
+      Install.WantedBy = [ "default.target" ];
+    };
     # Windows use the whole screen above the Dock: small edge widgets don't reserve a strip beside them.
     home.activation.hpSnapWindowSpace = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
       run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./window-space.json} \
         ${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"} \
         ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-window-space-v1"}
+    '';
+    # The plate marking where a dragged icon will land starts off, once per account (Settings > Desktop turns it on).
+    home.activation.hpSnapDropSlotOff = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
+      run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./drop-slot-off.json} \
+        ${lib.escapeShellArg "${config.xdg.configHome}/hp-os/config.json"} \
+        ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-drop-slot-off-v1"}
     '';
     # Niri's Liquid Glass settings, as tuned on Simon's account: glass blurs what is really behind
     # it (xray off), so it stays right while desktops scroll, plus his blur block. New accounts get
@@ -177,6 +220,13 @@ in {
     home.activation.hpSnapWindowStyle = lib.hm.dag.entryAfter [ "linkGeneration" "hposNiriBindings" ] ''
       run ${pkgs.python3}/bin/python3 ${./window-style.py} ${lib.escapeShellArg "${niriDir}/config.kdl"} \
         ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-window-style-v1"}
+    '';
+    # An account that runs its own hand-installed snap app gets the same window handling.
+    home.activation.hpSnapEngine = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      target=${lib.escapeShellArg "${config.home.homeDirectory}/.local/share/hp-snap/lib/engine.mjs"}
+      if [[ -f "$target" ]]; then
+        run ${pkgs.coreutils}/bin/install -m 644 ${./snap-app/lib/engine.mjs} "$target"
+      fi
     '';
     # Minimize, maximize and close on every window (GTK 3/4 and libadwaita read different places).
     gtk.gtk3.extraConfig.gtk-decoration-layout = buttons;

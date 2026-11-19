@@ -4,6 +4,17 @@
 import QtQuick 2.15
 
 Item {
+    id: main
+    // HP-OS: a device that has never been set up opens first-time setup instead of asking anyone to sign in.
+    // The mark is a tiny QML file so this screen can see it without any privileges.
+    Loader { id: firstBootMark; source: String(config.firstBootMark || "file:///var/lib/hp-os/first-boot.qml") }
+    readonly property bool firstBoot: firstBootMark.status === Loader.Ready
+    function openFirstSetup() {
+        const login = styleLoader.item
+        if (login && login.awaitingNewAccount !== undefined) login.awaitingNewAccount = true
+        Qt.openUrlExternally("hpos-add-user:first-boot")
+    }
+    Timer { running: main.firstBoot && styleLoader.status === Loader.Ready; interval: 300; onTriggered: main.openFirstSetup() }
     readonly property var irisStyles: ({ cover: "LoginCover.qml", frame: "LoginFrame.qml", lens: "LoginLens.qml" })
     // HP-OS: the HP mark and the wordmark, top left, sized from the screen like the rest of the layout.
     Row {
@@ -39,5 +50,28 @@ Item {
             : parent.irisStyles[String(config.irisLoginStyle || "lens")] || "LoginLens.qml"
         // A login screen that fails to load locks people out: fall back to the Classic one.
         onStatusChanged: if (status === Loader.Error && String(source).indexOf("ClassicLogin.qml") < 0) source = "ClassicLogin.qml"
+    }
+    // Behind first-time setup, and the way back into it if it is ever closed. Gone once the account exists.
+    Rectangle {
+        anchors.fill: parent
+        z: 20
+        visible: main.firstBoot && !(styleLoader.item && styleLoader.item.core && String(styleLoader.item.core.addedLogin || "").length > 0)
+        color: "#071a3f"
+        MouseArea { anchors.fill: parent; hoverEnabled: true }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.round(parent.width * 0.17); height: Math.round(width * 0.24)
+            radius: height / 2
+            color: "white"
+            Text {
+                anchors.centerIn: parent
+                text: "Set up this device"
+                color: "#0b2a6b"
+                font.family: String(config.irisFontMain || "HarmonyOS Sans")
+                font.pixelSize: Math.round(parent.height * 0.32)
+                font.weight: Font.DemiBold
+            }
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: main.openFirstSetup() }
+        }
     }
 }

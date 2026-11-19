@@ -1,0 +1,1051 @@
+--- a/scripts/accounts.py
++++ b/scripts/accounts.py
+@@ -2,6 +2,7 @@
+ """HP-OS account UI backend. Authorization is enforced by AccountsService."""
+ import ctypes
+ import json
++import shutil
+ import os
+ import re
+ import secrets
+@@ -12,12 +13,68 @@
+ SERVICE = "org.freedesktop.Accounts"
+ ROOT = "/org/freedesktop/Accounts"
+ USER = SERVICE + ".User"
++ICONS = "/var/lib/AccountsService/icons"
++PICTURES = "/nix/var/nix/profiles/hp-os-add-user/share/hp-os-add-user/pictures"
++PICTURE_NAMES = ("daybreak", "tide", "bloom", "dune", "aurora")
+ 
+ def call(path, interface, method, signature=None, values=()):
+     parameters = GLib.Variant(signature, values) if signature else None
+     return BUS.call_sync(SERVICE, path, interface, method, parameters, None,
+                          Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 120000, None).unpack()
+ 
++def library(username, create=False):
++    """Uploaded photos, kept privately so they can be recropped or deleted later."""
++    if not isinstance(username, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
++        raise ValueError("Select an account.")
++    folder = os.path.join(os.path.expanduser("~"), ".local/share/hp-os/profile-pictures", username)
++    if create:
++        os.makedirs(folder, mode=0o700, exist_ok=True)
++    return folder
++
++def uploads(username):
++    folder = library(username)
++    try:
++        names = os.listdir(folder)
++    except OSError:
++        return []
++    found = []
++    for name in names:
++        match = re.fullmatch(r"([0-9a-f]{12})\.json", name)
++        icon = os.path.join(folder, name[:-5] + "-icon.jpg")
++        if match and os.path.isfile(icon) and os.path.isfile(os.path.join(folder, name[:-5] + ".jpg")):
++            found.append((os.path.getmtime(icon), {"id": match.group(1), "icon": icon}))
++    return [entry for _, entry in sorted(found, key=lambda item: item[0], reverse=True)]
++
++def known_upload(request):
++    upload = request.get("id")
++    if not isinstance(upload, str) or not re.fullmatch(r"[0-9a-f]{12}", upload) \
++            or upload not in [entry["id"] for entry in uploads(request.get("username"))]:
++        raise ValueError("That photo is no longer available.")
++    return upload
++
++def current_picture(username):
++    """The account's picture: "" for their initial, one of PICTURE_NAMES, or "custom"."""
++    try:
++        with open(os.path.join(ICONS, username), "rb") as stream:
++            data = stream.read()
++    except OSError:
++        return ""
++    for upload in uploads(username):
++        try:
++            with open(upload["icon"], "rb") as stream:
++                if stream.read() == data:
++                    return "upload:" + upload["id"]
++        except OSError:
++            pass
++    for name in PICTURE_NAMES:
++        try:
++            with open(os.path.join(PICTURES, name + ".jpg"), "rb") as stream:
++                if stream.read() == data:
++                    return name
++        except OSError:
++            pass
++    return "custom"
++
+ def users():
+     result = []
+     for path in call(ROOT, SERVICE, "ListCachedUsers")[0]:
+@@ -25,6 +82,9 @@
+         if not data.get("SystemAccount"):
+             result.append({"username": data["UserName"], "name": data["RealName"],
+                            "uid": data["Uid"], "local": data.get("LocalAccount", False),
++                           "picture": current_picture(data["UserName"]),
++                           "uploads": uploads(data["UserName"]),
++                           "icon": os.path.join(ICONS, data["UserName"]),
+                            "administrator": data["AccountType"] == 1, "locked": data["Locked"]})
+     return result
+ 
+@@ -51,6 +111,157 @@
+         raise ValueError("Sign this account out of all sessions before deleting it.")
+     call(ROOT, SERVICE, "DeleteUser", "(xb)", (uid, True))
+ 
++def account_path(request):
++    username = request.get("username", "")
++    if not isinstance(username, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
++        raise ValueError("Select an account.")
++    return call(ROOT, SERVICE, "FindUserByName", "(s)", (username,))[0]
++
++def approved(path, method, signature, value):
++    try:
++        call(path, USER, method, signature, (value,))
++    except GLib.Error as error:
++        if "PermissionDenied" in str(error) or "NotAuthorized" in str(error):
++            raise ValueError("An administrator needs to approve this change.")
++        raise
++
++def rename_account(request):
++    name = request.get("name")
++    if not isinstance(name, str) or not name.strip() or len(name) > 64 or re.search(r"[:,=\\\x00-\x1f\x7f]", name):
++        raise ValueError("Enter a name without special characters.")
++    approved(account_path(request), "SetRealName", "(s)", name.strip())
++
++def set_account_picture(request):
++    picture = request.get("picture", "")
++    if picture != "" and picture not in PICTURE_NAMES:
++        raise ValueError("That picture can't be used.")
++    source = os.path.join(PICTURES, picture + ".jpg") if picture else ""
++    if source and not os.path.isfile(source):
++        raise ValueError("That picture isn't installed on this device.")
++    approved(account_path(request), "SetIconFile", "(s)", source)
++
++PHOTO_MINIMUM = 250
++
++def photo_file(name="hp-os-account-photo.jpg"):
++    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
++    if not runtime or not os.path.isdir(runtime):
++        raise ValueError("Photos can't be prepared right now.")
++    return os.path.join(runtime, name)
++
++def write_private_jpeg(image, path, quality):
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
++    with os.fdopen(fd, "wb") as stream:
++        image.save(stream, "JPEG", quality=quality, optimize=True)
++
++def forget_photo():
++    for name in ("hp-os-account-photo.jpg", "hp-os-account-icon.jpg"):
++        try:
++            os.unlink(photo_file(name))
++        except (FileNotFoundError, ValueError):
++            pass
++
++def open_photo(request):
++    """Makes a private working copy: upright, flattened, and free of the original's hidden details."""
++    try:
++        from PIL import Image, ImageOps
++    except ImportError:
++        raise ValueError("Photo support isn't installed on this device.")
++    path = request.get("file")
++    if not isinstance(path, str) or not os.path.isfile(path):
++        raise ValueError("That file can't be opened.")
++    if os.path.getsize(path) > 50 * 1024 * 1024:
++        raise ValueError("Choose a photo smaller than 50 MB.")
++    Image.MAX_IMAGE_PIXELS = 100_000_000
++    try:
++        with Image.open(path) as source:
++            if source.format not in ("JPEG", "MPO", "PNG", "WEBP", "BMP", "GIF", "TIFF"):
++                raise ValueError
++            upright = ImageOps.exif_transpose(source).convert("RGBA")
++        image = Image.new("RGB", upright.size, "white")
++        image.paste(upright, mask=upright.getchannel("A"))
++    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
++        raise ValueError("That file isn't a photo HP-OS can use. Try a JPEG, PNG or WebP.")
++    if min(image.size) < PHOTO_MINIMUM:
++        raise ValueError("Choose a photo that is at least 250 × 250 pixels.")
++    image.thumbnail((1600, 1600), Image.LANCZOS)
++    write_private_jpeg(image, photo_file(), 92)
++    return {"path": photo_file(), "width": image.width, "height": image.height}
++
++def save_photo(request):
++    from PIL import Image
++    x, y, size = request.get("x"), request.get("y"), request.get("size")
++    turns = {0: None, 90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_90}
++    rotation = request.get("rotation", 0)
++    if not all(type(value) is int for value in (x, y, size, rotation)) or rotation not in turns:
++        raise ValueError("Choose the part of the photo to use.")
++    try:
++        with Image.open(photo_file()) as working:
++            working.load()
++            turned = working.transpose(turns[rotation]) if turns[rotation] is not None else working.copy()
++            if size < PHOTO_MINIMUM or x < 0 or y < 0 or x + size > turned.width or y + size > turned.height:
++                raise ValueError("Choose the part of the photo to use.")
++            icon = turned.crop((x, y, x + size, y + size)).resize((512, 512), Image.LANCZOS)
++    except OSError:
++        raise ValueError("Choose the photo again.")
++    path = account_path(request)
++    editing = bool(request.get("id"))
++    upload = known_upload(request) if editing else secrets.token_hex(6)
++    folder = library(request["username"], create=True)
++    stem = os.path.join(folder, upload)
++    try:
++        shutil.copyfile(photo_file(), stem + ".jpg")
++        os.chmod(stem + ".jpg", 0o600)
++        write_private_jpeg(icon, stem + "-icon.jpg", 90)
++        descriptor = os.open(stem + ".json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
++        with os.fdopen(descriptor, "w") as stream:
++            json.dump({"rotation": rotation, "x": x, "y": y, "size": size}, stream)
++        approved(path, "SetIconFile", "(s)", stem + "-icon.jpg")
++    except (ValueError, OSError, GLib.Error):
++        if not editing:
++            remove_upload(stem)
++        raise
++    finally:
++        forget_photo()
++
++def remove_upload(stem):
++    for ending in (".jpg", "-icon.jpg", ".json"):
++        try:
++            os.unlink(stem + ending)
++        except FileNotFoundError:
++            pass
++
++def edit_photo(request):
++    """Reopens a photo for cropping: an upload with its last crop, or a picture set some other way."""
++    from PIL import Image
++    username = request.get("username")
++    folder = library(username)
++    crop = {}
++    if request.get("id"):
++        upload = known_upload(request)
++        source = os.path.join(folder, upload + ".jpg")
++        with open(os.path.join(folder, upload + ".json")) as stream:
++            crop = json.load(stream)
++        crop["id"] = upload
++    else:
++        source = os.path.join(ICONS, username)
++    if not os.path.isfile(source):
++        raise ValueError("That photo is no longer available.")
++    shutil.copyfile(source, photo_file())
++    os.chmod(photo_file(), 0o600)
++    with Image.open(photo_file()) as working:
++        return dict(crop, path=photo_file(), width=working.width, height=working.height)
++
++def use_photo(request):
++    upload = known_upload(request)
++    approved(account_path(request), "SetIconFile", "(s)", os.path.join(library(request["username"]), upload + "-icon.jpg"))
++
++def delete_photo(request):
++    upload = known_upload(request)
++    username = request["username"]
++    if current_picture(username) == "upload:" + upload:
++        approved(account_path(request), "SetIconFile", "(s)", "")
++    remove_upload(os.path.join(library(username), upload))
++
+ def password_hash(password):
+     if not isinstance(password, str) or not password or "\0" in password:
+         raise ValueError("Enter a password.")
+@@ -71,6 +282,28 @@
+     if action == "delete":
+         delete_account(request)
+         return {"ok": True, "deleted": request["username"], "users": users()}
++    if action == "rename":
++        rename_account(request)
++        return {"ok": True, "users": users()}
++    if action == "picture":
++        set_account_picture(request)
++        return {"ok": True, "users": users()}
++    if action == "photo-open":
++        return {"ok": True, "photo": open_photo(request)}
++    if action == "photo-save":
++        save_photo(request)
++        return {"ok": True, "photoSaved": True, "users": users()}
++    if action == "photo-edit":
++        return {"ok": True, "photo": edit_photo(request)}
++    if action == "photo-use":
++        use_photo(request)
++        return {"ok": True, "users": users()}
++    if action == "photo-delete":
++        delete_photo(request)
++        return {"ok": True, "photoDeleted": True, "users": users()}
++    if action == "photo-discard":
++        forget_photo()
++        return {"ok": True, "photoDiscarded": True}
+     username = request.get("username", "")
+     if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+         raise ValueError("Use a username beginning with a lowercase letter, followed by lowercase letters, numbers, underscores or hyphens.")
+--- a/modules/settings/AccountsConfig.qml
++++ b/modules/settings/AccountsConfig.qml
+@@ -1,8 +1,11 @@
+ import QtQuick
+ import QtQuick.Controls
++import QtQuick.Dialogs
+ import QtQuick.Layouts
+ import Quickshell
+ import Quickshell.Io
++import Quickshell.Widgets
++import qs
+ import qs.services
+ import qs.modules.settings
+ import qs.modules.common
+@@ -12,6 +15,10 @@
+ 
+ Flickable {
+     id: root
++    // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
+     property int settingsPageIndex: SettingsPageRegistry.pages.findIndex(page => page.key === "accounts")
+     property string settingsPageName: Translation.tr("Users & Accounts")
+     contentHeight: content.implicitHeight + 32
+@@ -36,6 +43,207 @@
+             IrisText { text: parent.parent.title; font.bold: true }
+         }
+     }
++    // A person's picture, or their initial when they have none.
++    component AccountFace: Item {
++        id: face
++        property string source: ""
++        property string letter: ""
++        ClippingRectangle {
++            anchors.fill: parent
++            radius: width / 2
++            color: "#2f6be0"
++            Image {
++                id: faceImage
++                anchors.fill: parent
++                source: face.source
++                cache: false
++                asynchronous: true
++                fillMode: Image.PreserveAspectCrop
++                sourceSize: Qt.size(256, 256)
++                visible: status === Image.Ready
++            }
++        }
++        IrisText {
++            anchors.centerIn: parent
++            visible: faceImage.status !== Image.Ready
++            text: face.letter.charAt(0).toUpperCase()
++            color: "white"
++            font.pixelSize: Math.round(face.height * 0.42)
++            font.bold: true
++        }
++    }
++    // The photo being prepared, turned and scaled.
++    component PhotoView: Item {
++        id: view
++        property real viewScale: 1
++        width: root.photoWidth * view.viewScale
++        height: root.photoHeight * view.viewScale
++        Image {
++            anchors.centerIn: parent
++            width: (root.photo ? root.photo.width : 0) * view.viewScale
++            height: (root.photo ? root.photo.height : 0) * view.viewScale
++            rotation: root.photoRotation
++            source: root.photo ? "file://" + root.photo.path + "?v=" + root.faceRevision : ""
++            cache: false
++            smooth: true
++            mipmap: true
++        }
++    }
++    // How the cropped photo will look in a circle.
++    component PhotoCircle: ClippingRectangle {
++        id: circle
++        property real size: 64
++        implicitWidth: circle.size
++        implicitHeight: circle.size
++        radius: circle.size / 2
++        color: "transparent"
++        Item {
++            width: circle.size
++            height: circle.size
++            PhotoView {
++                readonly property real fit: root.cropSize > 0 ? circle.size / root.cropSize : 1
++                viewScale: fit
++                x: -root.cropX * fit
++                y: -root.cropY * fit
++            }
++        }
++    }
++    // A corner of the crop square: drag it, or focus it and use the arrow keys.
++    component CropCorner: Rectangle {
++        id: handle
++        required property string corner
++        required property Item stage
++        readonly property bool onLeft: handle.corner[1] === "l"
++        readonly property bool onTop: handle.corner[0] === "t"
++        width: 18; height: 18
++        radius: 4
++        color: "white"
++        border.width: activeFocus ? 3 : 1
++        border.color: activeFocus ? IrisStyle.accent : Qt.rgba(0, 0, 0, 0.35)
++        x: (handle.onLeft ? 0 : parent.width) - width / 2
++        y: (handle.onTop ? 0 : parent.height) - height / 2
++        activeFocusOnTab: true
++        Accessible.role: Accessible.Button
++        Accessible.name: Translation.tr("Crop corner")
++        function nudge(outward) { root.resizeCrop(handle.corner, root.cropSize + (outward ? 10 : -10)) }
++        Keys.onLeftPressed: handle.nudge(handle.onLeft)
++        Keys.onRightPressed: handle.nudge(!handle.onLeft)
++        Keys.onUpPressed: handle.nudge(handle.onTop)
++        Keys.onDownPressed: handle.nudge(!handle.onTop)
++        MouseArea {
++            anchors { fill: parent; margins: -10 }
++            preventStealing: true
++            cursorShape: handle.onLeft === handle.onTop ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
++            property point from
++            property real fromSize: 0
++            onPressed: mouse => { handle.forceActiveFocus(); from = mapToItem(handle.stage, mouse.x, mouse.y); fromSize = root.cropSize }
++            onPositionChanged: mouse => {
++                const now = mapToItem(handle.stage, mouse.x, mouse.y)
++                const wide = (now.x - from.x) * (handle.onLeft ? -1 : 1), tall = (now.y - from.y) * (handle.onTop ? -1 : 1)
++                root.resizeCrop(handle.corner, fromSize + Math.max(wide, tall) / root.photoStageScale)
++            }
++        }
++    }
++    readonly property var pictureChoices: ["", "daybreak", "tide", "bloom", "dune", "aurora"]
++    readonly property var selectedAccount: root.users.find(u => u.username === root.selectedUser) ?? null
++    property int faceRevision: 0
++    // Adding a photo follows Google's steps: rotate and crop it, check the result, then save.
++    readonly property int photoMinimum: 250
++    readonly property real photoStageWidth: 520
++    readonly property real photoStageHeight: 380
++    property var photo: null
++    property string photoEditId: ""
++    property string photoToDelete: ""
++    readonly property string currentUpload: root.selectedAccount && String(root.selectedAccount.picture).startsWith("upload:")
++        ? String(root.selectedAccount.picture).slice(7) : ""
++    function selectAccount(account) {
++        root.discardPhoto()
++        root.photoToDelete = ""
++        root.deletion = null
++        root.selectedUser = account.username
++        username.text = account.username
++        fullName.text = account.name
++        profileName.text = account.name
++    }
++    // Arriving from "change profile picture" elsewhere: open on your own account's pictures.
++    function serveAccountPhotoRequest() {
++        if (!GlobalStates.accountPhotoRequested || root.users.length === 0) return
++        GlobalStates.accountPhotoRequested = false
++        const own = root.users.find(user => user.username === Quickshell.env("USER"))
++        if (own) root.selectAccount(own)
++        Qt.callLater(() => { root.contentY = Math.max(0, profileCard.y - 8) })
++    }
++    Connections {
++        target: GlobalStates
++        function onAccountPhotoRequestedChanged() { root.serveAccountPhotoRequest() }
++    }
++    property int photoStep: 1
++    property int photoRotation: 0
++    property string photoMessage: ""
++    property string lastAction: ""
++    property real cropX: 0
++    property real cropY: 0
++    property real cropSize: 0
++    readonly property bool photoTurned: root.photoRotation % 180 !== 0
++    readonly property real photoWidth: root.photo ? (root.photoTurned ? root.photo.height : root.photo.width) : 0
++    readonly property real photoHeight: root.photo ? (root.photoTurned ? root.photo.width : root.photo.height) : 0
++    readonly property real photoStageScale: root.photo ? Math.min(root.photoStageWidth / root.photoWidth, root.photoStageHeight / root.photoHeight) : 1
++    function clampTo(value, low, high) { return Math.max(low, Math.min(high, value)) }
++    function resetCrop() {
++        root.cropSize = Math.min(root.photoWidth, root.photoHeight)
++        root.cropX = (root.photoWidth - root.cropSize) / 2
++        root.cropY = (root.photoHeight - root.cropSize) / 2
++    }
++    function placeCrop(x, y) {
++        root.cropX = root.clampTo(x, 0, root.photoWidth - root.cropSize)
++        root.cropY = root.clampTo(y, 0, root.photoHeight - root.cropSize)
++    }
++    // Resizes from one corner ("tl", "tr", "bl", "br"), keeping the opposite corner where it is.
++    function resizeCrop(corner, size) {
++        const left = corner[1] === "l", top = corner[0] === "t"
++        const right = root.cropX + root.cropSize, bottom = root.cropY + root.cropSize
++        const room = Math.min(left ? right : root.photoWidth - root.cropX, top ? bottom : root.photoHeight - root.cropY)
++        const next = root.clampTo(size, root.photoMinimum, room)
++        if (left) root.cropX = right - next
++        if (top) root.cropY = bottom - next
++        root.cropSize = next
++    }
++    function rotatePhoto(turn) {
++        root.photoRotation = (root.photoRotation + turn + 360) % 360
++        root.resetCrop()
++    }
++    function savePhoto() {
++        const size = Math.floor(root.cropSize)
++        root.request({ action: "photo-save", username: root.selectedUser, rotation: root.photoRotation, size: size,
++            id: root.photoEditId,
++            x: root.clampTo(Math.round(root.cropX), 0, root.photoWidth - size),
++            y: root.clampTo(Math.round(root.cropY), 0, root.photoHeight - size) })
++    }
++    function discardPhoto() {
++        root.photoMessage = ""
++        root.photoEditId = ""
++        if (!root.photo) return
++        root.photo = null
++        root.request({ action: "photo-discard" })
++    }
++    FileDialog {
++        id: photoDialog
++        title: Translation.tr("Choose a photo")
++        fileMode: FileDialog.OpenFile
++        nameFilters: [Translation.tr("Photos") + " (*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff)"]
++        onAccepted: root.request({ action: "photo-open", file: decodeURIComponent(String(selectedFile).replace(/^file:\/\//, "")) })
++    }
++    // Settings steps down a layer while the chooser is up, so the chooser is never under it.
++    SettingsNativeDialogGuard {
++        dialog: photoDialog
++        dialogKey: "account-photo"
++    }
++    function pictureUrl(name) {
++        return name ? "file:///nix/var/nix/profiles/hp-os-add-user/share/hp-os-add-user/pictures/" + name + ".jpg" : ""
++    }
++    function accountFace(account) {
++        return account && account.picture ? "file://" + account.icon + "?v=" + root.faceRevision : ""
++    }
+     property var users: []
+     property string message: ""
+     property var pending: ({})
+@@ -43,6 +251,7 @@
+     property string selectedUser: ""
+     function request(data) {
+         if (backend.running) return
++        lastAction = String(data.action)
+         pending = data
+         backend.running = true
+     }
+@@ -61,7 +270,27 @@
+             onStreamFinished: {
+                 try {
+                     const result = JSON.parse(text)
+-                    if (result.users) root.users = result.users
++                    const photoStep = root.lastAction.startsWith("photo-")
++                    root.photoMessage = photoStep && !result.ok ? String(result.error) : ""
++                    if (result.photo) {
++                        root.photoStep = 1
++                        root.photoRotation = Number(result.photo.rotation ?? 0)
++                        root.photoEditId = String(result.photo.id ?? "")
++                        root.photo = result.photo
++                        root.faceRevision++
++                        root.resetCrop()
++                        if (result.photo.size !== undefined) {
++                            root.cropSize = result.photo.size
++                            root.placeCrop(result.photo.x, result.photo.y)
++                        }
++                        root.message = ""
++                        return
++                    }
++                    if (result.photoSaved) root.photo = null
++                    if (result.photoDiscarded) { root.message = ""; return }
++                    if (photoStep && !result.ok) return
++                    if (result.users) { root.users = result.users; root.faceRevision++; root.serveAccountPhotoRequest() }
++                    if (result.photoDeleted) root.photoToDelete = ""
+                     if (result.deleted) {
+                         root.selectedUser = ""
+                         root.deletion = null
+@@ -92,10 +321,7 @@
+                     implicitHeight: 48
+                     onClicked: {
+                         if (backend.running) return
+-                        root.deletion = null
+-                        root.selectedUser = modelData.username
+-                        username.text = modelData.username
+-                        fullName.text = modelData.name
++                        root.selectAccount(modelData)
+                     }
+                     contentItem: IrisText {
+                         text: (modelData.name || modelData.username) + " · " +
+@@ -106,11 +332,323 @@
+             }
+             IrisText {
+                 Layout.fillWidth: true
++                visible: !root.selectedUser
++                wrapMode: Text.WordWrap
++                color: IrisStyle.muted
++                text: Translation.tr("Select a person to change their name or picture.")
++            }
++            IrisText {
++                Layout.fillWidth: true
+                 wrapMode: Text.WordWrap
+                 text: root.message
+             }
+         }
+     }
++    AccountCard {
++        id: profileCard
++        visible: !!root.selectedAccount
++        title: Translation.tr("Name and picture")
++        icon: "badge"
++        ColumnLayout {
++            Layout.fillWidth: true
++            spacing: 14
++            RowLayout {
++                Layout.fillWidth: true
++                spacing: 14
++                AccountFace {
++                    implicitWidth: 64; implicitHeight: 64
++                    source: root.accountFace(root.selectedAccount)
++                    letter: root.selectedAccount ? (root.selectedAccount.name || root.selectedAccount.username) : ""
++                }
++                AccountField {
++                    id: profileName
++                    Layout.fillWidth: true
++                    placeholderText: Translation.tr("Name")
++                    maximumLength: 64
++                }
++                RippleButton {
++                    implicitWidth: 96
++                    implicitHeight: 44
++                    enabled: !backend.running && !!root.selectedAccount && profileName.text.trim().length > 0
++                        && profileName.text.trim() !== root.selectedAccount.name
++                    onClicked: root.request({ action: "rename", username: root.selectedUser, name: profileName.text.trim() })
++                    contentItem: IrisText {
++                        text: Translation.tr("Save")
++                        horizontalAlignment: Text.AlignHCenter
++                        verticalAlignment: Text.AlignVCenter
++                    }
++                }
++            }
++            Flow {
++                Layout.fillWidth: true
++                spacing: 12
++                Repeater {
++                    model: root.pictureChoices
++                    delegate: Item {
++                        id: choice
++                        required property string modelData
++                        readonly property bool chosen: !!root.selectedAccount && root.selectedAccount.picture === choice.modelData
++                        width: 64; height: 64
++                        Accessible.role: Accessible.Button
++                        Accessible.name: choice.modelData || Translation.tr("Initial")
++                        Rectangle {
++                            anchors.fill: parent
++                            radius: width / 2
++                            color: "transparent"
++                            border.width: 3
++                            border.color: choice.chosen ? IrisStyle.accent : "transparent"
++                        }
++                        AccountFace {
++                            anchors.fill: parent
++                            anchors.margins: 6
++                            source: root.pictureUrl(choice.modelData)
++                            letter: root.selectedAccount ? (root.selectedAccount.name || root.selectedAccount.username) : ""
++                            scale: choiceArea.containsMouse ? 1.06 : 1
++                            Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
++                        }
++                        MouseArea {
++                            id: choiceArea
++                            anchors.fill: parent
++                            hoverEnabled: true
++                            enabled: !backend.running && !choice.chosen
++                            cursorShape: Qt.PointingHandCursor
++                            onClicked: root.request({ action: "picture", username: root.selectedUser, picture: choice.modelData })
++                        }
++                    }
++                }
++                // Photos they've uploaded: click to use one, × to delete it.
++                Repeater {
++                    model: root.selectedAccount ? root.selectedAccount.uploads : []
++                    delegate: Item {
++                        id: uploaded
++                        required property var modelData
++                        readonly property bool chosen: root.currentUpload === uploaded.modelData.id
++                        width: 64; height: 64
++                        Accessible.role: Accessible.Button
++                        Accessible.name: Translation.tr("Uploaded photo")
++                        Rectangle {
++                            anchors.fill: parent
++                            radius: width / 2
++                            color: "transparent"
++                            border.width: 3
++                            border.color: uploaded.chosen ? IrisStyle.accent : "transparent"
++                        }
++                        AccountFace {
++                            anchors.fill: parent
++                            anchors.margins: 6
++                            source: "file://" + uploaded.modelData.icon + "?v=" + root.faceRevision
++                            scale: uploadedArea.containsMouse ? 1.06 : 1
++                            Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
++                        }
++                        MouseArea {
++                            id: uploadedArea
++                            anchors.fill: parent
++                            hoverEnabled: true
++                            enabled: !backend.running && !uploaded.chosen
++                            cursorShape: Qt.PointingHandCursor
++                            onClicked: root.request({ action: "photo-use", username: root.selectedUser, id: uploaded.modelData.id })
++                        }
++                        Rectangle {
++                            anchors { right: parent.right; top: parent.top }
++                            width: 22; height: 22
++                            radius: 11
++                            color: deleteArea.containsMouse ? "#d93025" : "#5f6673"
++                            border.width: 2
++                            border.color: "white"
++                            Accessible.role: Accessible.Button
++                            Accessible.name: Translation.tr("Delete photo")
++                            IrisText { anchors.centerIn: parent; text: "×"; color: "white"; font.pixelSize: 14; font.bold: true }
++                            MouseArea {
++                                id: deleteArea
++                                anchors { fill: parent; margins: -3 }
++                                hoverEnabled: true
++                                enabled: !backend.running
++                                cursorShape: Qt.PointingHandCursor
++                                onClicked: root.photoToDelete = uploaded.modelData.id
++                            }
++                        }
++                    }
++                }
++                // A picture set some other way, before uploads were kept.
++                Item {
++                    visible: !!root.selectedAccount && root.selectedAccount.picture === "custom"
++                    width: 64; height: 64
++                    Rectangle {
++                        anchors.fill: parent
++                        radius: width / 2
++                        color: "transparent"
++                        border.width: 3
++                        border.color: IrisStyle.accent
++                    }
++                    AccountFace {
++                        anchors.fill: parent
++                        anchors.margins: 6
++                        source: root.accountFace(root.selectedAccount)
++                        letter: root.selectedAccount ? (root.selectedAccount.name || root.selectedAccount.username) : ""
++                    }
++                }
++            }
++            RowLayout {
++                visible: !!root.photoToDelete
++                spacing: 10
++                IrisText { text: Translation.tr("Delete this photo?") }
++                Button { text: Translation.tr("Cancel"); enabled: !backend.running; onClicked: root.photoToDelete = "" }
++                Button {
++                    text: Translation.tr("Delete photo")
++                    enabled: !backend.running
++                    onClicked: root.request({ action: "photo-delete", username: root.selectedUser, id: root.photoToDelete })
++                }
++            }
++            RowLayout {
++                visible: !root.photo && !root.photoToDelete
++                spacing: 10
++                RippleButton {
++                    implicitWidth: 170
++                    implicitHeight: 42
++                    enabled: !backend.running
++                    onClicked: photoDialog.open()
++                    contentItem: IrisText {
++                        text: Translation.tr("Upload photo…")
++                        horizontalAlignment: Text.AlignHCenter
++                        verticalAlignment: Text.AlignVCenter
++                    }
++                }
++                RippleButton {
++                    visible: !!root.currentUpload || (!!root.selectedAccount && root.selectedAccount.picture === "custom")
++                    implicitWidth: 170
++                    implicitHeight: 42
++                    enabled: !backend.running
++                    onClicked: root.request({ action: "photo-edit", username: root.selectedUser, id: root.currentUpload })
++                    contentItem: IrisText {
++                        text: Translation.tr("Crop or resize…")
++                        horizontalAlignment: Text.AlignHCenter
++                        verticalAlignment: Text.AlignVCenter
++                    }
++                }
++            }
++            IrisText {
++                visible: !root.photo
++                color: IrisStyle.muted
++                text: Translation.tr("Photos must be at least %1 × %1 pixels.").arg(root.photoMinimum)
++            }
++            ColumnLayout {
++                visible: !!root.photo
++                Layout.alignment: Qt.AlignHCenter
++                spacing: 12
++                IrisText {
++                    Layout.alignment: Qt.AlignHCenter
++                    font.bold: true
++                    text: root.photoStep === 1 ? Translation.tr("Rotate and crop") : Translation.tr("Preview")
++                }
++                // Step 1: the whole photo, with a square to move and resize.
++                Item {
++                    visible: root.photoStep === 1
++                    Layout.alignment: Qt.AlignHCenter
++                    implicitWidth: root.photoStageWidth
++                    implicitHeight: root.photoStageHeight
++                    Item {
++                        id: cropStage
++                        anchors.centerIn: parent
++                        width: root.photoWidth * root.photoStageScale
++                        height: root.photoHeight * root.photoStageScale
++                        PhotoView { viewScale: root.photoStageScale }
++                        // Dims everything outside the square.
++                        Rectangle { color: Qt.rgba(0, 0, 0, 0.5); x: 0; y: 0; width: parent.width; height: cropBox.y }
++                        Rectangle { color: Qt.rgba(0, 0, 0, 0.5); x: 0; y: cropBox.y + cropBox.height; width: parent.width; height: parent.height - y }
++                        Rectangle { color: Qt.rgba(0, 0, 0, 0.5); x: 0; y: cropBox.y; width: cropBox.x; height: cropBox.height }
++                        Rectangle { color: Qt.rgba(0, 0, 0, 0.5); x: cropBox.x + cropBox.width; y: cropBox.y; width: parent.width - x; height: cropBox.height }
++                        Item {
++                            id: cropBox
++                            x: root.cropX * root.photoStageScale
++                            y: root.cropY * root.photoStageScale
++                            width: root.cropSize * root.photoStageScale
++                            height: width
++                            activeFocusOnTab: true
++                            Accessible.role: Accessible.Button
++                            Accessible.name: Translation.tr("Crop area")
++                            Keys.onLeftPressed: root.placeCrop(root.cropX - 10, root.cropY)
++                            Keys.onRightPressed: root.placeCrop(root.cropX + 10, root.cropY)
++                            Keys.onUpPressed: root.placeCrop(root.cropX, root.cropY - 10)
++                            Keys.onDownPressed: root.placeCrop(root.cropX, root.cropY + 10)
++                            Rectangle {
++                                anchors.fill: parent
++                                color: "transparent"
++                                border.width: cropBox.activeFocus ? 3 : 2
++                                border.color: cropBox.activeFocus ? IrisStyle.accent : "white"
++                            }
++                            Rectangle {
++                                anchors.fill: parent
++                                radius: width / 2
++                                color: "transparent"
++                                border.width: 1
++                                border.color: Qt.rgba(1, 1, 1, 0.8)
++                            }
++                            MouseArea {
++                                anchors.fill: parent
++                                preventStealing: true
++                                cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
++                                property point from
++                                property real fromX: 0
++                                property real fromY: 0
++                                onPressed: mouse => { cropBox.forceActiveFocus(); from = mapToItem(cropStage, mouse.x, mouse.y); fromX = root.cropX; fromY = root.cropY }
++                                onPositionChanged: mouse => {
++                                    const now = mapToItem(cropStage, mouse.x, mouse.y)
++                                    root.placeCrop(fromX + (now.x - from.x) / root.photoStageScale, fromY + (now.y - from.y) / root.photoStageScale)
++                                }
++                            }
++                            CropCorner { corner: "tl"; stage: cropStage }
++                            CropCorner { corner: "tr"; stage: cropStage }
++                            CropCorner { corner: "bl"; stage: cropStage }
++                            CropCorner { corner: "br"; stage: cropStage }
++                        }
++                    }
++                }
++                RowLayout {
++                    visible: root.photoStep === 1
++                    Layout.alignment: Qt.AlignHCenter
++                    spacing: 10
++                    Button { text: Translation.tr("Rotate left"); onClicked: root.rotatePhoto(-90) }
++                    Button { text: Translation.tr("Rotate right"); onClicked: root.rotatePhoto(90) }
++                }
++                // Step 2: how it will look.
++                RowLayout {
++                    visible: root.photoStep === 2
++                    Layout.alignment: Qt.AlignHCenter
++                    spacing: 24
++                    PhotoCircle { size: 200 }
++                    PhotoCircle { size: 88; Layout.alignment: Qt.AlignVCenter }
++                    PhotoCircle { size: 38; Layout.alignment: Qt.AlignVCenter }
++                }
++                RowLayout {
++                    Layout.alignment: Qt.AlignHCenter
++                    spacing: 10
++                    Button {
++                        text: root.photoStep === 1 ? Translation.tr("Cancel") : Translation.tr("Back")
++                        enabled: !backend.running
++                        onClicked: root.photoStep === 1 ? root.discardPhoto() : root.photoStep = 1
++                    }
++                    RippleButton {
++                        implicitWidth: 210
++                        implicitHeight: 42
++                        enabled: !backend.running
++                        onClicked: root.photoStep === 1 ? root.photoStep = 2 : root.savePhoto()
++                        contentItem: IrisText {
++                            text: root.photoStep === 1 ? Translation.tr("Next") : Translation.tr("Save as profile picture")
++                            horizontalAlignment: Text.AlignHCenter
++                            verticalAlignment: Text.AlignVCenter
++                        }
++                    }
++                }
++            }
++            IrisText {
++                Layout.fillWidth: true
++                visible: root.photoMessage.length > 0
++                wrapMode: Text.WordWrap
++                color: "#d93025"
++                text: root.photoMessage
++            }
++        }
++    }
+     AccountCard {
+         title: root.selectedUser ? Translation.tr("Set password") : Translation.tr("Add a person")
+         icon: "person_add"
+--- a/GlobalStates.qml
++++ b/GlobalStates.qml
+@@ -131,6 +131,13 @@
+     readonly property bool settingsNativeDialogOpen:
+         Object.keys(root._settingsNativeDialogs).length > 0
+ 
++    // Every "change profile picture" goes to the same place: Users & Accounts, on your own account.
++    property bool accountPhotoRequested: false
++    function openAccountPhoto(accountsPage: int): void {
++        root.accountPhotoRequested = true
++        root.openSettingsPage(accountsPage, "")
++    }
++
+     function openSettingsPage(index: int, section): void {
+         const requestedSection = String(section ?? "")
+         const isWaffle = Config.options?.panelFamily === "waffle"
+--- a/modules/iris/settings/IrisWallpaperCard.qml
++++ b/modules/iris/settings/IrisWallpaperCard.qml
+@@ -58,26 +58,7 @@
+         Wallpapers.applySelectionTarget(path, "main", Appearance.m3colors.darkmode, "")
+     }
+     function chooseAvatar(): void {
+-        avatarDialog.open()
+-    }
+-    FileDialog {
+-        id: avatarDialog
+-        title: Translation.tr("Profile picture")
+-        fileMode: FileDialog.OpenFile
+-        nameFilters: [Translation.tr("Images") + " (*.png *.jpg *.jpeg *.webp *.bmp *.avif)"]
+-        onAccepted: {
+-            setAvatar.command = [Quickshell.shellPath("scripts/accounts/set-avatar.sh"), FileUtils.trimFileProtocol(String(selectedFile))]
+-            setAvatar.running = true
+-        }
+-    }
+-    // Settings steps down a layer while the chooser is up, so the chooser is never under it.
+-    SettingsNativeDialogGuard {
+-        dialog: avatarDialog
+-        dialogKey: "iris-profile-picture"
+-    }
+-    Process {
+-        id: setAvatar
+-        onExited: exitCode => { if (exitCode === 0) Directories.userAvatarRevision++ }
++        GlobalStates.openAccountPhoto(SettingsPageRegistry.pages.findIndex(page => page.key === "accounts"))
+     }
+     function openGallery(): void {
+         GlobalStates.settingsOverlayOpen = false
+--- a/modules/iris/bar/IrisIsland.qml
++++ b/modules/iris/bar/IrisIsland.qml
+@@ -306,21 +306,7 @@
+ 
+     function chooseAvatar(): void {
+         root.expanded = false
+-        avatarDialog.open()
+-    }
+-    FileDialog {
+-        id: avatarDialog
+-        title: Translation.tr("Profile picture")
+-        fileMode: FileDialog.OpenFile
+-        nameFilters: [Translation.tr("Images") + " (*.png *.jpg *.jpeg *.webp *.bmp *.avif)"]
+-        onAccepted: {
+-            setAvatar.command = [Quickshell.shellPath("scripts/accounts/set-avatar.sh"), FileUtils.trimFileProtocol(String(selectedFile))]
+-            setAvatar.running = true
+-        }
+-    }
+-    Process {
+-        id: setAvatar
+-        onExited: exitCode => { if (exitCode === 0) Directories.userAvatarRevision++ }
++        GlobalStates.openAccountPhoto(SettingsPageRegistry.pages.findIndex(page => page.key === "accounts"))
+     }
+ 
+     function clockText(total: real): string {
+--- a/modules/settings/SidebarsConfig.qml
++++ b/modules/settings/SidebarsConfig.qml
+@@ -476,7 +476,7 @@
+                     RippleButtonWithIcon {
+                         materialIcon: "folder_open"
+                         mainText: Translation.tr("Choose")
+-                        onClicked: profileAvatarDialog.open()
++                        onClicked: GlobalStates.openAccountPhoto(SettingsPageRegistry.pages.findIndex(page => page.key === "accounts"))
+                     }
+ 
+                     RippleButtonWithIcon {
+--- a/modules/iris/settings/IrisSettings.qml
++++ b/modules/iris/settings/IrisSettings.qml
+@@ -546,6 +546,10 @@
+ 
+                     Flickable {
+                         id: sidebarFlick
++                        // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++                        PointHandler { id: sidebarHeld; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++                        MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++                        interactive: !sidebarHeld.active
+                         Layout.fillWidth: true
+                         Layout.fillHeight: true
+                         clip: true
+@@ -893,6 +897,10 @@
+ 
+                     Flickable {
+                         id: settingsFlick
++                        // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++                        PointHandler { id: settingsHeld; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++                        MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++                        interactive: !settingsHeld.active
+                         anchors.fill: parent
+                         anchors.topMargin: root.heroPinned ? heroPinSlot.y + heroPinSlot.height + Math.round(12 * root.d) : 0
+                         // Rows pass under the pinned head, never over it.
+@@ -1062,6 +1070,10 @@
+                     // Home: every area at once, in the sidebar's clusters, each one card of marks to open.
+                     Flickable {
+                         id: homeFlick
++                        // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++                        PointHandler { id: homeHeld; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++                        MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++                        interactive: !homeHeld.active
+                         anchors.fill: parent
+                         visible: root.atHome
+                         contentHeight: homeColumn.implicitHeight + 32 * root.d
+--- a/modules/common/widgets/ContentPage.qml
++++ b/modules/common/widgets/ContentPage.qml
+@@ -4,6 +4,10 @@
+ import qs.modules.common.widgets
+ 
+ StyledFlickable {
++    // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
+     id: root
+     property real bottomContentPadding: 48
+     // Metadatos opcionales para páginas de Settings
+--- a/modules/settings/WelcomeConfig.qml
++++ b/modules/settings/WelcomeConfig.qml
+@@ -8,6 +8,10 @@
+ import qs.modules.iris.style
+ 
+ Flickable {
++    // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
+     id: root
+     contentHeight: content.implicitHeight + 64
+     clip: true
+--- a/modules/iris/settings/IrisAboutPage.qml
++++ b/modules/iris/settings/IrisAboutPage.qml
+@@ -11,6 +11,10 @@
+ import qs.modules.iris.style
+ 
+ Flickable {
++    // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
+     id: root
+ 
+     readonly property real d: IrisStyle.density
+--- a/modules/iris/settings/IrisShortcutsPage.qml
++++ b/modules/iris/settings/IrisShortcutsPage.qml
+@@ -12,6 +12,10 @@
+ import qs.modules.iris.style
+ 
+ Flickable {
++    // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
++    PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
++    MouseArea { anchors.fill: parent; z: -1; preventStealing: true }
++    interactive: !heldByMouse.active
+     id: root
+ 
+     readonly property real d: IrisStyle.density

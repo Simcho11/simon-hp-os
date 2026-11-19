@@ -14,6 +14,7 @@ let
     "desktop-swipe-smooth.patch" "desktop-rail-stacking.patch" "minimize-to-dock-icon.patch"
     "dock-keep-cursor.patch" "carry-scroll-desktops.patch" "unminimize-to-current-desktop.patch"
     "overview-workspaces.patch" "snap-overlay-keeps-windows-active.patch" "keyboard-carry.patch"
+    "advertise-minimize.patch"
   ];
 in {
   niri = baseNiri.overrideAttrs (old: {
@@ -55,6 +56,9 @@ in {
     git apply --binary ${./shell.patch}
     git apply ${./account-session.patch}
     git apply ${./delete-account.patch}
+    git apply ${./account-profile.patch}
     git apply ${./glass-everywhere.patch}
+    git apply ${./file-drops.patch}
+    git apply ${./device-settings.patch}
   '';
 }

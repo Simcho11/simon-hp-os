@@ -2,6 +2,10 @@
 let
   cfg = config.programs.goran-hp-os;
   hpPkgs = hp-os.inputs.nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system};
+  # Files with a glass slot showing where a dropped item will land.
+  filesWithDropSlot = hpPkgs.kdePackages.dolphin.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [ ./hp-snap/files-drop-slot.patch ];
+  });
   originalQs = hpPkgs.quickshell;
   originalShell = hp-os.packages.${pkgs.stdenv.hostPlatform.system}.default;
   globalTouchNiri = originalShell.niri.overrideAttrs (old: {
@@ -92,6 +96,13 @@ export QT_WAYLAND_DECORATION="''${QT_WAYLAND_DECORATION:-adwaita}"'
     python3 "$packaging/write-version.py" "$config"'
       substituteInPlace "$out/bin/hp-os-files" \
         --replace-fail 'env["QT_PLUGIN_PATH"] = "' 'env["QT_PLUGIN_PATH"] = "${hpPkgs.qt6.qtwayland}/${hpPkgs.qt6.qtbase.qtPluginPrefix}:'
+      # Files shows a glass slot where a dropped item will land.
+      substituteInPlace "$out/bin/hp-os-files" \
+        --replace-fail '${hpPkgs.kdePackages.dolphin}/bin/dolphin' '${filesWithDropSlot}/bin/dolphin'
+      # Files drags like macOS: no menu on drop, and folders spring open under a held file.
+      substituteInPlace "$out/bin/hp-os-files" \
+        --replace-fail 'def prepare_environment(environ, assets):' "$(cat ${./hp-snap/files-drag.py})"$'\n\n\ndef prepare_environment(environ, assets):' \
+        --replace-fail '    apply_files_palette(profile / "kdeglobals", assets, mode)' $'    apply_files_palette(profile / "kdeglobals", assets, mode)\n    keep_mac_file_drags(profile)'
       # Seed a new desktop on the desktop grid (it starts at 0; 104 px pitch with the 8 px grid).
       substituteInPlace "$out/share/hp-os/packaging/initialize-config.py" \
         --replace-fail 'x=24 + (index // 6) * 104, y=24 + (index % 6) * 104' \

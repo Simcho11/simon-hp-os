@@ -112,6 +112,7 @@ LoginSurface {
         id: tile
         property string shownName: ""
         property string shownIcon: ""
+        property string shownLogin: ""
         property int order: 0
         property alias face: tileFace
         signal chosen()
@@ -144,6 +145,7 @@ LoginSurface {
                 id: tileFace
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: root.px(88); height: width
+                account: tile.shownLogin
                 icon: tile.shownIcon
                 name: tile.shownName
                 fontFamily: root.core.fontMain
@@ -295,6 +297,7 @@ LoginSurface {
                 anchors.verticalCenter: parent.verticalCenter
                 width: root.px(38)
                 height: width
+                account: root.core.userLogin
                 icon: root.core.userIcon
                 name: root.core.userName
                 fontFamily: root.core.fontMain
@@ -427,6 +430,7 @@ LoginSurface {
                 visible: root.core.addedLogin.length > 0
                 shownName: root.core.addedName
                 shownIcon: root.core.addedIcon
+                shownLogin: root.core.addedLogin
                 onChosen: root.chooseAdded(true)
             }
             Repeater {
@@ -437,6 +441,7 @@ LoginSurface {
                     order: index + (addedTile.visible ? 1 : 0)
                     shownName: root.core.modelText(userModel, index, root.core.realNameRole) || root.core.modelText(userModel, index, root.core.nameRole)
                     shownIcon: root.core.modelText(userModel, index, root.core.iconRole)
+                    shownLogin: root.core.modelText(userModel, index, root.core.nameRole)
                     onChosen: root.chooseProfile(index)
                 }
             }
@@ -453,6 +458,7 @@ LoginSurface {
         height: width
         x: Math.round(root.flyFromX + (flyer.landing().x - root.flyFromX) * root.stage - width / 2)
         y: Math.round(root.flyFromY + (flyer.landing().y - root.flyFromY) * root.stage - height / 2)
+        account: root.core.userLogin
         icon: root.core.userIcon
         name: root.core.userName
         fontFamily: root.core.fontMain

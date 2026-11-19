@@ -216,7 +216,13 @@ export class SnapEngine {
     if (win.is_focused) this.focusedId = win.id;
     // niri may report a restored window's focus only here, without WindowFocusChanged.
     if (win.is_focused && this.minimized.has(win.id)) this.unminimize(win.id);
-    if (!old) { this.noteFloating(win); this.io.emit?.("windows"); return; }
+    if (!old) {
+      this.noteFloating(win);
+      this.io.emit?.("windows");
+      // A window that opens maximized starts in the tiled layer, underneath every floating window.
+      if (!win.is_floating) this.onLeftFloating(win.id);
+      return;
+    }
     const wasPlaced = !!old.layout?.tile_pos_in_workspace_view;
     const isPlaced = !!win.layout?.tile_pos_in_workspace_view;
     if (old.is_floating && win.is_floating && wasPlaced && !isPlaced) { this.onDragStart(win.id); return; }
@@ -518,7 +524,14 @@ export class SnapEngine {
     // Use the last floating geometry: a window niri just maximized is already
     // tiled, and a tiled window has no windowed geometry of its own.
     const last = this.lastFloat.get(id);
-    if (last) this.restore.set(id, { rect: last.rect, output: last.output });
+    if (last) { this.restore.set(id, { rect: last.rect, output: last.output }); return; }
+    // A window that opened maximized has never floated: restore it to a centred window.
+    const out = this.outputOf(this.windows.get(id));
+    const wa = out && this.workAreaRect(out);
+    if (!wa) return;
+    const w = Math.round(wa.w * 0.6), h = Math.round(wa.h * 0.7);
+    const rect = { x: wa.x + Math.round((wa.w - w) / 2), y: wa.y + Math.round((wa.h - h) / 2), w, h };
+    this.restore.set(id, { rect, output: out.name });
   }
 
   unsnap(id) {
