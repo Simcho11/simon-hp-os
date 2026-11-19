@@ -57,6 +57,24 @@ let
       printf '[Desktop Entry]\nType=Application\nName=%s\nNoDisplay=true\nHidden=true\n' "''${name%.desktop}" > "$out/$name"
     done
   '';
+  # The app list only searches ~/.local/share and the system folders, not the account's Nix profile, so the
+  # apps installed for every account are listed there too, each with its icon as a file so it always shows.
+  listed = [ "com.mitchellh.ghostty" "google-chrome" ];
+  listedApps = pkgs.runCommand "hp-os-listed-apps" { } ''
+    mkdir -p "$out"
+    for id in ${lib.concatStringsSep " " listed}; do
+      entry=${config.home.path}/share/applications/$id.desktop
+      [ -f "$entry" ] || { echo "missing $entry" >&2; exit 1; }
+      icon=$(sed -n 's/^Icon=//p' "$entry" | head -n 1)
+      found=""
+      for candidate in scalable/apps/$icon.svg 512x512/apps/$icon.png 256x256/apps/$icon.png 128x128/apps/$icon.png; do
+        if [ -f ${config.home.path}/share/icons/hicolor/$candidate ]; then
+          found=$(readlink -f ${config.home.path}/share/icons/hicolor/$candidate); break
+        fi
+      done
+      if [ -n "$found" ]; then sed "s|^Icon=.*|Icon=$found|" "$entry" > "$out/$id.desktop"; else cp "$entry" "$out/$id.desktop"; fi
+    done
+  '';
 in {
   home.file = {
     ".local/bin/chrome-live-control".source = chrome;
@@ -69,7 +87,10 @@ in {
   } // builtins.listToAttrs (map (app: {
     name = "applications/microsoft365-${app.id}.desktop";
     value.source = file app;
-  }) catalogue);
+  }) catalogue) // builtins.listToAttrs (map (id: {
+    name = "applications/${id}.desktop";
+    value.source = "${listedApps}/${id}.desktop";
+  }) listed);
   home.activation.hpOsHiddenApps = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
     run mkdir -p ${lib.escapeShellArg "${config.xdg.dataHome}/applications"}
     for file in ${hidden}/*.desktop; do
