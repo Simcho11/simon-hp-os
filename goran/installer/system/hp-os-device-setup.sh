@@ -162,6 +162,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-update check
+# The check also works out the update's size and download time.
+TimeoutStartSec=1500
+Nice=10
 UNIT
 # Each account's wallpaper on the login screen: the session shares it, this keeps the copy (only when asked).
 cat > "$units/hp-os-login-wallpaper.socket" <<UNIT

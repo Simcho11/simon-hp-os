@@ -273,7 +273,8 @@ def update_status():
 
 
 def update_check():
-    run("/usr/bin/systemctl", "start", "hp-os-update-check.service", timeout=600)
+    # The check also works out the update's size and download time, which can take a few minutes on a slow device.
+    run("/usr/bin/systemctl", "start", "hp-os-update-check.service", timeout=1500)
     return update_status()
 
 

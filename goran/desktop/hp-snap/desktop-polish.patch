@@ -305,6 +305,246 @@ index f751670..cd5d2be 100644
          onReleased: {
              root.released()
              root._dragSessionActive = false
+diff --git a/modules/iris/settings/IrisNiri.qml b/modules/iris/settings/IrisNiri.qml
+index f31593f..85dfd54 100644
+--- a/modules/iris/settings/IrisNiri.qml
++++ b/modules/iris/settings/IrisNiri.qml
+@@ -27,6 +27,9 @@ Singleton {
+     readonly property bool displayBusy: root.pending !== null || applier.running || persister.running || root.arrangementBusy
+     property bool hasTouchpad: false
+     property bool hasTrackpoint: false
++    // hp-snap: a haptic touchpad (clicks with a motor) has feedback strength and click pressure; a regular one doesn't.
++    property bool hasHapticTouchpad: false
++    property bool hasClickPressure: false
+     property int secondsLeft: 0
+     property real previewDeadline: 0
+     readonly property int previewTimeout: 60
+@@ -38,6 +41,7 @@ Singleton {
+         if (!root.available) return
+         root.reload(["input", "layout", "animations", "window-rules", "outputs", "cursors"])
+         if (!devices.running) devices.running = true
++        if (!haptics.running) haptics.running = true
+     }
+     function reload(parts: var): void {
+         for (const part of parts) {
+@@ -268,6 +272,22 @@ Singleton {
+             onStreamFinished: root.parse(text, value => { root.cursorThemes = Array.isArray(value) ? value : [] })
+         }
+     }
++    Process {
++        id: haptics
++        command: [Quickshell.env("HOME") + "/.local/share/hp-snap/bin/touchpad-haptics", "detect"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try {
++                    const found = JSON.parse(text)
++                    root.hasHapticTouchpad = found.haptic === true
++                    root.hasClickPressure = found.haptic === true && found.pressure === true
++                } catch (error) {
++                    root.hasHapticTouchpad = false
++                    root.hasClickPressure = false
++                }
++            }
++        }
++    }
+     Process {
+         id: devices
+         command: ["grep", "-i", "^N: Name=", "/proc/bus/input/devices"]
+diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
+index 1c9dd35..36e0dc7 100644
+--- a/modules/iris/settings/IrisOptions.qml
++++ b/modules/iris/settings/IrisOptions.qml
+@@ -1095,8 +1095,8 @@ QtObject {
+             keywords: ["typing", "trackpad", "touchpad", "instant"]
+         },
+         { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.click-method", label: "Right click", kind: "choice", fallback: "button-areas", choices: [{label:"Bottom corner",value:"button-areas"},{label:"Two fingers",value:"clickfinger"}] },
+-        { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, label: "Haptic feedback", description: "How strongly the trackpad clicks back when you press it. 0 turns it off.", path: "hpos.touchpadHaptics", kind: "range", fallback: 50, min: 0, max: 100, step: 5, unit: " %", keywords: ["haptic", "haptics", "vibration", "feedback", "click", "force", "trackpad", "touchpad"] },
+-        { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, label: "Click pressure", description: "How hard you press the trackpad to click. Default is the trackpad's own setting.", path: "hpos.touchpadPressure", kind: "choice", fallback: "default", choices: [{label:"Default",value:"default"},{label:"Light",value:"light"},{label:"Medium",value:"medium"},{label:"Firm",value:"firm"}], keywords: ["pressure", "force", "click", "press", "sensitivity", "trackpad", "touchpad"] },
++        { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad && IrisNiri.hasHapticTouchpad, label: "Haptic feedback", description: "How strongly the trackpad clicks back when you press it. 0 turns it off.", path: "hpos.touchpadHaptics", kind: "range", fallback: 50, min: 0, max: 100, step: 5, unit: " %", keywords: ["haptic", "haptics", "vibration", "feedback", "click", "force", "trackpad", "touchpad"] },
++        { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad && IrisNiri.hasClickPressure, label: "Click pressure", description: "How hard you press the trackpad to click. Default is the trackpad's own setting.", path: "hpos.touchpadPressure", kind: "choice", fallback: "default", choices: [{label:"Default",value:"default"},{label:"Light",value:"light"},{label:"Medium",value:"medium"},{label:"Firm",value:"firm"}], keywords: ["pressure", "force", "click", "press", "sensitivity", "trackpad", "touchpad"] },
+         { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.disabled-on-external-mouse", label: "Off while a mouse is plugged in", kind: "switch", fallback: false },
+ 
+         { section: "keyboard", group: "Pointer", niri: "input", key: "cursor.xcursor-theme", read: "cursor.theme", label: "Cursor", kind: "choice", choicesFrom: "cursors", fallback: "", keywords: ["cursor", "theme", "pointer"] },
+diff --git a/modules/settings/WelcomeConfig.qml b/modules/settings/WelcomeConfig.qml
+index 4820162..8127ba0 100644
+--- a/modules/settings/WelcomeConfig.qml
++++ b/modules/settings/WelcomeConfig.qml
+@@ -1,12 +1,17 @@
+ import QtQuick
+ import QtQuick.Controls
+ import QtQuick.Layouts
++import Quickshell
+ import qs
+ import qs.services
+ import qs.modules.common
++import qs.modules.common.widgets
++import qs.modules.common.functions
+ import qs.modules.iris.components
+ import qs.modules.iris.style
+ 
++// hp-snap: Welcome to HP-OS. The moves most people want in their first week, each a short card, and the way to the
++// full User Guide (installed for every account at ~/.local/share/hp-os/HP-OS User Guide.pdf, with a copy on the desktop).
+ Flickable {
+     // A mouse press never drags the page: only the wheel, touchpad or touch scrolls it.
+     PointHandler { id: heldByMouse; acceptedDevices: PointerDevice.Mouse; acceptedButtons: Qt.LeftButton }
+@@ -15,33 +20,138 @@ Flickable {
+     id: root
+     contentHeight: content.implicitHeight + 64
+     clip: true
++
++    readonly property string guide: Quickshell.env("HOME") + "/.local/share/hp-os/HP-OS User Guide.pdf"
++    function openGuide(): void {
++        Qt.openUrlExternally("file://" + encodeURI(root.guide))
++    }
++
++    readonly property var tips: [
++        { glyph: "apps", title: Translation.tr("Open apps"),
++          text: Translation.tr("Click the grid at the left of the Dock, or press Super+Space. Start typing to find an app.") },
++        { glyph: "search", title: Translation.tr("Search anything"),
++          text: Translation.tr("Press Super+S for apps, settings and actions. Start with = to calculate, ; for things you copied, : for emoji.") },
++        { glyph: "view_agenda", title: Translation.tr("Desktop pages"),
++          text: Translation.tr("Scroll on an empty part of the desktop to change pages. Hold a window’s title bar and scroll to take it along. Super+Tab shows everything.") },
++        { glyph: "dashboard", title: Translation.tr("Snap windows"),
++          text: Translation.tr("Drag a window to an edge or corner to fill half or a quarter of the screen. Press Super+Z for more layouts.") },
++        { glyph: "tune", title: Translation.tr("Quick settings"),
++          text: Translation.tr("Wi-Fi, Bluetooth, volume, brightness and dark mode are in Control Center, at the bottom right. Click the date for your calendar and the weather.") },
++        { glyph: "wallpaper", title: Translation.tr("Make it yours"),
++          text: Translation.tr("Right-click the desktop to change the wallpaper, add widgets or make a new folder. Right-click any picture to set it as your wallpaper.") },
++        { glyph: "system_update", title: Translation.tr("Stay up to date"),
++          text: Translation.tr("HP-OS checks for updates every day. Settings › General › Software Update shows each update’s size and how long it takes.") },
++        { glyph: "group", title: Translation.tr("Share this device"),
++          text: Translation.tr("Everyone gets their own desktop, files and settings. An administrator adds people in Users & Accounts; Switch User keeps your apps open.") }
++    ]
++
+     ColumnLayout {
+         id: content
+-        x: 32; y: 32; width: root.width - 64; spacing: 24
+-        IrisText { text: Translation.tr("Welcome to HP-OS"); font.pixelSize: 30; font.bold: true }
+-        IrisText {
+-            Layout.fillWidth: true
+-            wrapMode: Text.WordWrap
+-            text: Translation.tr("Your desktop, files and preferences belong to your account.")
+-        }
+-        IrisText {
++        x: 32; y: 32; width: root.width - 64; spacing: 22
++
++        ColumnLayout {
+             Layout.fillWidth: true
+-            wrapMode: Text.WordWrap
+-            text: Translation.tr("Use the dock to open apps. Scroll on the desktop to move between screens. Hold a dragged window or icon near the bottom edge to move it to the next desktop.")
++            spacing: 6
++            IrisText { text: Translation.tr("Welcome to HP-OS"); font.pixelSize: IrisStyle.typeDisplay + 2; font.bold: true }
++            IrisText {
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: IrisStyle.subtext
++                font.pixelSize: IrisStyle.typeTitle
++                text: Translation.tr("A few things worth knowing. The User Guide has everything else.")
++            }
+         }
+-        IrisText {
++
++        // The User Guide
++        Rectangle {
+             Layout.fillWidth: true
+-            wrapMode: Text.WordWrap
+-            text: Translation.tr("Settings lets you personalize your display, keyboard and appearance. Users & Accounts lets an administrator add people and manage passwords.")
++            implicitHeight: guideRow.implicitHeight + 36
++            radius: IrisStyle.radiusCard
++            color: ColorUtils.applyAlpha(IrisStyle.accent, 0.12)
++            border.width: 1
++            border.color: ColorUtils.applyAlpha(IrisStyle.accent, 0.28)
++            RowLayout {
++                id: guideRow
++                anchors { fill: parent; margins: 18 }
++                spacing: 16
++                MaterialSymbol { text: "menu_book"; iconSize: 34; color: IrisStyle.accent }
++                ColumnLayout {
++                    Layout.fillWidth: true
++                    spacing: 2
++                    IrisText { text: Translation.tr("HP-OS User Guide"); font.pixelSize: IrisStyle.typeTitle; font.bold: true }
++                    IrisText {
++                        Layout.fillWidth: true
++                        wrapMode: Text.WordWrap
++                        color: IrisStyle.subtext
++                        text: Translation.tr("Every gesture, shortcut and setting, with pictures. It’s also on your desktop.")
++                    }
++                }
++                IrisButton {
++                    text: Translation.tr("Open the User Guide")
++                    emphasized: true
++                    onClicked: root.openGuide()
++                }
++            }
+         }
+-        IrisText {
++
++        // Tips
++        GridLayout {
+             Layout.fillWidth: true
+-            wrapMode: Text.WordWrap
+-            text: Translation.tr("Use Switch User in the power menu to let someone else sign in while keeping your apps open. If you forget your password, another administrator can reset it. Saved passwords may still require your old password.")
++            columns: root.width > 760 ? 2 : 1
++            columnSpacing: 14
++            rowSpacing: 14
++            Repeater {
++                model: root.tips
++                delegate: Rectangle {
++                    id: tip
++                    required property var modelData
++                    Layout.fillWidth: true
++                    Layout.preferredWidth: 1
++                    implicitHeight: tipRow.implicitHeight + 32
++                    radius: IrisStyle.radiusCard
++                    color: IrisStyle.surfaceHigh
++                    RowLayout {
++                        id: tipRow
++                        anchors { fill: parent; margins: 16 }
++                        spacing: 14
++                        MaterialSymbol {
++                            Layout.alignment: Qt.AlignTop
++                            text: tip.modelData.glyph
++                            iconSize: 24
++                            color: IrisStyle.accent
++                        }
++                        ColumnLayout {
++                            Layout.fillWidth: true
++                            spacing: 3
++                            IrisText { text: tip.modelData.title; font.pixelSize: IrisStyle.typeHeadline; font.bold: true }
++                            IrisText {
++                                Layout.fillWidth: true
++                                wrapMode: Text.WordWrap
++                                color: IrisStyle.subtext
++                                text: tip.modelData.text
++                            }
++                        }
++                    }
++                }
++            }
+         }
+-        Button {
+-            text: Translation.tr("Start using HP-OS")
+-            onClicked: GlobalStates.settingsOverlayOpen = false
++
++        RowLayout {
++            spacing: 10
++            IrisButton {
++                text: Translation.tr("Start using HP-OS")
++                emphasized: true
++                onClicked: GlobalStates.settingsOverlayOpen = false
++            }
++            IrisButton {
++                text: Translation.tr("Check for updates")
++                onClicked: Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-software-update"])
++            }
++            IrisButton {
++                text: Translation.tr("Open the User Guide")
++                quiet: true
++                onClicked: root.openGuide()
++            }
+         }
+     }
+ }
 diff --git a/modules/wallpaperSelector/WallpaperSelectorRouter.qml b/modules/wallpaperSelector/WallpaperSelectorRouter.qml
 index 28dec3d..6815cf3 100644
 --- a/modules/wallpaperSelector/WallpaperSelectorRouter.qml

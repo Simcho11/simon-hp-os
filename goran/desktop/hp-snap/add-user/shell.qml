@@ -141,6 +141,24 @@ ShellRoot {
     property string updateVersion: ""
     property real updateProgress: 0
     property string updateMessage: ""
+    // How big the update is and about how long it takes here (measured by the updater when it checks).
+    property real updateBytes: 0
+    property real updateEstimate: 0      // seconds
+    property real updateStarted: 0       // ms
+    property real updateNow: 0
+    function sizeText(bytes) {
+        return bytes >= 1e9 ? (bytes / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(bytes / 1e6)) + " MB"
+    }
+    function durationText(seconds) {
+        const minutes = Math.round(seconds / 60)
+        return seconds < 90 ? "about a minute" : minutes < 90 ? "about " + minutes + " minutes"
+            : "about " + Math.round(minutes / 60) + " hours"
+    }
+    readonly property string updateLeft: {
+        if (app.updateEstimate <= 0 || app.updateStarted <= 0) return ""
+        const left = app.updateEstimate - (app.updateNow - app.updateStarted) / 1000
+        return left > 45 ? app.durationText(left).replace(/^about/, "About") + " left" : "Almost done…"
+    }
     Process {
         id: welcomeRequest
         property string message: ""
@@ -194,6 +212,10 @@ ShellRoot {
             const status = answer.status || {}
             if (status.available && status.available.version) {
                 app.updateVersion = String(status.available.version)
+                app.updateBytes = Number(status.available.downloadBytes || 0)
+                app.updateEstimate = Number(status.available.estimateSeconds || 0)
+                app.updateStarted = Date.now()
+                app.updateNow = Date.now()
                 app.updatePhase = "installing"
                 app.updateProgress = 0
                 app.updateMessage = "Downloading…"
@@ -210,6 +232,7 @@ ShellRoot {
     Timer {
         id: updatePoll; interval: 2000; repeat: true
         onTriggered: app.ask({ action: "update-status" }, answer => {
+            app.updateNow = Date.now()
             const status = answer.status || {}
             app.updateProgress = Number(status.progress || app.updateProgress)
             app.updateMessage = String(status.message || app.updateMessage)
@@ -234,7 +257,7 @@ ShellRoot {
                 { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
                 { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
             else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
-            else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1" } } }))
+            else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
             else if (a === "update-status") { mockLater.progress = Math.min(100, mockLater.progress + 9)
                 done({ ok: true, status: { state: mockLater.progress >= 100 ? "restart" : "downloading", progress: mockLater.progress,
                                            message: "Preparing the update. This can take a while…" } }) }
@@ -659,10 +682,13 @@ ShellRoot {
                     : app.updatePhase === "failed" ? "Update not installed" : "Checking for updates"
             }
             Subtitle {
-                text: app.updatePhase === "installing" ? "Getting HP-OS " + app.updateVersion + " ready. Please keep your device plugged in."
+                text: app.updatePhase === "installing" ? "Getting HP-OS " + app.updateVersion + " ready"
+                        + (app.updateBytes > 0 ? ": a " + app.sizeText(app.updateBytes) + " download" : "")
+                        + (app.updateEstimate > 0 ? " that takes " + app.durationText(app.updateEstimate) + " on this connection" : "")
+                        + ". Please keep your device plugged in."
                     : app.updatePhase === "restarting" ? "Your device restarts to finish, then continues setup."
                     : app.updatePhase === "current" ? "You’re on the latest version."
-                    : app.updatePhase === "failed" ? app.updateMessage : "This only takes a moment."
+                    : app.updatePhase === "failed" ? app.updateMessage : "Seeing what’s new and how big it is. This can take a minute."
             }
             Gap { size: 22 }
             Rectangle {
@@ -690,7 +716,7 @@ ShellRoot {
             Note {
                 visible: app.updatePhase === "installing"
                 color: Qt.rgba(1, 1, 1, 0.75)
-                text: app.updateMessage
+                text: app.updateLeft.length > 0 ? app.updateLeft + " · " + app.updateMessage : app.updateMessage
             }
             Primary {
                 visible: app.updatePhase === "failed"

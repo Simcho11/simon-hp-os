@@ -18,6 +18,32 @@ ShellRoot {
     readonly property string state: String(app.status.state || "idle")
     readonly property var offer: app.status.available || null
     readonly property bool busy: state === "downloading" || state === "installing" || state === "restoring"
+    // How big the update is and about how long it takes on this connection (the updater measures both when it checks).
+    property real now: Date.now()
+    function sizeText(bytes) {
+        return bytes >= 1e9 ? (bytes / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(bytes / 1e6)) + " MB"
+    }
+    function durationText(seconds) {
+        const minutes = Math.round(seconds / 60)
+        return seconds < 90 ? "about a minute" : minutes < 90 ? "about " + minutes + " minutes"
+            : "about " + Math.round(minutes / 60) + " hours"
+    }
+    readonly property string sizeLine: {
+        const offer = app.offer
+        if (!offer) return ""
+        const bytes = Number(offer.downloadBytes ?? -1), seconds = Number(offer.estimateSeconds ?? 0)
+        if (bytes < 0) return ""
+        const parts = [bytes > 0 ? app.sizeText(bytes) + " download" : "Nothing new to download"]
+        if (seconds > 0) parts.push(app.durationText(seconds).replace(/^about/, "About") + " on this connection")
+        return parts.join(" · ")
+    }
+    readonly property string timeLeft: {
+        const offer = app.status.available || {}
+        const seconds = Number(offer.estimateSeconds ?? 0), started = Number(app.status.started ?? 0)
+        if (!app.busy || app.state === "restoring" || seconds <= 0 || started <= 0) return ""
+        const left = seconds - (app.now / 1000 - started)
+        return left > 45 ? app.durationText(left).replace(/^about/, "About") + " left" : "Almost done…"
+    }
 
     Process {
         id: request
@@ -72,19 +98,19 @@ ShellRoot {
     }
     Timer {
         id: checkLimit
-        interval: 120000
+        interval: 1500000      // the check also measures the update's size and download time
         onTriggered: if (app.checking) { app.checking = false; app.notice = "Checking took too long. Make sure you’re connected to the internet, then try again." }
     }
     QtObject {
         id: previews
-        readonly property var offer: ({ version: "2026.11.20.1", date: "2026-11-20", notes: "Files drag between your desktop, Files and the Dock.\nThe login screen starts faster.\nFixes for sleep and Wi-Fi." })
+        readonly property var offer: ({ version: "2026.11.20.1", date: "2026-11-20", downloadBytes: 742000000, estimateSeconds: 420, notes: "Files drag between your desktop, Files and the Dock.\nThe login screen starts faster.\nFixes for sleep and Wi-Fi." })
         readonly property var available: ({ state: "available", installed: "2026.11.18.1", available: offer })
-        readonly property var downloading: ({ state: "downloading", installed: "2026.11.18.1", available: offer, progress: 42, message: "Preparing the update. This can take a while…" })
+        readonly property var downloading: ({ state: "downloading", installed: "2026.11.18.1", available: offer, progress: 42, started: Date.now() / 1000 - 120, message: "Preparing the update. This can take a while…" })
         readonly property var restart: ({ state: "restart", installed: "2026.11.20.1", progress: 100, message: "Restart to finish updating." })
         readonly property var error: ({ state: "error", installed: "2026.11.18.1", available: offer, message: "The update couldn’t be installed. Your device is back on the previous version." })
         readonly property var idle: ({ state: "idle", installed: "2026.11.20.1", previous: "2026.11.18.1" })
     }
-    Timer { running: true; repeat: true; interval: 1500; triggeredOnStart: true; onTriggered: app.refresh() }
+    Timer { running: true; repeat: true; interval: 1500; triggeredOnStart: true; onTriggered: { app.now = Date.now(); app.refresh() } }
     Component.onCompleted: if (app.preview.length > 0) { app.status = previews[app.preview] || previews.idle; app.admin = Quickshell.env("HP_OS_UPDATE_ROLE") !== "standard" }
 
     FloatingWindow {
@@ -150,6 +176,13 @@ ShellRoot {
                     : app.status.installed ? "You’re on version " + app.status.installed + "." : "You’re on the latest version."
             }
 
+            Label {
+                visible: app.sizeLine.length > 0 && !!app.offer && !app.busy && app.state !== "restart"
+                color: Qt.rgba(1, 1, 1, 0.7)
+                font.pixelSize: 15; font.weight: Font.Medium
+                text: app.sizeLine
+            }
+
             // What's new
             Rectangle {
                 visible: !!app.offer && !app.busy && app.state !== "restart" && !app.asking
@@ -191,7 +224,7 @@ ShellRoot {
                 visible: app.busy
                 color: Qt.rgba(1, 1, 1, 0.7)
                 font.pixelSize: 15
-                text: "You can keep working. Please keep your device powered on."
+                text: (app.timeLeft.length > 0 ? app.timeLeft + ". " : "") + "You can keep working. Please keep your device powered on."
             }
 
             // An administrator's password

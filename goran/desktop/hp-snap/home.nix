@@ -212,6 +212,28 @@ in {
           ${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/hp-snap-hp-blue-v1"}
       fi
     '';
+    # The HP-OS User Guide: always at ~/.local/share/hp-os (Settings › Welcome opens it), and on the desktop. The
+    # desktop copy is put there once; a later edition replaces it only while it is the copy put there, so a guide
+    # that was moved, changed or deleted stays that way.
+    home.file.".local/share/hp-os/HP-OS User Guide.pdf".source = ../../docs/user-guide/hp-os-user-guide.pdf;
+    home.activation.hpOsUserGuide = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      desktop=${lib.escapeShellArg (if config.xdg.userDirs.desktop != null then config.xdg.userDirs.desktop else "${config.home.homeDirectory}/Desktop")}
+      guide="$desktop/HP-OS User Guide.pdf"
+      mark=${lib.escapeShellArg "${config.xdg.stateHome}/hp-os/user-guide-on-desktop"}
+      new=${../../docs/user-guide/hp-os-user-guide.pdf}
+      wanted=$(sha256sum "$new" | cut -d' ' -f1)
+      if [ ! -e "$mark" ]; then
+        if [ ! -e "$guide" ]; then
+          run mkdir -p "$desktop"
+          run install -m 644 "$new" "$guide"
+        fi
+        run mkdir -p "$(dirname "$mark")"
+        [ -n "''${DRY_RUN:-}" ] || echo "$wanted" > "$mark"
+      elif [ -f "$guide" ] && [ "$(sha256sum "$guide" | cut -d' ' -f1)" = "$(cat "$mark")" ] && [ "$wanted" != "$(cat "$mark")" ]; then
+        run install -m 644 "$new" "$guide"
+        [ -n "''${DRY_RUN:-}" ] || echo "$wanted" > "$mark"
+      fi
+    '';
     # The plate marking where a dragged icon will land starts off, once per account (Settings > Desktop turns it on).
     home.activation.hpSnapDropSlotOff = lib.hm.dag.entryAfter [ "hpSnapGlassTray" ] ''
       run ${pkgs.python3}/bin/python3 ${./apply-defaults.py} ${./drop-slot-off.json} \

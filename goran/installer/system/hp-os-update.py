@@ -35,6 +35,8 @@ CHIPS = {"aarch64": "aarch64-linux", "arm64": "aarch64-linux", "x86_64": "x86_64
 NIX_SETTINGS = "etc/nix/nix.conf"
 NETRC = "etc/nix/hp-os-updates.netrc"
 BEGIN, END = "# HP-OS ready-built updates (managed by hp-os-update)", "# end of HP-OS ready-built updates"
+PUBLIC_CACHE = "https://cache.nixos.org"
+UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
 GITHUB_KEY = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
 
 
@@ -223,6 +225,75 @@ class Updater:
                 names.append(fields[0])
         return names
 
+    # ── How big an update is, and how long it takes here ──
+    def everything(self, source):
+        """One Nix expression for everything an update builds: the system parts and each account's desktop."""
+        flake = "path:%s" % source
+        names = " ".join(json.dumps(name) for name in self.accounts())
+        return ('let f = builtins.getFlake "%s"; p = f.packages.${builtins.currentSystem}; in '
+                '[ p.hp-os-account-setup p.hp-os-add-user p.hp-os-login-theme ] ++ '
+                'map (name: (f.lib.hpOsAccount name).activationPackage) [ %s ]' % (flake, names))
+
+    @staticmethod
+    def download_size(report):
+        """What `nix build --dry-run` says it would download: (bytes, paths to fetch, things to build)."""
+        size = 0
+        found = re.search(r"will be fetched \(([\d.]+) (B|KiB|MiB|GiB|TiB) download", report)
+        if found:
+            size = int(float(found.group(1)) * UNITS[found.group(2)])
+        fetched = re.findall(r"^\s+(/nix/store/[a-z0-9]{32}-\S+)$", report.split("will be fetched", 1)[1], re.M) \
+            if "will be fetched" in report else []
+        built = re.search(r"(?:these (\d+) derivations|(this) derivation) will be built", report)
+        builds = int(built.group(1)) if built and built.group(1) else (1 if built else 0)
+        return size, fetched, builds
+
+    def download_speed(self, paths):
+        """Bytes per second from this device, timed on a few megabytes of one part the update needs from the public
+        cache (which most of an update comes from). 0 when it can't be measured."""
+        for path in paths[:40]:
+            name = Path(path).name.split("-")[0]
+            try:
+                info = subprocess.run(["/usr/bin/curl", "-fsS", "--max-time", "10", "%s/%s.narinfo" % (PUBLIC_CACHE, name)],
+                                      capture_output=True, text=True, timeout=15).stdout
+            except (OSError, subprocess.SubprocessError):
+                return 0
+            fields = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
+            if int(fields.get("FileSize", "0") or 0) < 2_000_000 or "URL" not in fields:
+                continue
+            sample = min(int(fields["FileSize"]), 8_000_000) - 1
+            try:
+                timing = subprocess.run(["/usr/bin/curl", "-fsS", "--max-time", "20", "-r", "0-%d" % sample, "-o", "/dev/null",
+                                         "-w", "%{size_download} %{time_total}", "%s/%s" % (PUBLIC_CACHE, fields["URL"])],
+                                        capture_output=True, text=True, timeout=25).stdout.split()
+                received, seconds = int(timing[0]), float(timing[1])
+            except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+                return 0
+            return int(received / seconds) if received > 500_000 and seconds > 0 else 0
+        return 0
+
+    def measure(self, manifest):
+        """Download size and an estimate of how long the update takes on this device, for Settings and first-time
+        setup. Empty when it can't be worked out; the update itself doesn't depend on it."""
+        try:
+            source = self.unpack(manifest)
+            if self.use_ready_built(manifest):
+                self.restart_nix()
+            result = self.as_updater(["/usr/bin/nix", "build", "--dry-run", "--impure", "--expr", self.everything(source)],
+                                     check=False, timeout=900)
+        except (Stop, subprocess.SubprocessError, OSError, ValueError, KeyError):
+            return {}
+        if result.returncode != 0:
+            return {}
+        size, fetched, builds = self.download_size(result.stderr)
+        speed = self.download_speed(fetched) if size else 0
+        found = {"downloadBytes": size, "builds": builds}
+        if speed:
+            # Downloading, unpacking about twice as much, building what isn't ready-built, then switching over.
+            found["estimateSeconds"] = int(size / speed * 1.2 + size / 60_000_000 + builds * 30 + 90)
+        elif not size:
+            found["estimateSeconds"] = 60 + builds * 30
+        return found
+
     def build(self, source):
         """Everything is built before the device changes at all."""
         flake = "path:%s" % source
@@ -294,6 +365,11 @@ class Updater:
             state = self.status().get("state")
             return self.save(state="restart" if state == "restart" else "idle", available=None, lastChecked=int(time.time()),
                              checkError="")
+        known = self.status().get("available") or {}
+        if known.get("version") == offer["version"] and "downloadBytes" in known:
+            offer.update({key: known[key] for key in ("downloadBytes", "builds", "estimateSeconds") if key in known})
+        else:
+            offer.update(self.measure(manifest))
         self.notify(offer)
         return self.save(state="available", available=offer, lastChecked=int(time.time()), checkError="", message="")
 
@@ -301,7 +377,7 @@ class Updater:
         current = self.installed()
         current_source = self.versions / current if current else None
         try:
-            self.save(state="downloading", progress=5, message="Downloading…")
+            self.save(state="downloading", progress=5, message="Downloading…", started=int(time.time()))
             self.ready_to_install()
             self.fetch()
             manifest = self.latest()

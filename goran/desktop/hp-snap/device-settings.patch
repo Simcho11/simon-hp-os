@@ -92,7 +92,7 @@ new file mode 100644
 +        : Translation.tr("HP-OS is up to date")
 +    readonly property string detail: card.busy || card.state === "error" ? String(card.status.message ?? "")
 +        : card.state === "restart" ? Translation.tr("Version %1 is installed.").arg(card.status.installed ?? "")
-+        : card.offer ? Translation.tr("A software update is ready to install.")
++        : card.offer ? (Number(card.offer.downloadBytes ?? 0) > 0 ? Translation.tr("A %1 update is ready to install.").arg(Number(card.offer.downloadBytes) >= 1e9 ? (Number(card.offer.downloadBytes) / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(Number(card.offer.downloadBytes) / 1e6)) + " MB") : Translation.tr("A software update is ready to install."))
 +        : card.status.installed ? Translation.tr("Version %1").arg(card.status.installed) : Translation.tr("Software Update")
 +
 +    function open(): void {

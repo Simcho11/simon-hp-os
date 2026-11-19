@@ -46,10 +46,14 @@ if [[ -x "$control" ]]; then
     ln -sfn "$(dirname "$(dirname "$control")")" "$brightness_root"
 fi
 
-# Touchpad feedback.
-wanted='SUBSYSTEM=="hidraw", KERNELS=="0018:06CB:D019.*", TAG+="uaccess"'
-if [[ "$(cat "$touchpad" 2>/dev/null)" != "$wanted" ]]; then
-    printf '%s\n' "$wanted" > "$touchpad"
+# Touchpad feedback, for whichever haptic touchpad this laptop has (none on a laptop with a regular touchpad).
+wanted=""
+for ids in $(/usr/bin/python3 -I "$repo/goran/desktop/hp-snap/touchpad-haptics.py" ids 2>/dev/null); do
+    [[ "$ids" =~ ^[0-9A-F]{4}:[0-9A-F]{4}$ ]] || continue
+    wanted+="SUBSYSTEM==\"hidraw\", KERNELS==\"*:$ids.*\", TAG+=\"uaccess\""$'\n'
+done
+if [[ "$(cat "$touchpad" 2>/dev/null)"$'\n' != "$wanted" && -n "$wanted$(cat "$touchpad" 2>/dev/null)" ]]; then
+    if [[ -n "$wanted" ]]; then printf '%s' "$wanted" > "$touchpad"; else rm -f "$touchpad"; fi
     udevadm control --reload
     udevadm trigger --subsystem-match=hidraw
 fi
