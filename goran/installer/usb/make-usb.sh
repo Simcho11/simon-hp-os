@@ -158,7 +158,8 @@ grub-mkstandalone -O arm64-efi --modules="part_gpt fat ext2 search search_label 
     -o "$boot/EFI/BOOT/BOOTAA64.EFI" "boot/grub/grub.cfg=$work/grub.cfg"
 cp "/boot/vmlinuz-$kernel" "$boot/hpos/vmlinuz"
 cp "$installer/installer.cpio.zst" "$boot/hpos/installer.cpio.zst"
-(cd /usr && { printf 'lib\0lib/modules\0'; find "lib/modules/$kernel" -path '*/kernel/drivers/gpu/*' -prune -o -print0; } \
+(cd /usr && { printf 'lib\0lib/modules\0'; find "lib/modules/$kernel" \( -path '*/kernel/drivers/gpu/*' -o -path '*/kernel/sound/*' -o -path '*/kernel/drivers/media/*' \
+        -o -path '*/kernel/drivers/net/*' -o -path '*/kernel/net/*' -o -path '*/kernel/drivers/bluetooth/*' \) -prune -o -print0; } \
     | "$tools/cpio" --null --quiet -H newc -o | zstd -q -T0 -6) > "$boot/hpos/modules.cpio.zst"
 umount "$boot"
 sync

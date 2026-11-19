@@ -1,0 +1,139 @@
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -452,6 +452,8 @@
+     /// config overrides for the workspace where the move originated from. As soon as the window
+     /// moves over some different workspace though, this override will reset.
+     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
++    /// hp-snap patch: the desktop this window was the last one on, kept while the window is carried.
++    pub(self) kept_source: Option<WorkspaceId>,
+ }
+ 
+ #[derive(Debug)]
+@@ -1187,6 +1189,10 @@
+                             unreachable!()
+                         };
+ 
++                        if let Some(source) = move_.kept_source {
++                            self.stop_keeping_desktop(source);
++                        }
++
+                         for mon in self.monitors_mut() {
+                             mon.dnd_scroll_gesture_end();
+                         }
+@@ -4229,6 +4235,7 @@
+ 
+                 // Unset fullscreen before removing the tile. This will restore its size properly,
+                 // and move it to floating if needed, so we don't have to deal with that here.
++                let in_overview = self.overview_open;
+                 let ws = self
+                     .workspaces_mut()
+                     .find(|ws| ws.has_window(&window_id))
+@@ -4236,6 +4243,13 @@
+                 ws.set_fullscreen(window, false);
+                 ws.set_maximized(window, false);
+ 
++                // hp-snap patch: carrying a desktop's last window to another desktop must not delete the desktop
++                // it came from. Otherwise the new desktop takes the old one's place and nothing seems to happen.
++                let kept_source = (!in_overview && !ws.keep_empty && ws.windows().count() == 1).then(|| {
++                    ws.keep_empty = true;
++                    ws.id()
++                });
++
+                 let RemovedTile {
+                     mut tile,
+                     width,
+@@ -4285,6 +4299,7 @@
+                     pointer_ratio_within_window,
+                     output_config,
+                     workspace_config,
++                    kept_source,
+                 };
+ 
+                 if let Some((tile_pos, zoom)) = tile_pos {
+@@ -4407,6 +4422,7 @@
+         let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
+             unreachable!()
+         };
++        let kept_source = move_.kept_source;
+ 
+         for mon in self.monitors_mut() {
+             mon.dnd_scroll_gesture_end();
+@@ -4618,6 +4634,34 @@
+                 );
+             }
+         }
++
++        // hp-snap patch: the desktop stays only when the window really went to another desktop on the same screen.
++        if let Some(source) = kept_source {
++            let dropped = self
++                .workspaces_mut()
++                .find(|ws| ws.has_window(window))
++                .map(|ws| (ws.id(), ws.current_output().cloned()));
++            let carried_away = self.workspaces_mut().find(|ws| ws.id() == source).is_some_and(|ws| {
++                dropped.as_ref().is_some_and(|(id, output)| *id != source && ws.current_output() == output.as_ref())
++            });
++            if !carried_away {
++                self.stop_keeping_desktop(source);
++            }
++        }
++    }
++
++    /// hp-snap patch: lets an empty desktop go again once nothing was carried away from it.
++    fn stop_keeping_desktop(&mut self, source: WorkspaceId) {
++        if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == source) {
++            ws.keep_empty = false;
++        }
++        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
++            for mon in monitors {
++                if mon.workspace_switch.is_none() {
++                    mon.clean_up_workspaces();
++                }
++            }
++        }
+     }
+ 
+     pub fn interactive_move_is_moving_above_output(&self, output: &Output) -> bool {
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3994,6 +3994,41 @@
+     }
+ }
+ 
++fn carry_window(switch_desktop: bool) -> Layout<TestWindow> {
++    let update = Op::InteractiveMoveUpdate { window: 1, dx: 1000., dy: 0., output_idx: 1, px: 0., py: 0. };
++    let mut ops = vec![
++        Op::AddOutput(1),
++        Op::AddWindow { params: TestWindowParams::new(1) },
++        Op::InteractiveMoveBegin { window: 1, output_idx: 1, px: 0., py: 0. },
++        update.clone(),
++        update,
++    ];
++    if switch_desktop {
++        ops.extend([Op::FocusWorkspaceDown, Op::CompleteAnimations]);
++    }
++    ops.push(Op::InteractiveMoveEnd { window: 1 });
++    check_ops(ops)
++}
++
++#[test]
++fn carrying_the_last_window_away_keeps_its_desktop() {
++    let layout = carry_window(true);
++    let monitor = layout.monitors().next().unwrap();
++    assert_eq!(monitor.workspaces.len(), 3);
++    assert!(!monitor.workspaces[0].has_windows());
++    assert!(monitor.workspaces[1].has_window(&1));
++    assert_eq!(monitor.active_workspace_idx, 1);
++}
++
++#[test]
++fn dropping_the_last_window_back_keeps_one_desktop() {
++    let layout = carry_window(false);
++    let monitor = layout.monitors().next().unwrap();
++    assert_eq!(monitor.workspaces.len(), 2);
++    assert!(monitor.workspaces[0].has_window(&1));
++    assert!(!monitor.workspaces[0].keep_empty);
++}
++
+ #[test]
+ fn overview_add_reorder_and_remove_workspaces() {
+     let mut layout = check_ops([Op::AddOutput(1), Op::AddOutput(2)]);

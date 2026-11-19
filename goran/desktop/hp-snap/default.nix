@@ -14,7 +14,7 @@ let
     "desktop-swipe-smooth.patch" "desktop-rail-stacking.patch" "minimize-to-dock-icon.patch"
     "dock-keep-cursor.patch" "carry-scroll-desktops.patch" "unminimize-to-current-desktop.patch"
     "overview-workspaces.patch" "snap-overlay-keeps-windows-active.patch" "keyboard-carry.patch"
-    "advertise-minimize.patch"
+    "advertise-minimize.patch" "carry-keeps-desktop.patch"
   ];
 in {
   niri = baseNiri.overrideAttrs (old: {

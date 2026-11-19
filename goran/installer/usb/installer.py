@@ -23,6 +23,23 @@ TARGET = Path("/mnt/target")
 ROOT_UUID = "d2c1c5bd-9c17-4517-abe7-90221e401acb"   # What this system's boot files expect.
 ESP_ID = "B6AFFFE5"
 MINIMUM_DISK = 200 * 1000 ** 3
+KERNEL = "7.0.14-2020-n1x-hibernate"
+STARTUP_ENTRY = """menuentry 'HP-OS' --id hp-os {
+    insmod part_gpt
+    insmod ext2
+    insmod gzio
+    search --no-floppy --fs-uuid --set=root %(root)s
+    linux /boot/vmlinuz-%(kernel)s root=UUID=%(root)s ro console=tty0 'acpi_osi=!Windows 2022' quiet splash plymouth.ignore-serial-consoles plymouth.use-simpledrm=0 loglevel=3 vt.global_cursor_default=0
+    initrd /boot/goran-battery-acpi.cpio /boot/initrd.img-%(kernel)s
+}
+""" % {"root": ROOT_UUID, "kernel": KERNEL}
+STARTUP_SETTINGS = """GRUB_DEFAULT=0
+GRUB_TIMEOUT_STYLE=hidden
+GRUB_TIMEOUT=0
+GRUB_RECORDFAIL_TIMEOUT=0
+GRUB_DISABLE_OS_PROBER=true
+GRUB_DISABLE_SUBMENU=true
+"""
 LOG = open("/run/hp-os-install.log", "a", buffering=1)
 
 
@@ -143,10 +160,12 @@ class TextScreen:
 
 # ── The keyboard ──
 class Keys:
-    ENTER, KEYPAD_ENTER, ESCAPE = 28, 96, 1
+    ENTER, KEYPAD_ENTER, ESCAPE, POWER = 28, 96, 1, 116
 
-    def wait(self, wanted):
-        while True:
+    def wait(self, wanted, seconds=None):
+        """Returns the key pressed, or None once the time is up."""
+        ends = None if seconds is None else time.monotonic() + seconds
+        while ends is None or time.monotonic() < ends:
             devices = []
             for path in glob.glob("/dev/input/event*"):
                 try:
@@ -265,6 +284,7 @@ def install(screen, disk):
     run("fallocate", "-l", "8G", str(TARGET / "swap.img"))
     os.chmod(TARGET / "swap.img", 0o600)
     run("mkswap", str(TARGET / "swap.img"))
+    clean_startup()
     if os.path.isdir("/sys/firmware/efi/efivars"):
         listing = run("efibootmgr", check=False)
         for number, label in re.findall(r"^Boot([0-9A-Fa-f]{4})\*? (.+)$", listing, re.M):
@@ -276,6 +296,49 @@ def install(screen, disk):
     run("umount", str(TARGET / "boot/efi"))
     run("umount", str(TARGET))
     run("sync")
+
+
+def save_report():
+    """Leaves a hardware report on the stick, so a problem on a real laptop can be diagnosed afterwards."""
+    folder = Path("/mnt/report")
+    try:
+        found = run("blkid", "-L", "HPOS-BOOT", check=False).strip()
+        if not found.startswith("/dev/"):
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        run("mount", found, str(folder))
+        LOG.flush()
+        sections = [("installer", Path("/run/hp-os-install.log").read_text(errors="replace")),
+                    ("drivers", Path("/proc/modules").read_text()), ("disks", Path("/proc/partitions").read_text()),
+                    ("input", Path("/proc/bus/input/devices").read_text()), ("kernel", run("dmesg", check=False))]
+        Path(folder, "hp-os-report.txt").write_text("".join("=== %s ===\n%s\n" % section for section in sections))
+        run("umount", str(folder))
+        run("sync")
+    except Exception as error:
+        log("no report:", repr(error))
+
+
+def clean_startup():
+    """A new laptop goes straight into HP-OS, with no startup menu, now and after any later system update."""
+    for name in ("vmlinuz-" + KERNEL, "initrd.img-" + KERNEL, "goran-battery-acpi.cpio"):
+        if not (TARGET / "boot" / name).exists():
+            raise RuntimeError("startup file missing: " + name)
+    scripts, settings = TARGET / "etc/grub.d", TARGET / "etc/default/grub.d"
+    for leftover in (scripts / "46_n1x_simon", settings / "zzzz-n1x-installer.cfg"):
+        if leftover.exists():
+            leftover.unlink()
+    for script in scripts.iterdir():
+        if script.is_file() and script.name != "00_header":
+            script.chmod(0o644)
+    settings.mkdir(parents=True, exist_ok=True)
+    (settings / "zzzz-hp-os.cfg").write_text(STARTUP_SETTINGS)
+    (scripts / "10_hp_os").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + STARTUP_ENTRY)
+    (scripts / "10_hp_os").chmod(0o755)
+    menu = TARGET / "boot/grub/grub.cfg"
+    menu.write_text("set default=0\nset timeout=0\nset timeout_style=hidden\n" + STARTUP_ENTRY)
+    menu.chmod(0o600)
+    header = "# GRUB Environment Block\n"
+    (TARGET / "boot/grub/grubenv").write_text(header + "#" * (1024 - len(header)))
 
 
 def power(action):
@@ -312,7 +375,7 @@ def main():
         screen.frame("Install HP-OS", ["This erases everything on this laptop, including Windows,",
                                        "and replaces it with HP-OS. This can't be undone."],
                      button="Press Enter to erase and install", quiet="Press Esc to turn off without changing anything", danger=True)
-        if keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE}) == Keys.ESCAPE:
+        if keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE, Keys.POWER}) not in (Keys.ENTER, Keys.KEYPAD_ENTER):
             screen.frame("Turning off", ["Nothing on this laptop was changed."])
             time.sleep(2)
             turn_off()
@@ -324,14 +387,17 @@ def main():
         screen.frame("Restarting", [])
         restart()
     except Stop as reason:
-        screen.frame("HP-OS can't be installed", [str(reason)], button="Press Enter to turn off")
-        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE})
+        save_report()
+        screen.frame("HP-OS can't be installed", [str(reason)], button="Press Enter to turn off",
+                     quiet="This laptop turns itself off after one minute.")
+        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE, Keys.POWER}, 60)
         turn_off()
     except Exception as error:     # Whatever went wrong, the person gets a clear screen, not a dead one.
         log("failed:", repr(error))
+        save_report()
         screen.frame("Installation didn't finish", ["Something went wrong while installing.", "Restart from the USB stick to try again."],
-                     button="Press Enter to turn off", quiet=str(error)[:90])
-        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE})
+                     button="Press Enter to turn off", quiet="This laptop turns itself off after one minute.")
+        keys.wait({Keys.ENTER, Keys.KEYPAD_ENTER, Keys.ESCAPE, Keys.POWER}, 60)
         turn_off()
 
 

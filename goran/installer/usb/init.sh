@@ -21,10 +21,17 @@ mkdir -p /run/udev /etc/udev
 udevd --daemon --resolve-names=never
 udevadm trigger --action=add --type=subsystems
 udevadm trigger --action=add --type=devices
-for module in nvme usb_storage uas sd_mod hid_generic usbhid i2c_hid_acpi hid_multitouch evdev vfat ext4 nls_cp437 nls_ascii nls_iso8859_1; do
-    modprobe "$module" 2>/dev/null
+for module in xhci_plat_hcd i2c_mt65xx nvme usb_storage uas sd_mod hid_generic usbhid i2c_hid_acpi hid_multitouch evdev vfat ext4 nls_cp437 nls_ascii nls_iso8859_1; do
+    timeout 20 modprobe "$module" 2>/dev/null
 done
 udevadm settle --timeout=20
+
+# Load whatever else this laptop's hardware asks for. New devices appear as drivers load, so look a few times.
+for pass in 1 2 3; do
+    find /sys/devices -name modalias -type f -exec cat {} + 2>/dev/null | sort -u |
+        xargs -r -d '\n' -n 1 -P 8 timeout 20 modprobe -q -b 2>/dev/null
+    udevadm settle --timeout=10
+done
 
 python3 -I /installer/installer.py
 # The installer only ends by turning off or restarting. If it ever stops, restart cleanly.
