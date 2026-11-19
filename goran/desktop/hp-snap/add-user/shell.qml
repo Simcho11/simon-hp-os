@@ -251,6 +251,25 @@ ShellRoot {
         })
     }
     Timer { id: updateDone; interval: 1400; onTriggered: if (app.step === 7) app.skipWifi() }
+    // Preview: the same time zone list a new device shows, read by accounts.py from this computer's own zone files.
+    Process {
+        id: previewZones
+        property var done: null
+        function load(callback) { previewZones.done = callback; previewZones.running = true }
+        command: ["/usr/bin/python3", "-I", "-c",
+            "import importlib.util, json, sys\n" +
+            "spec = importlib.util.spec_from_file_location('accounts', sys.argv[1])\n" +
+            "accounts = importlib.util.module_from_spec(spec); spec.loader.exec_module(accounts)\n" +
+            "print(json.dumps({'ok': True, 'zones': accounts.time_zones(), 'current': accounts.current_zone()}))",
+            Quickshell.shellPath("accounts.py")]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                let answer = { ok: true, zones: [], current: "" }
+                try { answer = JSON.parse(this.text) } catch (e) {}
+                if (previewZones.done) previewZones.done(answer)
+            }
+        }
+    }
     // Preview: a pretend network list and update, for designing these screens.
     QtObject {
         id: mockWelcome
@@ -260,14 +279,7 @@ ShellRoot {
                 { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
                 { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Neighbour", signal: 30, secure: true } ] })
             else if (a === "wifi-join") mockLater.run(() => done({ ok: true, online: true }))
-            else if (a === "timezone-list") done({ ok: true, current: "Etc/UTC", zones: [
-                { zone: "Asia/Kolkata", country: "India", city: "Kolkata", region: "", offset: 330 },
-                { zone: "Europe/London", country: "Britain (UK)", city: "London", region: "", offset: 0 },
-                { zone: "America/New_York", country: "United States", city: "New York", region: "Eastern (most areas)", offset: -300 },
-                { zone: "America/Chicago", country: "United States", city: "Chicago", region: "Central (most areas)", offset: -360 },
-                { zone: "America/Denver", country: "United States", city: "Denver", region: "Mountain (most areas)", offset: -420 },
-                { zone: "America/Los_Angeles", country: "United States", city: "Los Angeles", region: "Pacific", offset: -480 },
-                { zone: "Asia/Kathmandu", country: "Nepal", city: "Kathmandu", region: "", offset: 345 } ] })
+            else if (a === "timezone-list") previewZones.load(done)
             else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
             else if (a === "update-status") { mockLater.progress = Math.min(100, mockLater.progress + 9)
                 done({ ok: true, status: { state: mockLater.progress >= 100 ? "restart" : "downloading", progress: mockLater.progress,
@@ -970,7 +982,7 @@ ShellRoot {
             Field {
                 id: zoneSearchField
                 anchors.horizontalCenter: parent.horizontalCenter
-                placeholder: "Search, like India or New York"
+                placeholder: "Search"
                 input.maximumLength: 48
                 input.onTextChanged: {
                     app.zoneSearch = zoneSearchField.text
@@ -985,7 +997,7 @@ ShellRoot {
                 id: zoneList
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: win.px(440)
-                height: win.px(3 * 50 + 2 * 6)
+                height: win.px(5 * 50 + 4 * 6)
                 spacing: win.px(6)
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
