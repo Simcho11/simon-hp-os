@@ -21,6 +21,8 @@ pkgs.runCommand "hp-os-add-user" { } ''
   cp ${./login-theme/LoginActivity.qml} "$app/LoginActivity.qml"
   cp ${./login-theme/LoginAvatar.qml} "$app/LoginAvatar.qml"
   cp ${./login-theme/LoginText.qml} "$app/LoginText.qml"
+  cp ${./login-theme/GlassShape.qml} "$app/GlassShape.qml"
+  cp ${./login-theme/LiquidLens.qsb} "$app/LiquidLens.qsb"
   ${pkgs.python3.withPackages (p: [ p.numpy p.pillow ])}/bin/python3 ${./add-user/pictures.py} "$app/pictures"
   cat > "$out/bin/hp-os-add-user" <<EOF
   #!/bin/sh

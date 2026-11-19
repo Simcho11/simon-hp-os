@@ -16,12 +16,17 @@ Item {
     property real sheenDepth: 0.44
     property real sheenStrength: 1
 
+    // Or given directly: the picture to bend, and the item whose coordinates it is drawn in.
+    property Item backdropItem: null
+    property Item hostItem: null
+
     readonly property Item host: {
+        if (glass.hostItem) return glass.hostItem
         for (let p = glass.parent; p; p = p.parent)
             if (p.glassBackdrop !== undefined) return p
         return null
     }
-    readonly property Item texture: glass.host ? glass.host.glassBackdrop : null
+    readonly property Item texture: glass.backdropItem ? glass.backdropItem : glass.host ? glass.host.glassBackdrop : null
     property real boost: glass.pressed ? 1 : glass.lit ? 0.6 : 0
     Behavior on boost { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
     // Where it is on the screen, followed through every parent's movement.

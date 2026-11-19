@@ -39,6 +39,8 @@ FIRST_BOOT = "/var/lib/hp-os/first-boot.qml"
 NMCLI = "/usr/bin/nmcli"
 CONNECTIONS = "/etc/NetworkManager/system-connections"
 UPDATE_STATE = "/var/lib/hp-os/update"
+# Left for the welcome by the restart that finishes an update, so it carries on at the name step.
+UPDATED_MARK = "/var/lib/hp-os/welcome-updated.qml"
 ADMIN_GROUPS = ("sudo", "admin", "wheel")
 
 
@@ -297,6 +299,11 @@ def welcome_step(request):
     if action == "update-status":
         return update_status()
     if action == "restart":
+        if (update_status()["status"].get("state") or "") == "restart":
+            descriptor = os.open(UPDATED_MARK, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write("import QtQuick\nItem {}\n")
+            os.chmod(UPDATED_MARK, 0o644)
         threading.Timer(1.5, lambda: run("/usr/bin/systemctl", "reboot", timeout=30)).start()
         return {"ok": True}
     raise Refused("That request isn’t available.")
@@ -316,6 +323,8 @@ def main(first_boot=False):
         create(*request, administrator=first_boot)
         if first_boot:
             os.unlink(FIRST_BOOT)   # Set up: this screen never comes back.
+            if os.path.exists(UPDATED_MARK):
+                os.unlink(UPDATED_MARK)
         say({"progress": 1})
         return {"ok": True, "prepared": prepare(request[1])}
     except Refused as reason:

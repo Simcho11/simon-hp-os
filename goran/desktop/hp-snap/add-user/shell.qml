@@ -24,6 +24,14 @@ ShellRoot {
     // ── The answers ──
     // 5 hello, 6 Wi-Fi, 7 software update (new device only), then 0 name, 1 picture, 2 password, 3 approve, 4 done
     property int step: firstBoot ? 5 : 0
+    // Set by the first-setup service just before the restart that finishes an update: Wi-Fi and the update are done,
+    // so the welcome carries on at "What's your name?" instead of starting over.
+    Loader { id: updatedMark; source: app.firstBoot ? "file:///var/lib/hp-os/welcome-updated.qml" : "" }
+    readonly property bool justUpdated: updatedMark.status === Loader.Ready
+    onJustUpdatedChanged: if (app.justUpdated && app.step === 5) { app.online = true; app.step = 0; Qt.callLater(() => nameField.input.forceActiveFocus()) }
+    // Everything fades in when the window opens.
+    property real appear: 0
+    NumberAnimation on appear { from: 0; to: 1; duration: 1100; easing.type: Easing.OutCubic }
     property string fullName: ""
     readonly property var faces: ["daybreak", "tide", "bloom", "dune", "aurora"]
     property string face: ""                   // empty: their initial
@@ -412,11 +420,23 @@ ShellRoot {
             anchors.fill: parent
             enabled: current
             visible: opacity > 0
-            opacity: current ? 1 : 0
+            opacity: (current ? 1 : 0) * app.appear
+            scale: 0.97 + 0.03 * app.appear
             Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
             transform: Translate {
                 x: page.current ? 0 : (app.step > page.index ? -win.px(70) : win.px(70))
                 Behavior on x { NumberAnimation { duration: 480; easing.type: Easing.BezierSpline; easing.bezierCurve: app.expressive } }
+            }
+            GlassShape {
+                readonly property real pad: win.px(46)
+                width: Math.max(win.px(660), holder.width + 2 * pad)
+                height: holder.height + 2 * pad
+                x: Math.round((parent.width - width) / 2)
+                y: holder.y - pad
+                radius: win.px(44)
+                d: win.d
+                backdropItem: backdropTexture
+                hostItem: win.contentItem
             }
             Column {
                 id: holder
@@ -447,39 +467,42 @@ ShellRoot {
 
         // ── The picture, out of focus, like the login screen behind this ──
         // Larger than the screen, so the blur's soft outer edge stays out of sight.
-        Image {
-            id: backdrop
-            anchors { fill: parent; margins: -win.px(140) }
-            source: app.picture
-            asynchronous: true
-            fillMode: Image.PreserveAspectCrop
-            sourceSize: Qt.size(backdrop.width, backdrop.height)
-            visible: false
-        }
-        MultiEffect {
-            anchors.fill: backdrop
-            source: backdrop
-            blurEnabled: true; blur: 1; blurMax: 64
-            saturation: 0.15
-        }
-        Rectangle { anchors.fill: parent; color: "#8a071a3f" }
-
-        Row {
-            x: win.px(36); y: win.px(30)
-            spacing: win.px(12)
+        Rectangle { anchors.fill: parent; color: "black" }
+        Item {
+            id: backdropLayer
+            anchors.fill: parent
+            opacity: app.appear
             Image {
-                source: app.themeDir + "hp-logo.png"
-                width: win.px(30); height: width
-                sourceSize: Qt.size(width * 2, height * 2)
-                anchors.verticalCenter: parent.verticalCenter
+                id: backdrop
+                anchors { fill: parent; margins: -win.px(140) }
+                source: app.picture
+                asynchronous: true
+                fillMode: Image.PreserveAspectCrop
+                sourceSize: Qt.size(backdrop.width, backdrop.height)
+                visible: false
             }
-            Label { text: "HP-OS"; font.pixelSize: win.px(20); font.weight: Font.Medium; font.letterSpacing: win.px(1.5); anchors.verticalCenter: parent.verticalCenter }
+            MultiEffect {
+                anchors.fill: backdrop
+                source: backdrop
+                blurEnabled: true; blur: 1; blurMax: 64
+                saturation: 0.12
+            }
+            // A plain dim, like the login screen at night: no colour of its own.
+            Rectangle { anchors.fill: parent; color: Qt.rgba(0, 0, 0, 0.30) }
+        }
+        ShaderEffectSource {
+            id: backdropTexture
+            anchors.fill: parent
+            sourceItem: backdropLayer
+            live: true
+            visible: false
         }
 
         // ── Who this is becoming: stays on screen through every step ──
         LoginAvatar {
             id: avatar
             visible: app.step !== 5 && app.step !== 6 && app.step !== 7
+            opacity: app.appear
             anchors.horizontalCenter: parent.horizontalCenter
             y: Math.round(parent.height * 0.17)
             width: win.px(app.step === 4 ? 132 : 112); height: width
