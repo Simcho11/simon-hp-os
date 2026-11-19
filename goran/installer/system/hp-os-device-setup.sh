@@ -187,6 +187,9 @@ systemctl daemon-reload
 systemctl enable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-update.socket hp-os-update-check.timer >/dev/null
 systemctl enable hp-os-factory-wipe.service hp-os-update-settle.service >/dev/null
 
+# Laptops made with the USB installer show the HP logo early in startup.
+"$here/hp-os-boot-splash.sh"
+
 # The login screen must survive a reset that removes every home folder.
 niri=$(readlink -f /opt/hp-os/niri-patch/result-hpos)
 [[ "$niri" != /nix/store/* ]] || ln -sfn "$niri" /nix/var/nix/gcroots/hp-os-greeter-niri

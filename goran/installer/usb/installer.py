@@ -29,7 +29,7 @@ STARTUP_ENTRY = """menuentry 'HP-OS' --id hp-os {
     insmod ext2
     insmod gzio
     search --no-floppy --fs-uuid --set=root %(root)s
-    linux /boot/vmlinuz-%(kernel)s root=UUID=%(root)s ro console=tty0 'acpi_osi=!Windows 2022' quiet splash plymouth.ignore-serial-consoles plymouth.use-simpledrm=0 loglevel=3 vt.global_cursor_default=0
+    linux /boot/vmlinuz-%(kernel)s root=UUID=%(root)s ro console=tty0 'acpi_osi=!Windows 2022' quiet splash plymouth.ignore-serial-consoles plymouth.use-simpledrm=1 loglevel=3 vt.global_cursor_default=0
     initrd /boot/goran-battery-acpi.cpio /boot/initrd.img-%(kernel)s
 }
 """ % {"root": ROOT_UUID, "kernel": KERNEL}
