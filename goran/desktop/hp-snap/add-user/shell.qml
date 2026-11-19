@@ -284,18 +284,65 @@ ShellRoot {
     }
     Process {
         id: signInBrowser
-        // A throwaway profile in memory, gone when the window closes.
-        environment: ({ "HOME": app.signInFolder })
-        command: [Quickshell.env("HP_OS_CHROME") || "google-chrome-stable", "--app=" + app.signInPage,
+        // A throwaway profile in memory, gone when the window closes. What Chrome says goes to a log beside it, kept
+        // until the next restart, in case the page doesn't appear.
+        environment: ({ "HOME": app.signInFolder, "XDG_CONFIG_HOME": app.signInFolder + "/config" })
+        command: ["/bin/sh", "-c", 'folder=$1; shift; mkdir -p "$folder" && cd "$folder" || exit 1; exec "$@" > "$folder.log" 2>&1',
+            "sh", app.signInFolder, Quickshell.env("HP_OS_CHROME") || "google-chrome-stable", "--app=" + app.signInPage,
             "--user-data-dir=" + app.signInFolder, "--no-first-run", "--no-default-browser-check", "--disable-sync",
-            "--disable-extensions", "--disable-background-networking", "--password-store=basic", "--ozone-platform=wayland",
-            "--disable-gpu", "--class=hp-os-wifi-sign-in"]
-        onRunningChanged: app.signInOpen = signInBrowser.running
-        onExited: Quickshell.execDetached(["/bin/rm", "-rf", "--", app.signInFolder])
+            "--disable-extensions", "--disable-background-networking", "--disable-component-update", "--password-store=basic",
+            "--ozone-platform=wayland", "--disable-gpu", "--new-window", "--start-maximized"]
+        onRunningChanged: {
+            app.signInOpen = signInBrowser.running
+            if (!signInBrowser.running) signInFront.stop()
+        }
+        onExited: code => {
+            Quickshell.execDetached(["/bin/rm", "-rf", "--", app.signInFolder])
+            // Gone before its page ever showed: say so, instead of looking like it's open.
+            if (!app.signInShown && app.step === 13) app.signInNotice = "The sign-in page couldn’t open. Try again, or choose another network."
+        }
     }
+    property bool signInShown: false
+    property string signInNotice: ""
+    property int signInTries: 0
     function openSignIn() {
+        app.signInNotice = ""
         if (app.preview) { app.signInOpen = true; mockSignIn.start(); return }
-        if (!signInBrowser.running) signInBrowser.running = true
+        if (signInBrowser.running) { app.signInTries = 0; signInFront.restart(); return }
+        app.signInShown = false
+        app.signInTries = 0
+        signInBrowser.running = true
+        signInFront.restart()
+    }
+    // The page's window is found in the login screen's compositor and brought to the front: it could open behind setup.
+    // No window after fifteen seconds means it didn't open; Chrome is stopped so the person can try again.
+    Timer {
+        id: signInFront; interval: 1000; repeat: true
+        onTriggered: {
+            app.signInTries++
+            if (app.signInTries > 15) {
+                stop()
+                if (!app.signInShown) {
+                    signInBrowser.running = false
+                    app.signInNotice = "The sign-in page didn’t appear. Try again, or choose another network."
+                }
+                return
+            }
+            if (!signInFocus.running) signInFocus.running = true
+        }
+    }
+    Process {
+        id: signInFocus
+        command: ["/bin/sh", "-c", 'niri=/opt/hp-os/niri-patch/result-hpos/bin/niri
+            socket=${NIRI_SOCKET:-$(ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/niri.*.sock 2>/dev/null | head -n 1)}
+            [ -x "$niri" ] && [ -S "$socket" ] || exit 2
+            id=$(NIRI_SOCKET="$socket" "$niri" msg --json windows | /usr/bin/python3 -I -c \'import json, sys; found = [w["id"] for w in json.load(sys.stdin) if str(w.get("app_id") or "").startswith("chrome-")]; print(found[-1] if found else "")\')
+            [ -n "$id" ] || exit 1
+            NIRI_SOCKET="$socket" "$niri" msg action focus-window --id "$id"']
+        onExited: code => {
+            if (code === 0) { app.signInShown = true; signInFront.stop() }
+            else if (code === 2) { app.signInShown = true; signInFront.stop() }    // No way to look: trust it opened.
+        }
     }
     Timer { id: mockSignIn; interval: 5000; onTriggered: { app.mockSignedIn = true; app.signInOpen = false } }
     Timer {
@@ -1159,14 +1206,16 @@ ShellRoot {
             Gap { size: 18 }
             Primary {
                 anchors.horizontalCenter: parent.horizontalCenter
-                label: app.netState === "portal" ? (app.signInOpen ? "Sign-in page is open" : "Open sign-in page")
+                label: app.netState === "portal" ? (app.signInOpen ? (app.signInShown ? "Show sign-in page" : "Opening…") : "Open sign-in page")
                     : app.checkingNet ? "Checking…" : "Try again"
-                ready: app.netState === "portal" ? !app.signInOpen : !app.checkingNet
+                ready: app.netState === "portal" ? (!app.signInOpen || app.signInShown) : !app.checkingNet
                 onActivated: app.netState === "portal" ? app.openSignIn() : app.checkInternet()
             }
             Note {
-                color: Qt.rgba(1, 1, 1, 0.8)
-                text: app.netState !== "portal" ? "Checking again every few seconds."
+                color: app.signInNotice.length > 0 ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8)
+                text: app.signInNotice.length > 0 ? app.signInNotice
+                    : app.netState !== "portal" ? "Checking again every few seconds."
+                    : app.signInOpen && !app.signInShown ? "Opening the sign-in page…"
                     : app.signInOpen ? "It closes by itself once you’re online. Press Ctrl+W to come back."
                     : "Once you’re signed in, setup carries on by itself."
             }
