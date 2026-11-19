@@ -200,7 +200,8 @@ def gateway_answers(url, password):
     import urllib.request
 
     def status(token):
-        request = urllib.request.Request(url.rstrip("/") + "/nix-cache-info", method="HEAD")
+        # Cloudflare turns away Python's default client name; Nix downloads with curl's.
+        request = urllib.request.Request(url.rstrip("/") + "/nix-cache-info", method="HEAD", headers={"User-Agent": "curl/8"})
         if token:
             request.add_header("Authorization", "Basic " + base64.b64encode(("hp-os:" + token).encode()).decode())
         try:
