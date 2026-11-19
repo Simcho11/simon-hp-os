@@ -14,6 +14,7 @@ Software Update steps, and the time zone step after the password: {"action": "wi
 """
 import ctypes
 import fcntl
+import glob
 import grp
 import json
 import os
@@ -196,20 +197,20 @@ def online():
     return state == "full"
 
 
-# A network that wants a web sign-in first (hotels, cafés, airports) answers this plain-HTTP address with its own page
-# or a redirect instead of the empty 204.
-PROBE = "http://connectivity-check.ubuntu.com/"
+# Whether the internet really works through this network. A hotel, café or airport network connects but answers
+# everything with its own sign-in page until you sign in, and some networks reach nothing at all.
+PROBE = "http://connectivity-check.ubuntu.com/"           # Answers 204 and nothing else; a sign-in page can't fake that.
+SECURE_PROBE = "https://cache.nixos.org/nix-cache-info"     # Where updates come from: TLS can't be faked by a sign-in page.
 
 
 def connectivity():
-    """("full" | "portal" | "limited" | "none" | "unknown", the page to open for a sign-in). NetworkManager's own check
-    first, asked to look again now; a direct look at PROBE when it can't tell (a device without its check set up)."""
+    """("full" | "portal" | "limited" | "none", the page to open for a sign-in). "full" only when the internet is really
+    reached: Ubuntu's check address answers its empty 204, or the update server answers over HTTPS. A network that
+    answers plain HTTP with something else, or that NetworkManager calls a portal, wants a sign-in."""
     try:
         state = run(NMCLI, "networking", "connectivity", "check", timeout=25).stdout.strip()
     except subprocess.SubprocessError:
         state = "unknown"
-    if state in ("full", "portal") and state:
-        return state, PROBE
     try:
         answer = run("/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", "--max-time", "8",
                      PROBE, timeout=15).stdout.split()
@@ -218,10 +219,16 @@ def connectivity():
     code = answer[0] if answer else "000"
     if code == "204":
         return "full", PROBE
-    if code[:1] in ("2", "3"):
+    try:
+        secure = run("/usr/bin/curl", "-sf", "-o", "/dev/null", "--max-time", "8", SECURE_PROBE, timeout=15).returncode == 0
+    except subprocess.SubprocessError:
+        secure = False
+    if secure:
+        return "full", PROBE     # Ubuntu's address is blocked here, but the internet works.
+    if state == "portal" or code[:1] in ("2", "3"):
         page = answer[1] if len(answer) > 1 and re.fullmatch(r"https?://[^\s]{1,2000}", answer[1]) else PROBE
         return "portal", page
-    return state or "none", PROBE
+    return ("limited" if state == "limited" else "none"), PROBE
 
 
 def split_fields(line):
@@ -241,6 +248,23 @@ def split_fields(line):
     return fields + [current]
 
 
+def security_kind(security):
+    """What a network asks for, from nmcli's SECURITY column: open, owe (Enhanced Open: encrypted, no password), wep,
+    psk (WPA/WPA2 password, or WPA2/WPA3 mixed), sae (WPA3 only) or eap (username and password: work, school, eduroam)."""
+    words = security.replace("--", "").split()
+    if "802.1X" in words:
+        return "eap"
+    if not words:
+        return "open"
+    if words[0].startswith("OWE"):
+        return "owe"
+    if "WEP" in words:
+        return "wep"
+    if words == ["WPA3"]:
+        return "sae"
+    return "psk"
+
+
 def wifi_list():
     listed = run(NMCLI, "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes", timeout=40)
     best = {}
@@ -248,47 +272,84 @@ def wifi_list():
         fields = split_fields(line)
         if len(fields) < 4 or not fields[1].strip():
             continue
-        name, security = fields[1], fields[3].strip()
+        name, kind = fields[1], security_kind(fields[3].strip())
         network = {"ssid": name, "signal": int(fields[2]) if fields[2].isdigit() else 0, "connected": fields[0] == "*",
-                   "secure": security not in ("", "--"), "wep": "WEP" in security, "sae": security == "WPA3"}
+                   "kind": kind, "secure": kind not in ("open", "owe"), "sae": kind == "sae", "wep": kind == "wep",
+                   "enterprise": kind == "eap"}
         if name not in best or network["signal"] > best[name]["signal"]:
             best[name] = network
     networks = sorted(best.values(), key=lambda network: (not network["connected"], -network["signal"]))[:30]
     state, page = connectivity() if any(network["connected"] for network in networks) else ("none", PROBE)
-    return {"ok": True, "online": state == "full" or online(), "connectivity": state, "signIn": page, "networks": networks}
+    return {"ok": True, "online": state == "full", "connectivity": state, "signIn": page, "networks": networks}
 
 
 def keyfile_value(text):
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
 
 
+def clean_text(value, longest):
+    return isinstance(value, str) and 0 < len(value) <= longest and not re.search(r"[\x00-\x1f\x7f]", value)
+
+
 def wifi_join(request):
+    """Joins a network with what it asks for. Kinds: see security_kind; a hidden network ("hidden": true) is joined by
+    its name, open or with a WPA password. The password goes straight into NetworkManager's private folder."""
     import uuid
-    ssid, password = request.get("ssid"), request.get("password", "")
+    ssid, password, user = request.get("ssid"), request.get("password", ""), request.get("user", "")
     if not isinstance(ssid, str) or not 0 < len(ssid.encode()) <= 32 or re.search(r"[\x00-\x1f\x7f]", ssid):
-        raise Refused("Choose a network from the list.")
-    secure = bool(request.get("secure"))
-    if secure and (not isinstance(password, str) or not re.fullmatch(r"[\x20-\x7e]{8,63}|[0-9A-Fa-f]{64}", password)):
+        raise Refused("Type the network’s name.") if request.get("hidden") else Refused("Choose a network from the list.")
+    kind = request.get("kind")
+    if kind not in ("open", "owe", "wep", "psk", "sae", "eap"):     # From before kinds: secure and sae only.
+        kind = ("sae" if request.get("sae") else "psk") if request.get("secure") else "open"
+    if request.get("hidden"):
+        kind = "psk" if password else "open"
+    if kind in ("psk", "sae") and not (isinstance(password, str) and re.fullmatch(r"[\x20-\x7e]{8,63}|[0-9A-Fa-f]{64}", password)):
         raise Refused("A Wi-Fi password has 8 to 63 characters.")
+    if kind == "wep" and not (isinstance(password, str) and re.fullmatch(r"[\x20-\x7e]{5}|[\x20-\x7e]{13}|[0-9A-Fa-f]{10}|[0-9A-Fa-f]{26}", password)):
+        raise Refused("This older network’s key has 5 or 13 characters, or 10 or 26 digits and letters A to F.")
+    if kind == "eap" and not (clean_text(user, 128) and clean_text(password, 256)):
+        raise Refused("Enter your username and password for this network.")
     identifier = str(uuid.uuid4())
     lines = ["[connection]", "id=" + keyfile_value(ssid), "uuid=" + identifier, "type=wifi", "autoconnect=true", "",
-             "[wifi]", "mode=infrastructure", "ssid=" + ";".join(str(byte) for byte in ssid.encode()) + ";", ""]
-    if secure:
-        lines += ["[wifi-security]", "key-mgmt=" + ("sae" if request.get("sae") else "wpa-psk"),
-                  "psk=" + keyfile_value(password), ""]
+             "[wifi]", "mode=infrastructure", "ssid=" + ";".join(str(byte) for byte in ssid.encode()) + ";"]
+    lines += ["hidden=true", ""] if request.get("hidden") else [""]
+    if kind in ("psk", "sae"):
+        lines += ["[wifi-security]", "key-mgmt=" + ("sae" if kind == "sae" else "wpa-psk"), "psk=" + keyfile_value(password), ""]
+    elif kind == "owe":
+        lines += ["[wifi-security]", "key-mgmt=owe", ""]
+    elif kind == "wep":
+        lines += ["[wifi-security]", "key-mgmt=none", "wep-key-type=1", "wep-key0=" + keyfile_value(password), ""]
+    elif kind == "eap":
+        # Work, school and eduroam networks: PEAP or TTLS with the person's username and password (MSCHAPv2), the
+        # way phones and Windows join them.
+        lines += ["[wifi-security]", "key-mgmt=wpa-eap", "", "[802-1x]", "eap=peap;ttls;", "identity=" + keyfile_value(user),
+                  "password=" + keyfile_value(password), "phase2-auth=mschapv2", ""]
     lines += ["[ipv4]", "method=auto", "", "[ipv6]", "method=auto", ""]
+    # One saved network per name: an earlier try at the same network goes first.
+    for old in glob.glob(os.path.join(CONNECTIONS, "hp-os-wifi-*.nmconnection")):
+        try:
+            with open(old, encoding="utf-8") as stream:
+                if "id=" + keyfile_value(ssid) in stream.read().splitlines():
+                    os.unlink(old)
+        except OSError:
+            pass
     path = os.path.join(CONNECTIONS, "hp-os-wifi-%s.nmconnection" % identifier)
-    # The password goes straight into NetworkManager's private folder, never onto a command line.
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as stream:
         stream.write("\n".join(lines))
     run(NMCLI, "connection", "reload", timeout=20)
-    joined = run(NMCLI, "--wait", "40", "connection", "up", "uuid", identifier, timeout=60)
+    joined = run(NMCLI, "--wait", "45", "connection", "up", "uuid", identifier, timeout=70)
     if joined.returncode != 0:
         run(NMCLI, "connection", "delete", "uuid", identifier, timeout=20)
         if os.path.exists(path):
             os.unlink(path)
             run(NMCLI, "connection", "reload", timeout=20)
+        if kind == "eap":
+            raise Refused("Couldn’t join %s. Check your username and password and try again." % ssid)
+        if request.get("hidden"):
+            raise Refused("Couldn’t join %s. Check its name and password, and that it’s nearby." % ssid)
+        if kind in ("open", "owe"):
+            raise Refused("Couldn’t join %s. Move closer to it, or choose another network." % ssid)
         raise Refused("Couldn’t join %s. Check the password and try again." % ssid)
     state, page = connectivity()
     return {"ok": True, "online": state == "full", "connectivity": state, "signIn": page}

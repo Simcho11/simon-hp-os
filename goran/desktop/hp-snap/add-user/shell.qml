@@ -194,22 +194,47 @@ ShellRoot {
             app.scanning = false
             app.networks = answer.networks || []
             app.online = answer.online === true
-            // Already on a network that wants a web sign-in first.
-            if (answer.connectivity === "portal" && app.step === 6 && !app.chosenNetwork) { app.needSignIn(answer.signIn); return }
+            if (app.step !== 6 || app.chosenNetwork) return
             // Already online (a cable, or a network joined before): straight on to updates.
-            if (app.online && app.step === 6 && !app.chosenNetwork) app.startUpdate()
+            if (app.online) { app.startUpdate(); return }
+            // Already on a network that doesn't reach the internet yet, or wants a web sign-in first.
+            if (app.networks.some(network => network.connected)) app.needInternet(answer.signIn, answer.connectivity)
         })
     }
-    function joinWifi(password) {
-        if (!app.chosenNetwork || app.joining) return
+    // What a network asks for: open and owe (Enhanced Open) nothing; psk, sae and wep a password; eap a username and
+    // password (work, school, eduroam); a hidden one its name, and a password if it has one.
+    function needsNothing(network) { return !!network && !network.hidden && (network.kind === "open" || network.kind === "owe" || (!network.kind && !network.secure)) }
+    readonly property bool wifiReady: {
+        const network = app.chosenNetwork
+        if (!network || app.joining) return false
+        const password = wifiPassword.text
+        if (network.hidden) return wifiName.text.trim().length > 0 && (password.length === 0 || password.length >= 8)
+        if (network.kind === "eap") return wifiUser.text.trim().length > 0 && password.length > 0
+        if (network.kind === "wep") return password.length >= 5
+        return password.length >= 8
+    }
+    function chooseNetwork(network) {
+        app.wifiNotice = ""
+        wifiPassword.text = ""; wifiUser.text = ""; wifiName.text = ""
+        app.chosenNetwork = network
+        if (app.needsNothing(network)) { app.joinWifi(); return }
+        Qt.callLater(() => (network.hidden ? wifiName : network.kind === "eap" ? wifiUser : wifiPassword).input.forceActiveFocus())
+    }
+    function joinWifi() {
+        const network = app.chosenNetwork
+        if (!network || app.joining || (!app.needsNothing(network) && !app.wifiReady)) return
         app.joining = true
         app.wifiNotice = ""
-        app.ask({ action: "wifi-join", ssid: app.chosenNetwork.ssid, secure: app.chosenNetwork.secure,
-                  sae: app.chosenNetwork.sae, password: password }, answer => {
+        app.ask({ action: "wifi-join", ssid: network.hidden ? wifiName.text.trim() : network.ssid, kind: network.kind || "",
+                  secure: network.secure, sae: network.sae, hidden: !!network.hidden,
+                  user: network.kind === "eap" ? wifiUser.text.trim() : "", password: wifiPassword.text }, answer => {
             app.joining = false
-            if (answer.ok && answer.connectivity === "portal") app.needSignIn(answer.signIn)
-            else if (answer.ok) { app.online = true; app.startUpdate() }
-            else app.wifiNotice = answer.error || "Couldn’t join that network."
+            if (!answer.ok) { app.wifiNotice = answer.error || "Couldn’t join that network."; return }
+            if (network.hidden) app.chosenNetwork = { ssid: wifiName.text.trim(), kind: wifiPassword.text ? "psk" : "open", secure: !!wifiPassword.text }
+            wifiPassword.text = ""
+            // On only once the internet really works; until then, sign in or wait.
+            if (answer.connectivity === "full") { app.online = true; app.startUpdate() }
+            else app.needInternet(answer.signIn, answer.connectivity)
         })
     }
     function skipWifi() { app.step = 0; nameField.input.forceActiveFocus() }
@@ -219,14 +244,34 @@ ShellRoot {
     property string signInPage: ""
     property string signInNetwork: ""
     property bool signInOpen: false
+    property string netState: "portal"          // portal: wants a web sign-in; otherwise connected but no internet yet
+    property bool checkingNet: false
     property bool mockSignedIn: false
     readonly property string signInFolder: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/hp-os-wifi-sign-in"
-    function needSignIn(page) {
+    function needInternet(page, state) {
         app.signInPage = page || "http://connectivity-check.ubuntu.com/"
+        app.netState = state === "portal" ? "portal" : "offline"
         const current = app.chosenNetwork || app.networks.find(network => network.connected) || null
         app.signInNetwork = current ? current.ssid : ""
         app.step = 13
         signInWatch.start()
+    }
+    function checkInternet() {
+        if (app.checkingNet) return
+        app.checkingNet = true
+        app.ask({ action: "wifi-connectivity" }, answer => { app.checkingNet = false; app.internetAnswer(answer) })
+    }
+    function internetAnswer(answer) {
+        if (app.step !== 13) return
+        if (answer.connectivity === "full") {
+            signInWatch.stop()
+            if (signInBrowser.running) signInBrowser.running = false
+            app.online = true
+            app.startUpdate()
+            return
+        }
+        if (answer.connectivity === "portal") { app.netState = "portal"; if (answer.signIn) app.signInPage = answer.signIn }
+        else if (!app.signInOpen) app.netState = "offline"
     }
     Process {
         id: signInBrowser
@@ -246,13 +291,7 @@ ShellRoot {
     Timer { id: mockSignIn; interval: 5000; onTriggered: { app.mockSignedIn = true; app.signInOpen = false } }
     Timer {
         id: signInWatch; interval: 3000; repeat: true
-        onTriggered: app.ask({ action: "wifi-connectivity" }, answer => {
-            if (answer.connectivity !== "full" || app.step !== 13) return
-            signInWatch.stop()
-            if (signInBrowser.running) signInBrowser.running = false
-            app.online = true
-            app.startUpdate()
-        })
+        onTriggered: app.checkInternet()
     }
     function leaveSignIn(otherNetwork) {
         signInWatch.stop()
@@ -329,10 +368,14 @@ ShellRoot {
             const a = message.action
             if (a === "wifi-list") done({ ok: true, online: false, networks: [
                 { ssid: "Simon’s Wi-Fi", signal: 92, secure: true }, { ssid: "HP Guest", signal: 71, secure: false },
-                { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Café Wi-Fi", signal: 44, secure: false } ] })
+                { ssid: "Studio 5G", signal: 58, secure: true }, { ssid: "Café Wi-Fi", signal: 44, secure: false, kind: "open" },
+                { ssid: "HP Corporate", signal: 66, secure: true, kind: "eap", enterprise: true } ] })
             else if (a === "wifi-join") mockLater.run(() => done(message.ssid === "Café Wi-Fi"
-                ? { ok: true, online: false, connectivity: "portal", signIn: "http://connectivity-check.ubuntu.com/" } : { ok: true, online: true }))
-            else if (a === "wifi-connectivity") done({ ok: true, connectivity: app.mockSignedIn ? "full" : "portal" })
+                ? { ok: true, online: false, connectivity: "portal", signIn: "http://connectivity-check.ubuntu.com/" }
+                : message.ssid === "Studio 5G" ? { ok: true, online: false, connectivity: "none" }
+                : message.kind === "eap" && message.password !== "secret" ? { ok: false, error: "Couldn’t join HP Corporate. Check your username and password and try again." }
+                : { ok: true, online: true, connectivity: "full" }))
+            else if (a === "wifi-connectivity") done({ ok: true, connectivity: app.mockSignedIn ? "full" : app.netState === "portal" ? "portal" : "none" })
             else if (a === "timezone-list") previewZones.load(done)
             else if (a === "recovery-key") done({ ok: true, key: mockRecovery.key })
             else if (a === "update-check") mockLater.run(() => done({ ok: true, status: { available: { version: "2026.11.19.1", downloadBytes: 742000000, estimateSeconds: 420 } } }))
@@ -655,7 +698,9 @@ ShellRoot {
             if (app.step === 7) app.startUpdate()
             if (app.step === 8) app.chooseTimeZone("previewpassword")
             if (app.step === 9) { app.step = 2; app.showRecoveryKey("previewpassword") }
-            if (app.step === 13) { app.chosenNetwork = { ssid: "Café Wi-Fi", secure: false }; app.needSignIn("") }
+            if (app.step === 13) { app.chosenNetwork = { ssid: "Café Wi-Fi", secure: false, kind: "open" }; app.needInternet("", Quickshell.env("HP_OS_PREVIEW_NET") || "portal") }
+            if (app.step === 6 && Quickshell.env("HP_OS_PREVIEW_NET") === "eap") Qt.callLater(() => app.chooseNetwork({ ssid: "HP Corporate", secure: true, kind: "eap", enterprise: true }))
+            if (app.step === 6 && Quickshell.env("HP_OS_PREVIEW_NET") === "hidden") Qt.callLater(() => app.chooseNetwork({ ssid: "", hidden: true, kind: "psk", secure: true }))
         }
     }
 
@@ -951,8 +996,13 @@ ShellRoot {
         Page {
             index: 6
             Title { text: "Connect to Wi-Fi" }
-            Subtitle { text: app.chosenNetwork ? "Enter the password for " + app.chosenNetwork.ssid + "."
-                : "HP-OS checks for the latest version before you start." }
+            Subtitle {
+                text: !app.chosenNetwork ? "HP-OS checks for the latest version before you start."
+                    : app.chosenNetwork.hidden ? "Type the network’s name, and its password if it has one."
+                    : app.chosenNetwork.kind === "eap" ? "Sign in to " + app.chosenNetwork.ssid + " with your username and password."
+                    : app.needsNothing(app.chosenNetwork) ? "Joining " + app.chosenNetwork.ssid + "…"
+                    : "Enter the password for " + app.chosenNetwork.ssid + "."
+            }
             Gap { size: 12 }
             Column {
                 visible: !app.chosenNetwork
@@ -981,7 +1031,8 @@ ShellRoot {
                             anchors { left: parent.left; leftMargin: win.px(26); right: bars.left; rightMargin: win.px(12); verticalCenter: parent.verticalCenter }
                             horizontalAlignment: Text.AlignLeft
                             elide: Text.ElideRight
-                            text: network.modelData.ssid + (network.modelData.secure ? "" : "  ·  Open")
+                            text: network.modelData.ssid + (network.modelData.kind === "eap" ? "  ·  Username"
+                                : !network.modelData.secure ? "  ·  Open" : "")
                             font.pixelSize: win.px(18); font.weight: Font.Medium
                         }
                         Row {
@@ -1003,39 +1054,74 @@ ShellRoot {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            enabled: !network.modelData.wep
-                            onClicked: {
-                                app.wifiNotice = ""
-                                app.chosenNetwork = network.modelData
-                                if (network.modelData.secure) wifiPassword.input.forceActiveFocus()
-                                else app.joinWifi("")
-                            }
+                            onClicked: app.chooseNetwork(network.modelData)
                         }
+                    }
+                }
+                // A hidden network doesn't appear in the list: join it by its name.
+                Rectangle {
+                    visible: !app.scanning
+                    width: parent.width; height: win.px(54)
+                    radius: height / 2
+                    color: Qt.rgba(1, 1, 1, otherHit.pressed ? 0.24 : otherHit.containsMouse ? 0.18 : 0.08)
+                    border.width: 1
+                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                    Label {
+                        anchors { left: parent.left; leftMargin: win.px(26); verticalCenter: parent.verticalCenter }
+                        text: "Other network…"
+                        color: Qt.rgba(1, 1, 1, 0.85)
+                        font.pixelSize: win.px(18); font.weight: Font.Medium
+                    }
+                    MouseArea {
+                        id: otherHit
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: app.chooseNetwork({ ssid: "", hidden: true, kind: "psk", secure: true })
                     }
                 }
             }
             Field {
-                id: wifiPassword
-                visible: !!app.chosenNetwork && app.chosenNetwork.secure
+                id: wifiName
+                visible: !!app.chosenNetwork && !!app.chosenNetwork.hidden
                 anchors.horizontalCenter: parent.horizontalCenter
-                placeholder: "Wi-Fi password"
+                placeholder: "Network name"
+                input.maximumLength: 32
+                onAccepted: wifiPassword.input.forceActiveFocus()
+            }
+            Field {
+                id: wifiUser
+                visible: !!app.chosenNetwork && app.chosenNetwork.kind === "eap"
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: "Username"
+                input.maximumLength: 128
+                input.inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+                onAccepted: wifiPassword.input.forceActiveFocus()
+            }
+            Field {
+                id: wifiPassword
+                visible: !!app.chosenNetwork && !app.needsNothing(app.chosenNetwork)
+                anchors.horizontalCenter: parent.horizontalCenter
+                placeholder: app.chosenNetwork && app.chosenNetwork.hidden ? "Password (if it has one)"
+                    : app.chosenNetwork && app.chosenNetwork.kind === "eap" ? "Password" : "Wi-Fi password"
                 secret: true
                 failed: app.wifiNotice.length > 0
-                onAccepted: app.joinWifi(wifiPassword.text)
+                input.maximumLength: 256
+                onAccepted: app.joinWifi()
             }
             // A network with a password says "Joining…" on its Join button; an open one has no button, so it says it here.
-            Note { color: app.wifiNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8); text: app.joining ? (app.chosenNetwork && app.chosenNetwork.secure ? " " : "Joining…") : app.wifiNotice || " " }
+            Note { color: app.wifiNotice ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.8); text: app.joining ? (app.needsNothing(app.chosenNetwork) ? "Joining…" : " ") : app.wifiNotice || " " }
             Primary {
-                visible: !!app.chosenNetwork && app.chosenNetwork.secure
+                visible: !!app.chosenNetwork && !app.needsNothing(app.chosenNetwork)
                 anchors.horizontalCenter: parent.horizontalCenter
                 label: app.joining ? "Joining…" : "Join"
-                ready: !app.joining && wifiPassword.text.length >= 8
-                onActivated: app.joinWifi(wifiPassword.text)
+                ready: app.wifiReady
+                onActivated: app.joinWifi()
             }
             Quiet {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.chosenNetwork ? "Other networks" : app.scanning ? " " : "Look again"
-                onActivated: { if (app.chosenNetwork) { app.chosenNetwork = null; wifiPassword.text = ""; app.wifiNotice = "" } else app.scanWifi() }
+                onActivated: { if (app.chosenNetwork) { app.chosenNetwork = null; wifiPassword.text = ""; wifiUser.text = ""; wifiName.text = ""; app.wifiNotice = "" } else app.scanWifi() }
             }
             Gap { size: 4 }
             Quiet {
@@ -1048,21 +1134,32 @@ ShellRoot {
         // ── Wi-Fi that wants a web sign-in first ──
         Page {
             index: 13
-            Title { text: "Sign in to Wi-Fi" }
+            Title { text: app.netState === "portal" ? "Sign in to Wi-Fi" : "No internet yet" }
             Subtitle {
-                text: (app.signInNetwork || "This network") + " asks you to sign in or accept its terms on a web page before HP-OS can check for updates."
+                text: app.netState === "portal"
+                    ? (app.signInNetwork || "This network") + " asks you to sign in or accept its terms on a web page before HP-OS can check for updates."
+                    : "You’re connected to " + (app.signInNetwork || "this network") + ", but it isn’t reaching the internet. Setup carries on by itself once it does."
             }
             Gap { size: 18 }
             Primary {
                 anchors.horizontalCenter: parent.horizontalCenter
-                label: app.signInOpen ? "Sign-in page is open" : "Open sign-in page"
-                ready: !app.signInOpen
-                onActivated: app.openSignIn()
+                label: app.netState === "portal" ? (app.signInOpen ? "Sign-in page is open" : "Open sign-in page")
+                    : app.checkingNet ? "Checking…" : "Try again"
+                ready: app.netState === "portal" ? !app.signInOpen : !app.checkingNet
+                onActivated: app.netState === "portal" ? app.openSignIn() : app.checkInternet()
             }
             Note {
                 color: Qt.rgba(1, 1, 1, 0.8)
-                text: app.signInOpen ? "It closes by itself once you’re online. Press Ctrl+W to come back."
+                text: app.netState !== "portal" ? "Checking again every few seconds."
+                    : app.signInOpen ? "It closes by itself once you’re online. Press Ctrl+W to come back."
                     : "Once you’re signed in, setup carries on by itself."
+            }
+            // A sign-in page the checks didn't spot: open one anyway.
+            Quiet {
+                visible: app.netState !== "portal"
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Open a sign-in page"
+                onActivated: { app.netState = "portal"; app.openSignIn() }
             }
             Gap { size: 4 }
             Quiet { anchors.horizontalCenter: parent.horizontalCenter; text: "Choose another network"; onActivated: app.leaveSignIn(true) }
