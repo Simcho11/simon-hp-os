@@ -7,10 +7,29 @@ import sys
 import tempfile
 
 
+def marker_for(path):
+    """An account's own config.json gets these defaults once; after that, what the person sets in
+    Settings stays (the Island's bubbles, Largest jump). The packaged default config has no marker."""
+    if path != (Path.home() / ".config/hp-os/config.json").resolve():
+        return None
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    return state / "hp-os/hp-os-battery-v1"
+
+
 def enable(path):
     path = Path(path).resolve()
     if not path.is_file():
         return
+    marker = marker_for(path)
+    if marker and marker.exists():
+        return
+    _apply(path)
+    if marker:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("applied\n")
+
+
+def _apply(path):
     data = json.loads(path.read_text())
     bar = data.setdefault("iris", {}).setdefault("bar", {})
     pieces = bar.get("pieces", ["sound"])

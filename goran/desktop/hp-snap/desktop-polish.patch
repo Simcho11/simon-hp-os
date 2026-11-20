@@ -331,6 +331,29 @@ index f751670..cd5d2be 100644
          onReleased: {
              root.released()
              root._dragSessionActive = false
+diff --git a/modules/hpos/controlcenter/HposControlCenter.qml b/modules/hpos/controlcenter/HposControlCenter.qml
+index f043e30..2fd1a7d 100644
+--- a/modules/hpos/controlcenter/HposControlCenter.qml
++++ b/modules/hpos/controlcenter/HposControlCenter.qml
+@@ -52,10 +52,17 @@ ColumnLayout {
+         picker = next === "none" ? "" : next
+         GlobalStates.irisControlPickerRequest = ""
+     }
+-    Component.onCompleted: takePickerRequest()
++    // hp-snap: Settings › Control Center › Arrange it opens the Control Center already arranging.
++    function takeEditRequest() {
++        if (!GlobalStates.irisControlEdit) return
++        root.editing = true
++        GlobalStates.irisControlEdit = false
++    }
++    Component.onCompleted: { takePickerRequest(); takeEditRequest() }
+     Connections {
+         target: GlobalStates
+         function onIrisControlPickerRequestChanged() { root.takePickerRequest() }
++        function onIrisControlEditChanged() { root.takeEditRequest() }
+     }
+     function saveActions(list) { Config.setNestedValue("hpos.controlCenter.actions", list) }
+     function moveAction(index, step) {
 diff --git a/modules/iris/background/IrisDesktopActions.qml b/modules/iris/background/IrisDesktopActions.qml
 index d4db1da..a88cd45 100644
 --- a/modules/iris/background/IrisDesktopActions.qml
@@ -476,10 +499,97 @@ index f31593f..85dfd54 100644
          id: devices
          command: ["grep", "-i", "^N: Name=", "/proc/bus/input/devices"]
 diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
-index 1c9dd35..6c9b683 100644
+index 1c9dd35..e00eadc 100644
 --- a/modules/iris/settings/IrisOptions.qml
 +++ b/modules/iris/settings/IrisOptions.qml
-@@ -839,9 +839,6 @@ QtObject {
+@@ -48,6 +48,12 @@ QtObject {
+             if (["auto", "light", "dark"].includes(next)) Config.setNestedValue("hpos.appearance", next)
+             return
+         }
++        // hp-snap: HP-OS's own surfaces (start menu, Control Center) read hpos.locale; it speaks English and Chinese.
++        if (spec.path === "language.ui" && root.hposFamily) {
++            const code = String(next ?? "auto")
++            Config.setNestedValues({ "language.ui": code, "hpos.locale": code === "auto" ? "auto" : code.startsWith("zh") ? "zh_CN" : "en_US" })
++            return
++        }
+         // A family switch goes through the shell's transition, never a bare config write.
+         if (spec.path === "panelFamily") Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "panelFamily", "set", String(next)])
+         else if (spec.widgetDesign) DesktopWidgetDesign.apply(String(next))
+@@ -105,7 +111,8 @@ QtObject {
+     }
+     // A scheme's tuning is listed only when that scheme can be the one in use: the one chosen, or dark and light under Auto.
+     function schemeShown(name: string): bool {
+-        const choice = String(Config.getNestedValue("iris.appearance.scheme", "auto"))
++        // hp-snap: HP-OS keeps the choice in hpos.appearance (Settings writes it there), not in iris.appearance.scheme.
++        const choice = String(root.hposFamily ? (Config.options?.hpos?.appearance ?? "auto") : Config.getNestedValue("iris.appearance.scheme", "auto"))
+         if (choice !== "auto") return choice === name
+         return IrisStyle.colourTheme === "iris-ink" ? name === "ink" : name !== "ink"
+     }
+@@ -118,13 +125,20 @@ QtObject {
+         "iris.appearance.glass.mode", "iris.dock.material", "iris.appearance.tune.dark.lume", "iris.appearance.tune.light.lume",
+         "iris.appearance.tune.ink.lume"].concat(root.hposSurfaces.map(id => "iris.appearance.surfaces." + id + ".material")).concat([
+         "iris.appearance.fontFamily", "iris.appearance.titleFontFamily", "iris.appearance.numbersFontFamily",
+-        "iris.surround.enable", "iris.surround.thickness", "iris.surround.radius"])
++        "iris.surround.enable", "iris.surround.thickness", "iris.surround.radius",
++        // Auto is the time of day on HP-OS (hp-os-appearance-schedule); the wallpaper does not also decide it.
++        "appearance.wallpaperTheming.autoDarkLightMode",
++        // Reduce motion is hpos.reducedMotion on HP-OS (Settings › General, Accessibility).
++        "iris.appearance.motion",
++        // HP-OS's Control Center (HposControlCenter) keeps its own quick actions; it never reads these.
++        "iris.controlCenter.modules", "iris.controlCenter.columns", "iris.controlCenter.labels", "iris.controlCenter.controls", "iris.controlCenter.accent", "iris.controlCenter.sliders", "iris.controlCenter.platter", "iris.controlCenter.levels"])
+     readonly property var hposSurfaces: ["cards", "controlCenter", "panels", "spotlight", "orbit", "menus", "gallery", "osd", "settings"]
+     // One Material row: the first path is the choice, the rest are what used to be chosen surface by surface.
+-    readonly property var hposMaterialPaths: ["hpos.material", "iris.dock.material", "iris.widgets.material"]
++    // hp-snap: desktop widgets keep their own Material (Desktop › Widgets); this row no longer resets it.
++    readonly property var hposMaterialPaths: ["hpos.material", "iris.dock.material"]
+         .concat(root.hposSurfaces.filter(id => id !== "settings").map(id => "iris.appearance.surfaces." + id + ".material"))
+     function hposMaterialValues(material: string, widgets: string): var {
+-        return [material, "inherit", widgets].concat(root.hposSurfaces.filter(id => id !== "settings").map(() => ""))
++        return [material, "inherit"].concat(root.hposSurfaces.filter(id => id !== "settings").map(() => ""))
+     }
+     readonly property var hposFullOnly: ["iris.appearance.texture", "iris.appearance.glass.edgeLight"]
+     function hposHides(spec: var): bool {
+@@ -225,11 +239,12 @@ QtObject {
+     }
+     function schemeSource(): string {
+         const name = root.schemeName(IrisStyle.scheme)
+-        const choice = String(Config.getNestedValue("iris.appearance.scheme", "auto"))
++        const choice = String(root.hposFamily ? (Config.options?.hpos?.appearance ?? "auto") : Config.getNestedValue("iris.appearance.scheme", "auto"))
+         const themed = IrisStyle.colourTheme !== "auto"
+         const presetName = themed ? String(ThemePresets.getPreset(IrisStyle.colourTheme).name) : ""
+         if (choice === "auto") {
+             if (themed) return Translation.tr("In use: %1, set by the %2 colour theme").arg(name).arg(presetName)
++            if (root.hposFamily) return Translation.tr("In use: %1, from the time of day").arg(name)
+             return Config.getNestedValue("appearance.wallpaperTheming.autoDarkLightMode", false)
+                 ? Translation.tr("In use: %1, from the wallpaper").arg(name) : Translation.tr("In use: %1, from your last choice").arg(name)
+         }
+@@ -298,7 +313,7 @@ QtObject {
+         { target: "material", group: "Colour theme", label: "Style", description: "iRiS is vivid, Washi is paper and pigment, Material You follows your wallpaper.", kind: "choice", tiles: true, flatTiles: true, fallback: "iris", bundle: ["iris.appearance.language", "iris.appearance.variant"], choices: root.styleChoices, keywords: ["style", "palette style", "iris", "washi", "paper", "pigment", "material you", "material", "android", "monet", "dynamic colour", "dynamic color", "tonal spot", "vibrant", "expressive", "fidelity", "monochrome", "preset", "estilo", "paleta"] },
+         { target: "material", group: "Colour theme", label: "Colour theme", description: "The palette your shell and apps wear. Wallpaper makes one for each wallpaper.", path: "appearance.theme", kind: "choice", tiles: true, fallback: "auto", choices: root.colourThemeChoices, note: () => root.themeNote(), keywords: ["palette", "catppuccin", "nord", "gruvbox", "dracula", "rose pine", "tokyo night", "everforest", "kanagawa", "theme", "apps", "terminal", "colours", "colors", "tema", "paleta", "ink"] },
+         { target: "material", group: "Colour theme", label: "Match the shell", description: "The shell takes the theme's accent, highlight and material too.", path: "iris.appearance.followTheme", visibleWhen: "!appearance.theme=auto", kind: "switch", fallback: true, keywords: ["sync", "match", "follow", "apps", "shell", "accent", "sincronizar"] },
+-        { target: "material", group: "Scheme", label: "Scheme", description: "Ink sits between dark and light: paper and ink, easier on the eyes.", path: "iris.appearance.scheme", kind: "choice", fallback: "auto", choices: [{label:"Auto",value:"auto",glyph:"auto_awesome"},{label:"Dark mode",value:"dark",glyph:"dark_mode"},{label:"Ink",value:"ink",glyph:"ink_pen"},{label:"Light mode",value:"light",glyph:"light_mode"}], keywords: ["light", "dark", "ink", "sumi", "washi", "paper", "japanese", "day", "night", "mode", "theme", "bright", "white", "black", "claro", "oscuro", "tinta", "modo"] , note: () => root.schemeNote() },
++        { target: "material", group: "Scheme", label: "Scheme", get description() { return root.hposFamily ? "Auto turns light at sunrise and dark at sunset. Light or Dark stays as you chose." : "Ink sits between dark and light: paper and ink, easier on the eyes." }, path: "iris.appearance.scheme", kind: "choice", fallback: "auto", choices: [{label:"Auto",value:"auto",glyph:"auto_awesome"},{label:"Dark mode",value:"dark",glyph:"dark_mode"},{label:"Ink",value:"ink",glyph:"ink_pen"},{label:"Light mode",value:"light",glyph:"light_mode"}], keywords: ["light", "dark", "ink", "sumi", "washi", "paper", "japanese", "day", "night", "mode", "theme", "bright", "white", "black", "claro", "oscuro", "tinta", "modo"] , note: () => root.schemeNote() },
+         { target: "material", group: "Scheme", label: "Light or dark from the wallpaper", description: "With Auto, bright wallpapers pick light and dark ones pick dark.", path: "appearance.wallpaperTheming.autoDarkLightMode", visibleWhen: "iris.appearance.scheme=auto", kind: "switch", fallback: false, keywords: ["auto", "brightness", "night", "day", "wallpaper", "luminance", "claro", "oscuro"] },
+         { target: "material", group: "Dark look", showIf: () => root.schemeShown("dark"), label: "Paper", description: "Night is your style's own. Kuro, Sumi and Usuzumi are ink at night: washi paper, gentle on the eyes.", kind: "choice", tiles: true, flatTiles: true, fallback: "night", bundle: ["iris.appearance.tune.dark.tone", "iris.appearance.tune.dark.warmth", "iris.appearance.darkStyle"], choices: root.paperChoices("dark"), keywords: ["paper", "washi", "ink", "sumi", "night", "eyes", "charcoal", "warm", "papel", "tinta", "noche"] },
+         { target: "material", group: "Dark look", showIf: () => root.schemeShown("dark") && String(Config.getNestedValue("iris.appearance.darkStyle", "style")) === "ink", label: "Warmth", summary: false, description: "How much washi fibre the night paper carries.", path: "iris.appearance.tune.dark.warmth", kind: "range", fallback: 20, min: 0, max: 100, step: 5, unit: " %", keywords: ["warmth", "warm", "sepia", "fibre", "fiber", "paper", "eyes", "night", "calidez", "papel"] },
+@@ -336,7 +351,7 @@ QtObject {
+         { target: "material", group: "Texture", label: "Grade the wallpaper", description: "The wallpaper gets the same light, live ones and the lock included, so the whole screen matches.", path: "iris.appearance.afterglow.wallpaper", visibleWhen: "iris.appearance.texture=afterglow", kind: "switch", fallback: true, keywords: ["wallpaper", "background", "grade", "desktop", "fondo"] },
+         { target: "material", group: "Glass", label: "Glass", description: "Glass blurs the wallpaper. Blur has Niri blur the windows behind (Niri 26.04).", path: "iris.appearance.glass.mode", kind: "choice", fallback: "off", choices: [{label:"Off",value:"off",glyph:"crop_square"},{label:"Glass",value:"wallpaper",glyph:"blur_on"},{label:"Blur (beta)",value:"compositor",glyph:"lens_blur"}] , note: () => root.glassNote() },
+         // HP-OS: one material and one opacity for every surface the shell draws.
+-        { target: "material", group: "Glass", label: "Material", showIf: () => root.hposFamily, description: "What every surface is made of: the Dock, the bar, cards, panels, menus, notifications and desktop widgets. Frosted blurs what is behind. Liquid is clear glass with a lit rim.", kind: "choice", bundle: root.hposMaterialPaths, choices: [{label:"Solid",value:"solid",glyph:"square",values:root.hposMaterialValues("solid","solid")},{label:"Frosted",value:"frosted",glyph:"blur_on",values:root.hposMaterialValues("frosted","glass")},{label:"Liquid",value:"liquid",glyph:"water_drop",values:root.hposMaterialValues("liquid","glass")}], keywords: ["material", "glass", "liquid", "frosted", "solid", "blur", "transparent", "hp-os"] },
++        { target: "material", group: "Glass", label: "Material", showIf: () => root.hposFamily, description: "What every surface is made of: the Dock, the bar, cards, panels, menus and notifications. Desktop widgets have their own, under Desktop › Widgets. Frosted blurs what is behind. Liquid is clear glass with a lit rim.", kind: "choice", bundle: root.hposMaterialPaths, choices: [{label:"Solid",value:"solid",glyph:"square",values:root.hposMaterialValues("solid","solid")},{label:"Frosted",value:"frosted",glyph:"blur_on",values:root.hposMaterialValues("frosted","glass")},{label:"Liquid",value:"liquid",glyph:"water_drop",values:root.hposMaterialValues("liquid","glass")}], keywords: ["material", "glass", "liquid", "frosted", "solid", "blur", "transparent", "hp-os"] },
+         { target: "material", group: "Glass", label: "Liquid Glass strength", showIf: () => root.hposFamily, description: "How strongly Liquid Glass bends and catches the light: surfaces, and selected desktop icons and widgets. 0 leaves plain frosted glass.", path: "hpos.liquidStrength", kind: "range", fallback: 100, min: 0, max: 200, step: 5, unit: " %", zeroLabel: "Off", keywords: ["liquid glass", "strength", "refraction", "bend", "lens", "intensity", "effect", "glass"] },
+         { target: "material", group: "Glass", label: "Liquid Glass highlight", showIf: () => IrisStyle.liquid > 0, description: "Adjusts the brightness of the reflections along Liquid Glass edges.", path: "hpos.liquidHighlight", kind: "range", fallback: 100, min: 0, max: 100, step: 5, unit: " %", zeroLabel: "Off", keywords: ["liquid glass", "white", "whiteness", "highlight", "brightness", "glint", "rim", "edge", "reflection"] },
+         { target: "material", group: "Glass", label: "Opacity", showIf: () => root.hposFamily && IrisStyle.glassy, description: "How much of the surface colour covers the glass, everywhere at once. Lower shows more of what is behind.", path: "hpos.materialIntensity", kind: "range", fallback: 1, min: 0.5, max: 1.5, step: 0.05, scale: 100, unit: " %", keywords: ["material", "intensity", "opacity", "transparency", "glass", "tint", "hp-os"] },
+@@ -482,6 +497,7 @@ QtObject {
+         { target: "bodies", group: "Control Center", label: "Corners", description: "Auto keeps the family's shape for the panel.", path: "iris.appearance.surfaces.controlCenter.radius", kind: "range", fallback: 0, min: 0, max: 44, unit: " px", zeroLabel: "Auto" },
+         { target: "bodies", group: "Control Center", label: "Light", description: "Its own colour, the wallpaper's, or plain black.", path: "iris.appearance.surfaces.controlCenter.light", kind: "choice", fallback: "inherit", choices: [{label:"Own",value:"inherit",glyph:"auto_awesome"},{label:"Wallpaper",value:"wallpaper",glyph:"wallpaper"},{label:"Off",value:"off",glyph:"light_off"}] },
+         { target: "bodies", group: "Control Center", label: "What it carries", description: "Every control the panel can hold, in the order you switch them on. Arrange it in place to resize or reorder them.", path: "iris.controlCenter.modules", kind: "pieces", fallback: ["platter", "media", "darkMode", "nightLight", "levels", "idle", "snip", "devices", "record", "notifications"], choices: IrisControlOptions.catalogue.map(entry => ({ label: entry.label, value: entry.id })) },
++        { target: "bodies", group: "Control Center", label: "Quick actions", hposOwn: true, showIf: () => root.hposFamily, description: "The buttons in the Control Center, in the order you switch them on. Arrange it does the same in place.", path: "hpos.controlCenter.actions", kind: "pieces", fallback: ["focus", "darkMode", "nightLight", "profiles", "mic", "idle", "snip", "lock", "settings", "session"], choices: [{label:"Do Not Disturb",value:"focus"},{label:"Dark mode",value:"darkMode"},{label:"Night Light",value:"nightLight"},{label:"Power mode",value:"profiles"},{label:"Microphone",value:"mic"},{label:"Keep awake",value:"idle"},{label:"Screen snip",value:"snip"},{label:"Lock",value:"lock"},{label:"Settings",value:"settings"},{label:"Power menu",value:"session"}], keywords: ["quick", "actions", "toggles", "buttons", "tiles", "control center", "arrange"] },
+         { target: "bodies", group: "Control Center", label: "Columns", description: "How many controls fit across. More columns make everything smaller.", path: "iris.controlCenter.columns", kind: "range", fallback: 4, min: 3, max: 6, keywords: ["grid", "layout"] },
+         { target: "bodies", group: "Control Center", label: "Names under the controls", description: "Off shows a name in the header while you point at it.", path: "iris.controlCenter.labels", kind: "switch", fallback: true },
+         { target: "bodies", group: "Control Center", label: "Control shape", description: "Round draws each switch as a disc with its name under it; Tiles are rounded squares.", path: "iris.controlCenter.controls", kind: "choice", fallback: "tiles", choices: [{label:"Tiles",value:"tiles",glyph:"grid_view"},{label:"Round",value:"round",glyph:"radio_button_checked"}] },
+@@ -839,9 +855,6 @@ QtObject {
          { section: "bubbles", group: "Tray", label: "App names", path: "iris.tray.labels", kind: "switch", fallback:true },
          { section: "bubbles", group: "Tray", label: "Hide passive apps", path: "iris.tray.hidePassive", kind: "switch", fallback:false },
          { section: "bubbles", group: "Tray", label: "Columns", path: "iris.tray.columns", kind: "range", fallback:4,min:2,max:6 },
@@ -489,7 +599,7 @@ index 1c9dd35..6c9b683 100644
          { section: "desktop", group: "Wallpaper gallery", label: "Preview on the desktop", description: "The highlighted wallpaper shows behind the gallery; closing without applying restores yours.", path: "iris.wallpaper.livePreview", kind: "switch", fallback: true },
          { section: "desktop", group: "Wallpaper gallery", label: "Play previews", description: "Live wallpapers play a muted preview while chosen or hovered in the gallery. Only one plays at a time.", path: "iris.wallpaper.motion", kind: "switch", fallback: true },
          { section: "desktop", group: "Wallpaper gallery", label: "Library order", description: "How your folders line up in the gallery.", path: "iris.wallpaper.sort", kind: "choice", fallback: "newest", choices: [{label:"Newest",value:"newest",glyph:"schedule"},{label:"Oldest",value:"oldest",glyph:"history"},{label:"Name",value:"name",glyph:"sort_by_alpha"}], keywords: ["sort", "order", "date", "recent", "newest", "oldest", "name", "alphabetical"] },
-@@ -889,7 +886,7 @@ QtObject {
+@@ -889,10 +902,11 @@ QtObject {
          { section: "general", group: "Language", label: "Language", description: "Every label in the shell. System follows your locale.", path: "language.ui", kind: "choice", fallback: "auto",
              choices: [{ label: "System", value: "auto" }].concat(Translation.allAvailableLanguages.map(code => ({ label: Translation.languageDisplayName(code), value: code }))),
              keywords: ["language", "idioma", "translation", "locale", "español", "spanish"] },
@@ -498,7 +608,11 @@ index 1c9dd35..6c9b683 100644
          { section: "general", group: "Settings window", label: "Opens as", description: "Over the desktop previews every change on the screen behind it. A window sits with your apps: Niri sizes, maximizes and moves it like any other.", path: "iris.appearance.settingsHost", kind: "choice", fallback: "overlay", choices: [{ label: "Over the desktop", value: "overlay", glyph: "layers" }, { label: "Window", value: "window", glyph: "web_asset" }], keywords: ["settings", "window", "overlay", "floating", "tile", "maximize"] },
          { section: "general", group: "Settings window", label: "Show every setting", description: "Off keeps Settings to the areas most people need. Search still finds everything.", path: "settingsUi.easyMode", invert: true, kind: "switch", fallback: true, keywords: ["simple", "easy", "advanced", "all settings", "sections"] },
          { section: "general", group: "Settings window", label: "Layout", description: "Sidebar lists every area beside the page. Rail keeps only their marks, for more room. Home opens on every area at once; each opens full width.", path: "iris.appearance.settingsLayout", kind: "choice", fallback: "sidebar", choices: [{ label: "Sidebar", value: "sidebar", glyph: "view_sidebar" }, { label: "Rail", value: "rail", glyph: "view_week" }, { label: "Home", value: "home", glyph: "grid_view" }], keywords: ["settings", "navigation", "sidebar", "rail", "grid", "home", "layout"] },
-@@ -901,9 +898,6 @@ QtObject {
++        { section: "general", group: "Accessibility", label: "Reduce motion", hposOwn: true, showIf: () => root.hposFamily, description: "Windows, menus and panels appear in place instead of growing, sliding or zooming.", path: "hpos.reducedMotion", kind: "switch", fallback: false, keywords: ["motion", "animation", "animations", "reduce", "accessibility", "vestibular", "movement"] },
+         { section: "general", group: "Performance", label: "Low power", description: "Turns glass, blur and heavy wallpaper effects off everywhere.", path: "performance.lowPower", kind: "switch", fallback: false, keywords: ["performance", "battery", "effects", "glass", "blur", "rendimiento"] },
+ 
+         // hp-snap: the device itself
+@@ -901,9 +915,6 @@ QtObject {
          { section: "general", group: "Power", label: "Factory reset", description: "Erase every account and its files, and start this device again as new. Needs an administrator.", kind: "action", button: "Reset…", keywords: ["erase", "wipe", "reset"], run: () => Quickshell.execDetached(["/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-factory-reset"]) },
          { section: "general", group: "HP-OS", label: "Weather provider", description: "Open-Meteo receives manually configured coordinates. Set latitude and longitude in weather settings, then enable weather. Automatic geolocation is disabled for HP-OS.", path: "hpos.weatherProvider", kind: "choice", fallback: "disabled", showIf: () => Config.options.panelFamily === "hpos", choices: [{label:"Disabled",value:"disabled"},{label:"Open-Meteo",value:"open-meteo"}] },
          { section: "general", group: "HP-OS", label: "HP-OS preferences", description: "Typography, materials, accessibility and component gallery.", kind: "action", button: "Open", showIf: () => Config.options.panelFamily === "hpos", run: () => Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "hpos", "settings"]) },
@@ -508,7 +622,7 @@ index 1c9dd35..6c9b683 100644
  
          { section: "spotlight", group: "Web search", label: "Search the web with", description: "What ? and Search the web use in Spotlight.", path: "search.engineBaseUrl", kind: "choice", fallback: "https://www.google.com/search?q=",
              choices: [{label:"Google",value:"https://www.google.com/search?q="},{label:"DuckDuckGo",value:"https://duckduckgo.com/?q="},{label:"Brave",value:"https://search.brave.com/search?q="},{label:"Bing",value:"https://www.bing.com/search?q="},{label:"Startpage",value:"https://www.startpage.com/do/search?q="}],
-@@ -1095,8 +1089,8 @@ QtObject {
+@@ -1095,8 +1106,8 @@ QtObject {
              keywords: ["typing", "trackpad", "touchpad", "instant"]
          },
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.click-method", label: "Right click", kind: "choice", fallback: "button-areas", choices: [{label:"Bottom corner",value:"button-areas"},{label:"Two fingers",value:"clickfinger"}] },
@@ -519,7 +633,7 @@ index 1c9dd35..6c9b683 100644
          { section: "keyboard", group: "Trackpad", showIf: () => IrisNiri.hasTouchpad, niri: "input", key: "touchpad.disabled-on-external-mouse", label: "Off while a mouse is plugged in", kind: "switch", fallback: false },
  
          { section: "keyboard", group: "Pointer", niri: "input", key: "cursor.xcursor-theme", read: "cursor.theme", label: "Cursor", kind: "choice", choicesFrom: "cursors", fallback: "", keywords: ["cursor", "theme", "pointer"] },
-@@ -1130,7 +1124,7 @@ QtObject {
+@@ -1130,7 +1141,7 @@ QtObject {
          { id: "general", cluster: 0, title: "General", subtitle: "Time, language and how iRiS behaves", icon: "settings", get tint() { return IrisStyle.identity.gray }, tip: "Settings that shape the whole shell, whichever surface shows them." },
          { id: "appearance", cluster: 0, title: "Appearance", subtitle: "Look, material, shape and type", icon: "style", get tint() { return IrisStyle.identity.purple }, tip: "Customize edits the same values live, on top of your desktop." },
          { id: "colour", cluster: 0, title: "Colour", subtitle: "Light or dark, accent, highlight and your apps", icon: "palette", get tint() { return IrisStyle.identity.pink }, tip: "Colour can come from your wallpaper, from a theme, or be one you pick." },
@@ -528,16 +642,20 @@ index 1c9dd35..6c9b683 100644
          { id: "motion", cluster: 0, title: "Motion", subtitle: "How every shape grows, moves and settles", icon: "animation", get tint() { return IrisStyle.identity.indigo }, tip: "Shorter durations feel snappier; the curve stays the same." },
          { id: "bar", cluster: 1, title: "Island", subtitle: "Composition, size and how the Island responds", icon: "pill", get tint() { return IrisStyle.identity.blue }, tip: "Rest on the Island to peek, click to keep it, scroll for volume." },
          { id: "bubbles", cluster: 1, title: "Bubbles & Cards", subtitle: "Pieces you carry and the cards they grow", icon: "bubble_chart", get tint() { return IrisStyle.identity.sky }, tip: "Hold a bubble to carry it; drop it beside the Island to bring it back." },
-@@ -1158,6 +1152,8 @@ QtObject {
+@@ -1157,8 +1168,11 @@ QtObject {
+         { id: "system", cluster: 6, title: "More Settings", subtitle: "Wallpaper engine, Niri, widgets and services", icon: "tune", get tint() { return IrisStyle.identity.gray }, tip: "Pages iRiS shares with the other families." }
      ]
      // The shared iNiR pages that still act under iRiS, as "More Settings" lists them. Pages for other families stay out.
++    // A page with a home is linked from that section instead (Wi-Fi and Bluetooth in General, Users & Accounts in Lock Screen); search still finds it.
      readonly property var morePages: [
-+        { group: "System", key: "wifi", label: "Wi-Fi", detail: "Networks, joining and forgetting", icon: "wifi", get tint() { return IrisStyle.identity.blue }, keywords: ["wifi", "wi-fi", "wireless", "network", "internet", "hotspot", "join"] },
-+        { group: "System", key: "bluetooth", label: "Bluetooth", detail: "Headphones, keyboards and other devices", icon: "bluetooth", get tint() { return IrisStyle.identity.blue }, keywords: ["bluetooth", "bt", "headphones", "airpods", "earbuds", "speaker", "keyboard", "mouse", "pair", "devices"] },
-         { group: "System", key: "accounts", label: "Users & Accounts", detail: "People, passwords and sign-in", icon: "manage_accounts", get tint() { return IrisStyle.identity.blue }, keywords: ["user", "account", "password", "login", "register"] },
+-        { group: "System", key: "accounts", label: "Users & Accounts", detail: "People, passwords and sign-in", icon: "manage_accounts", get tint() { return IrisStyle.identity.blue }, keywords: ["user", "account", "password", "login", "register"] },
++        { group: "System", key: "wifi", home: "general", label: "Wi-Fi", detail: "Networks, joining and forgetting", icon: "wifi", get tint() { return IrisStyle.identity.blue }, keywords: ["wifi", "wi-fi", "wireless", "network", "internet", "hotspot", "join"] },
++        { group: "System", key: "bluetooth", home: "general", label: "Bluetooth", detail: "Headphones, keyboards and other devices", icon: "bluetooth", get tint() { return IrisStyle.identity.blue }, keywords: ["bluetooth", "bt", "headphones", "airpods", "earbuds", "speaker", "keyboard", "mouse", "pair", "devices"] },
++        { group: "System", key: "accounts", home: "lock", label: "Users & Accounts", detail: "People, passwords and sign-in", icon: "manage_accounts", get tint() { return IrisStyle.identity.blue }, keywords: ["user", "account", "password", "login", "register"] },
          { group: "Desktop", key: "wallpaper", label: "Wallpaper engine", detail: "Backend, transitions, rotation", icon: "wallpaper", get tint() { return IrisStyle.identity.teal }, keywords: ["wallpaper", "awww", "transition", "slideshow", "fondo"] },
          { group: "Desktop", key: "widgets", label: "Desktop widgets", detail: "Every widget's own options", icon: "widgets", get tint() { return IrisStyle.identity.sky }, keywords: ["widgets", "clock", "weather", "media"] },
-@@ -1422,7 +1418,7 @@ QtObject {
+         { group: "System", key: "autostart", label: "Autostart", detail: "Apps that start with you", icon: "rocket_launch", get tint() { return IrisStyle.identity.orange }, keywords: ["autostart", "startup", "login", "inicio"] },
+@@ -1422,7 +1436,7 @@ QtObject {
          bubbles: ["Size", "Behaviour", "On the contour", "Floating", "Opening bodies", "Cards", "Card contents", "Joining", "Tray"],
          dock: ["Notch", "Look", "Icons", "Visibility"],
          desktop: ["Icons", "Widgets", "Desktop menu"],
@@ -546,7 +664,7 @@ index 1c9dd35..6c9b683 100644
          lock: ["When idle", "Security", "Scene", "Clock", "At a glance", "Now playing", "Activity", "Status", "Sign in", "Type"]
      })
      // How a section's page reads: named blocks of groups, by what someone came to change.
-@@ -1448,7 +1444,7 @@ QtObject {
+@@ -1448,7 +1462,7 @@ QtObject {
              { caption: "Fine tuning", groups: ["Dark look", "Ink look", "Light look", "Wallpaper tint"] }
          ],
          wallpaper: [
@@ -555,7 +673,7 @@ index 1c9dd35..6c9b683 100644
              { caption: "How it sits", groups: ["Scaling", "Behind windows", "Parallax", "Overview backdrop"] }
          ],
          lock: [
-@@ -1461,7 +1457,7 @@ QtObject {
+@@ -1461,7 +1475,7 @@ QtObject {
      // surface's other rows are (Customize reads them there) and are shown here.
      readonly property var movedGroups: ({
          appearance: { to: "colour", groups: ["Colour theme", "Scheme", "Accent", "Highlight", "App colours", "Dark look", "Ink look", "Light look", "Wallpaper tint"] },
@@ -579,6 +697,60 @@ index 4810e60..d26c84f 100644
      readonly property var categoryAreas: ({ system: "System", tools: "Tools", media: "Media", appearance: "Appearance", settings: "General", setup: "System" })
      readonly property var aliases: ({
          bt: ["bluetooth"], wifi: ["wi-fi", "wireless", "network"], wlan: ["wi-fi", "network"], dnd: ["disturb", "silent"],
+diff --git a/modules/iris/settings/IrisSettings.qml b/modules/iris/settings/IrisSettings.qml
+index e2108b5..d0b8fc6 100644
+--- a/modules/iris/settings/IrisSettings.qml
++++ b/modules/iris/settings/IrisSettings.qml
+@@ -192,12 +192,15 @@ Item {
+     }
+     IrisGroupPreview { id: sceneProbe; visible: false; section: ""; group: "" }
+     readonly property int irisPageIndex: root.pages.findIndex(page => page.key === "iris")
+-    readonly property var morePages: IrisOptions.morePages.filter(entry => root.pages.some(page => page.key === entry.key))
++    readonly property var sharedPages: IrisOptions.morePages.filter(entry => root.pages.some(page => page.key === entry.key))
++    readonly property var morePages: root.sharedPages.filter(entry => !entry.home)
+     readonly property var moreGroups: [...new Set(root.morePages.map(entry => Translation.tr(entry.group)))]
++    // Shared pages that live in the open section, as its own links.
++    readonly property var homeLinks: root.sharedPages.filter(entry => entry.home === root.section).map(entry => root.moreLink(entry))
+     readonly property var pageMatches: {
+         const terms = root.query.toLowerCase().split(/\s+/).filter(term => term.length > 0)
+         if (terms.length === 0) return []
+-        return root.morePages.filter(entry => {
++        return root.sharedPages.filter(entry => {
+             const text = [Translation.tr(entry.label), Translation.tr(entry.detail), ...(entry.keywords ?? [])].join(" ").toLowerCase()
+             return terms.every(term => text.includes(term))
+         })
+@@ -216,7 +219,7 @@ Item {
+     function pageIndexOf(key: string): int { return root.pages.findIndex(page => page.key === key) }
+     function moreLink(entry: var): var {
+         return { label: Translation.tr(entry.label), value: Translation.tr(entry.detail), icon: entry.icon, tint: entry.tint,
+-            action: () => { searchField.text = ""; root.go({ section: "system", group: "", advancedPage: root.pageIndexOf(entry.key) }) } }
++            action: () => { searchField.text = ""; root.go({ section: entry.home ?? "system", group: "", advancedPage: root.pageIndexOf(entry.key) }) } }
+     }
+     function pageTitle(index: int): string {
+         const page = root.pages[index]
+@@ -339,7 +342,8 @@ Item {
+         if (page >= 0) {
+             const irisPage = page === root.irisPageIndex
+             root.advancedPage = irisPage ? -1 : page
+-            root.section = irisPage || root.irisPageFor(String(root.pages[page]?.key ?? "")).length > 0 ? (root.homeLayout ? "home" : "general") : "system"
++            root.section = irisPage || root.irisPageFor(String(root.pages[page]?.key ?? "")).length > 0 ? (root.homeLayout ? "home" : "general")
++                : (IrisOptions.morePages.find(entry => entry.key === root.pages[page]?.key)?.home ?? "system")
+             if (irisPage && root.sections.some(s => s.id === root.requestedSection))
+                 root.section = root.requestedSection
+             GlobalStates.settingsOverlayCurrentPage = page
+@@ -986,6 +990,12 @@ Item {
+                                 visible: root.browsing && root.section === "general"
+                             }
+ 
++                            IrisLinkCard {
++                                visible: root.browsing && root.homeLinks.length > 0
++                                tinted: true
++                                links: root.homeLinks
++                            }
++
+                             IrisText {
+                                 visible: root.searching && root.entries.length === 0 && root.pageMatches.length === 0
+                                 Layout.topMargin: 24 * root.d
 diff --git a/modules/iris/settings/IrisWallpaperCard.qml b/modules/iris/settings/IrisWallpaperCard.qml
 index 1d830cb..6d4735b 100644
 --- a/modules/iris/settings/IrisWallpaperCard.qml
@@ -591,6 +763,20 @@ index 1d830cb..6d4735b 100644
              }
          }
      }
+diff --git a/modules/iris/style/IrisStyle.qml b/modules/iris/style/IrisStyle.qml
+index 914b993..23a3b77 100644
+--- a/modules/iris/style/IrisStyle.qml
++++ b/modules/iris/style/IrisStyle.qml
+@@ -921,7 +921,8 @@ QtObject {
+     readonly property real accentRuleWidth: Math.round(24 * root.density)
+     readonly property real accentRuleHeight: Math.max(2, Math.round(3 * root.density))
+ 
+-    readonly property bool motionEnabled: (!HposTokens.active || !HposTokens.reducedMotion) && (root.appearance?.motion ?? true) && Appearance.animationsEnabled
++    // hp-snap: one Reduce motion. HP-OS keeps it in hpos.reducedMotion (Settings › General); iRiS's own key is not read there.
++    readonly property bool motionEnabled: (HposTokens.active ? !HposTokens.reducedMotion : (root.appearance?.motion ?? true)) && Appearance.animationsEnabled
+ 
+     // --- Arrival: the family grows inward once the shell has its first frame ------------------
+     // Boot, a reload and a family switch all end in shellEntryReady; the chassis rides this one
 diff --git a/modules/settings/AccountsConfig.qml b/modules/settings/AccountsConfig.qml
 index 5e20c7c..582e9ca 100644
 --- a/modules/settings/AccountsConfig.qml
@@ -1905,6 +2091,38 @@ index ee56f01..5b8e4eb 100644
  
      function pathOf(target: string): string {
          return String(target ?? "").replace(/^file:\/\//, "")
+diff --git a/services/MaterialThemeLoader.qml b/services/MaterialThemeLoader.qml
+index 6e1dba2..500d3c0 100644
+--- a/services/MaterialThemeLoader.qml
++++ b/services/MaterialThemeLoader.qml
+@@ -44,8 +44,11 @@ Singleton {
+     }
+ 
+     // Toggle dark/light mode by running switchwall.sh with --mode and scheduling a reload.
+-    function setDarkMode(dark: bool): void {
+-        if (Config.options?.panelFamily === "hpos") Config.setNestedValue("hpos.appearance", dark ? "dark" : "light")
++    // hp-snap: `automatic` is a change nobody chose (the sunrise/sunset schedule): it repaints the mode but
++    // leaves the person's choice (HP-OS Automatic, Light or Dark) and the wallpaper switch as they are.
++    function setDarkMode(dark: bool, automatic): void {
++        automatic = automatic === true
++        if (Config.options?.panelFamily === "hpos" && !automatic) Config.setNestedValue("hpos.appearance", dark ? "dark" : "light")
+         if (Quickshell.env("INIR_SAFE_PREVIEW") === "1") {
+             Config.setNestedValue("appearance.customTheme.darkmode", dark)
+             Appearance.m3colors.darkmode = dark
+@@ -54,11 +57,11 @@ Singleton {
+         Config.setNestedValue("appearance.customTheme.darkmode", dark)
+         // A switch by hand is the last word: the wallpaper's brightness would decide again on the very next regeneration
+         // (the seed of the new mode starts one) and undo it. The Settings switch shows it off; the person turns it back on.
+-        if (Config.options?.appearance?.wallpaperTheming?.autoDarkLightMode ?? false)
++        if (!automatic && (Config.options?.appearance?.wallpaperTheming?.autoDarkLightMode ?? false))
+             Config.setNestedValue("appearance.wallpaperTheming.autoDarkLightMode", false)
+         // A scheme iRiS was told to keep is the mode: leaving it behind would put the shell and the apps in different ones on the next regeneration.
+         const scheme = String(Config.options?.iris?.appearance?.scheme ?? "auto")
+-        if (Config.isIrisFamily && scheme !== "auto")
++        if (!automatic && Config.isIrisFamily && scheme !== "auto")
+             Config.setNestedValue("iris.appearance.scheme", dark ? "dark" : scheme === "ink" ? "ink" : "light")
+         darkModeProc.command = [
+             "bash",
 diff --git a/services/TaskbarApps.qml b/services/TaskbarApps.qml
 index 6626687..0c0a338 100644
 --- a/services/TaskbarApps.qml
@@ -1929,6 +2147,36 @@ index 6626687..0c0a338 100644
      }
  
      function _buildApps(): var {
+diff --git a/services/ThemeService.qml b/services/ThemeService.qml
+index 99c5aa2..a4ee1e6 100644
+--- a/services/ThemeService.qml
++++ b/services/ThemeService.qml
+@@ -175,13 +175,24 @@ Singleton {
+             else if (Appearance.m3colors.darkmode !== (wanted === "dark")) Appearance.toggleDarkMode()
+             return wanted
+         }
++        // hp-snap: the sunrise/sunset schedule. It follows the time of day only while the person chose
++        // Automatic, and never turns that choice into Light or Dark.
++        function follow(mode: string): string {
++            const wanted = String(mode ?? "").trim().toLowerCase()
++            if (!["dark", "light"].includes(wanted)) return "Unknown mode: dark or light"
++            const choice = String(Config.options?.hpos?.appearance ?? "auto")
++            if (Config.options?.panelFamily === "hpos" && choice !== "auto") return "kept " + choice
++            if (Appearance.effectiveDarkMode !== (wanted === "dark")) MaterialThemeLoader.setDarkMode(wanted === "dark", true)
++            return wanted
++        }
+         function get(): string {
+             return JSON.stringify({
+                 mode: Appearance.effectiveDarkMode ? "dark" : "light",
+                 colourTheme: root.currentTheme,
+                 saved: (Config.options?.appearance?.customTheme?.darkmode ?? true) ? "dark" : "light",
+                 fromWallpaper: wallpaperThemingCfg?.autoDarkLightMode ?? false,
+-                irisScheme: root.irisSchemeChoice
++                irisScheme: root.irisSchemeChoice,
++                choice: String(Config.options?.hpos?.appearance ?? "auto")
+             })
+         }
+     }
 diff --git a/services/Wallpapers.qml b/services/Wallpapers.qml
 index 291047f..97eb96e 100644
 --- a/services/Wallpapers.qml
@@ -1995,10 +2243,18 @@ index 5b7f130..372776c 100644
      }
  
 diff --git a/shell.qml b/shell.qml
-index 3180bd7..3a24ed4 100644
+index 3180bd7..6f16dd8 100644
 --- a/shell.qml
 +++ b/shell.qml
-@@ -1053,6 +1053,9 @@ ShellRoot {
+@@ -279,7 +279,6 @@ ShellRoot {
+             })
+             if (!ready) return "loading"
+             const reduced = !Appearance.animationsEnabled || (Config.options?.hpos?.reducedMotion ?? false)
+-                || !(Config.options?.iris?.appearance?.motion ?? true)
+             return reduced ? "ready-instant" : "ready"
+         }
+     }
+@@ -1053,6 +1052,9 @@ ShellRoot {
  
      function cyclePanelFamily() {
          const currentFamily = Config.options?.panelFamily ?? "ii"

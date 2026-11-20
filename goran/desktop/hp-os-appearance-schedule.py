@@ -68,6 +68,9 @@ def find_session(proc=Path('/proc')):
                 continue
             if not env.get('DBUS_SESSION_BUS_ADDRESS') or not env.get('WAYLAND_DISPLAY'):
                 continue
+            # A test shell (its own runtime folder, its own display) is never the desktop.
+            if env.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}') != f'/run/user/{os.getuid()}':
+                continue
             found.append({'pid': int(path.name), 'start': session_identity(path),
                           'executable': args[0], 'env': env, 'proc': path})
         except (OSError, ValueError, IndexError):
@@ -99,6 +102,12 @@ def apply(session, status, appearance, state):
             env[name] = session['env'][name]
     ipc = [session['executable'], 'ipc', '--pid', str(session['pid']), 'call', 'colorMode']
     current = json.loads(run([*ipc, 'get'], env=env, check=True).stdout)
+    # The time of day decides only while the person chose Automatic. A shell too old to say what was
+    # chosen is left alone: its only way to switch would overwrite that choice.
+    status['choice'] = current.get('choice')
+    if current.get('choice') != 'auto':
+        write_state(state, json.dumps(status, indent=2) + '\n')
+        return
     identity = {'pid': session['pid'], 'start': session['start'], 'mode': status['mode'],
                 'publisher': str(Path(appearance).resolve())}
     try:
@@ -108,7 +117,7 @@ def apply(session, status, appearance, state):
     if current['mode'] != status['mode'] or previous != identity:
         check_session(session)
         if current['mode'] != status['mode']:
-            run([*ipc, 'set', status['mode']], env=env, check=True)
+            run([*ipc, 'follow', status['mode']], env=env, check=True)
         # Use the tested publisher on the live private bus and the user bus.
         run([appearance, status['mode']], env=env, check=True)
         check_session(session)

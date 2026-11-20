@@ -10,9 +10,9 @@ username:
   programs.home-manager.enable = true;
   programs.goran-hp-os.enable = true;
   # The same patched niri, xwayland-satellite and shell Simon's desktop runs (goran/desktop/hp-snap).
-  # No every-minute sunrise/sunset switching: it overrode a hand-picked dark mode. Light by
-  # default (hp-snap/defaults.json), and the wallpaper follows whatever mode the user picks.
-  programs.goran-hp-os.appearanceSchedule.enable = false;
+  # Every account starts on Light (hp-snap/defaults.json), so a new device's first start is light
+  # at any hour. The sunrise/sunset schedule (on by default) acts only if the person picks Auto in
+  # Settings › Colour › Scheme, and never changes a Light or Dark they chose.
 
   # Same GPU userspace as Simon's account; Nix-built apps need it to draw on the NVIDIA GPU.
   targets.genericLinux.gpu = {
