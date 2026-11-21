@@ -65,4 +65,6 @@ update-desktop-database -q /usr/share/applications
 "$here/hp-os-login-theme.sh"
 # Publishes first-time setup with its progress, and the sign-in step that shows it.
 "$here/hp-os-login-session.sh"
+# Intel laptops installed without the sound profiles get them (does nothing elsewhere, never fails).
+"$here/hp-os-sound-profiles.sh" || true
 echo "Add user is installed. It appears the next time the login screen starts."

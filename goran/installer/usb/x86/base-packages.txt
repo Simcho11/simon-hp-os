@@ -9,6 +9,9 @@ chrony
 # Everyday system services
 network-manager wpasupplicant wireless-regdb bluez upower power-profiles-daemon udisks2 polkitd
 pipewire pipewire-pulse pipewire-alsa wireplumber libspa-0.2-bluetooth alsa-utils
+# The speaker and microphone profiles for each laptop's sound chip. They are only "recommended" by Ubuntu, so the
+# install (which skips recommended extras) left them out, and newer Intel laptops showed only "Dummy Output".
+alsa-ucm-conf alsa-topology-conf
 # Login screen
 sddm libpam-gnome-keyring gnome-keyring libpam-systemd
 qml6-module-qt5compat-graphicaleffects qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtqml-workerscript
