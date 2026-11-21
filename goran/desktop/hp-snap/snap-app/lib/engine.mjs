@@ -132,6 +132,8 @@ export class SnapEngine {
         this.windows = new Map(body.windows.map(w => [w.id, w]));
         for (const w of body.windows) {
           if (w.is_focused) this.focusedId = w.id;
+          const output = this.workspaces.get(w.workspace_id)?.output;
+          if (output) this.lastOutput.set(w.id, output);
           this.noteFloating(w);
         }
         break;
@@ -172,7 +174,9 @@ export class SnapEngine {
   // A monitor unplugged: niri moves its workspaces onto another monitor as extra, inactive workspaces,
   // so their windows look closed (HP-OS shows no workspace switcher). Like Windows, bring those windows
   // onto that monitor's visible workspace, snapped ones into the same zone there; when the monitor comes
-  // back, return them to it.
+  // back, return them to it. With the lid closed, unplugging the only monitor leaves no screen for a moment
+  // (every workspace without an output) before the laptop's own comes back: the window's last real screen
+  // (lastOutput) bridges that gap, or its windows would stay on a hidden desktop behind the laptop's.
   onMonitorsChanged(before) {
     if (!before.size) return;  // the first workspace list: nothing changed
     const outputsNow = new Set([...this.workspaces.values()].map(w => w.output));
@@ -181,9 +185,11 @@ export class SnapEngine {
     for (const win of this.windows.values()) {
       const id = win.id;
       if (this.minimized.has(id) || this.drag?.id === id) continue;
-      const was = before.get(win.workspace_id)?.output;
+      const was = before.get(win.workspace_id)?.output ?? this.lastOutput.get(id);
       const now = this.workspaces.get(win.workspace_id)?.output;
+      if (now) this.lastOutput.set(id, now);
       if (!was || !now || was === now || outputsNow.has(was)) continue;
+      if (this.evicted.get(id) === now) continue;  // coming home: returned below
       const target = activeOn(now);
       if (!target) continue;
       this.evicted.set(id, was);
