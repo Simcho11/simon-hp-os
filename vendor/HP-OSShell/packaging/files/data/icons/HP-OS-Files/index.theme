@@ -1,4 +1,12 @@
 [Icon Theme]
 Name=HP-OS Files
-Inherits=HP-OS,hicolor
-Directories=
+Comment=The HP-OS icons (the same folder) for Files. KDE draws one-colour toolbar and menu icons (Breeze's, Qt's fallback theme) in the palette's text colour only when the current theme follows the colour scheme; without this, they were dark on Files' dark toolbar.
+Inherits=Adwaita,hicolor
+FollowsColorScheme=true
+Directories=256x256
+
+[256x256]
+Size=256
+Type=Scalable
+MinSize=16
+MaxSize=512

@@ -28,6 +28,13 @@
     extraConfig = builtins.readFile ../desktop/emacs-desktop-mode.el;
   };
   services.emacs.enable = true;
+  # Text files open in Emacs (apps.nix); list its launcher where HP-OS looks.
+  programs.goran-hp-os.defaultApps.extraLaunchers.emacs = {
+    package = config.programs.emacs.finalPackage;
+    id = "emacs";
+    program = "emacs";
+    types = [ "text/plain" ];
+  };
 
   home.file.".local/bin/chrome-live-control" = {
     source = import ../desktop/chrome-live-control.nix { inherit pkgs; };

@@ -1,0 +1,3589 @@
+diff --git a/modules/background/Background.qml b/modules/background/Background.qml
+index 292f224..6aabd2f 100644
+--- a/modules/background/Background.qml
++++ b/modules/background/Background.qml
+@@ -788,6 +788,8 @@ Scope {
+         property bool _keyboardReleased: false
+         function releaseKeyboard(): void {
+             if (bgRoot._menuOpen || (!bgRoot._needsKeyboardFocus && !bgRoot._keyboardReleased)) return
++            // A name being typed on the desktop (or about to be, for a new folder) keeps the keyboard.
++            if (DesktopFolder.editingItem.length > 0 || DesktopFolder.pendingRename) return
+             bgRoot._keyboardReleased = true
+             keyboardRearm.restart()
+         }
+@@ -2076,15 +2078,58 @@ Scope {
+                 width: 0
+                 height: 0
+                 focus: false
++                // hp-snap: the desktop's keys, as in Files: Delete, F2, Enter, Ctrl+A, Ctrl+Z,
++                // Ctrl+Shift+N (new folder) and Escape.
++                function delegateFor(instanceKey: string): var {
++                    for (let i = 0; i < desktopItemsRepeater.count; i++) {
++                        const item = desktopItemsRepeater.itemAt(i)
++                        if (item && item.instanceKey === instanceKey) return item
++                    }
++                    return null
++                }
+                 Keys.onPressed: event => {
+-                    if (event.key !== Qt.Key_Delete || event.modifiers !== Qt.NoModifier
+-                            || event.isAutoRepeat || bgRoot._menuOpen || GlobalStates.screenLocked)
+-                        return
++                    if (bgRoot._menuOpen || GlobalStates.screenLocked) return
++                    const mods = event.modifiers & ~Qt.KeypadModifier
++                    const ctrl = mods === Qt.ControlModifier, ctrlShift = mods === (Qt.ControlModifier | Qt.ShiftModifier)
++                    const plain = mods === Qt.NoModifier
+                     const single = GlobalStates.selectedDesktopItem
+                     const ids = single.length > 0
+                         ? [single.split("::desktopItem.").pop()]
+                         : GlobalStates.selectedDesktopItemIds()
+-                    event.accepted = DesktopFolder.trashItems(ids)
++                    if (event.isAutoRepeat && event.key !== Qt.Key_Delete) return
++                    if (plain && event.key === Qt.Key_Delete) {
++                        if (!event.isAutoRepeat) event.accepted = DesktopFolder.trashItems(ids)
++                    } else if (plain && event.key === Qt.Key_F2) {
++                        const item = desktopFocusSink.delegateFor(single.length > 0 ? single
++                            : (GlobalStates.selectedDesktopItems.length === 1 ? GlobalStates.selectedDesktopItems[0] : ""))
++                        if (item && !item.locked) { item.beginRename(); event.accepted = true }
++                    } else if (plain && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
++                        if (single.length > 0) desktopFocusSink.delegateFor(single)?.activate()
++                        else if (GlobalStates.selectedDesktopItems.length > 0) GlobalStates.desktopGroupAction("open")
++                        event.accepted = single.length > 0 || GlobalStates.selectedDesktopItems.length > 0
++                    } else if (ctrl && event.key === Qt.Key_A) {
++                        const keys = []
++                        for (let i = 0; i < desktopItemsRepeater.count; i++) {
++                            const item = desktopItemsRepeater.itemAt(i)
++                            if (item && item.visible) keys.push(item.instanceKey)
++                        }
++                        GlobalStates.setDesktopItemSelection(keys)
++                        event.accepted = true
++                    } else if (ctrl && (event.key === Qt.Key_C || event.key === Qt.Key_X)) {
++                        event.accepted = DesktopFolder.copyItems(ids, event.key === Qt.Key_X)
++                    } else if (ctrl && event.key === Qt.Key_V) {
++                        desktopDropCoordinator.pasteInFreePlace()
++                        event.accepted = true
++                    } else if (ctrl && event.key === Qt.Key_Z) {
++                        event.accepted = DesktopFolder.undo()
++                    } else if (ctrlShift && event.key === Qt.Key_N) {
++                        desktopDropCoordinator.newFolderInFreePlace()
++                        event.accepted = true
++                    } else if (plain && event.key === Qt.Key_Escape) {
++                        GlobalStates.clearDesktopItemSelection()
++                        bgRoot.releaseKeyboard()
++                        event.accepted = true
++                    }
+                 }
+             }
+ 
+@@ -2143,15 +2188,12 @@ Scope {
+                 acceptedButtons: Qt.RightButton | Qt.LeftButton
+                 onClicked: function(mouse) {
+                     if (mouse.button === Qt.LeftButton) {
++                        // hp-snap: a click on the desktop gives it the keyboard, as on Windows and
++                        // macOS: Ctrl+V pastes here, Ctrl+A selects every icon, Ctrl+Z undoes, until
++                        // a window is clicked or focused, or Escape is pressed.
+                         desktopFocusSink.forceActiveFocus()
+-                        // A click on the bare desktop is not typing: Niri gave this
+-                        // OnDemand surface the keyboard for it, so hand it straight
+-                        // back to the window that had it.
+                         if (desktopClickArea.bandEnded) desktopClickArea.bandEnded = false
+-                        else {
+-                            GlobalStates.clearDesktopItemSelection()
+-                            bgRoot.releaseKeyboard()
+-                        }
++                        else GlobalStates.clearDesktopItemSelection()
+                         if (desktopContextMenu.active) desktopContextMenu.close()
+                         if (desktopItemContextMenu.active) desktopItemContextMenu.close()
+                         if (irisDesktopMenu.active) irisDesktopMenu.close()
+@@ -2276,7 +2318,10 @@ Scope {
+                 // hp-snap: "Add bubble…" turns the open menu into the list of bubbles to add, placed
+                 // where the desktop was right-clicked
+                 property bool pickingBubble: false
+-                onActiveChanged: if (!active) pickingBubble = false
++                // hp-snap: New Folder asks for the name in the open menu, which holds the keyboard (once
++                // the menu closes, Niri gives the keyboard back to the window, not the desktop)
++                property bool namingFolder: false
++                onActiveChanged: if (!active) { pickingBubble = false; namingFolder = false }
+                 readonly property var bubbleEntry: [{ type: "separator" },
+                     { text: Translation.tr("Add bubble…"), iconName: "add_circle", submenu: true, keepOpen: true,
+                         action: () => { irisDesktopMenu.pickingBubble = true } }]
+@@ -2306,19 +2351,36 @@ Scope {
+                     { type: "separator" },
+                     { text: Translation.tr("Done"), iconName: "check", tint: "green",
+                         action: () => { widgetManagerPanel.shown = false; GlobalStates.setWidgetEditMode(false) } }
+-                ] : irisDesktopMenu.pickingBubble
++                ] : irisDesktopMenu.namingFolder ? irisDesktopMenu.folderNameEntry
++                    : irisDesktopMenu.pickingBubble
+                     ? IrisPieces.addMenu(desktopMenuAnchor.x / Math.max(1, desktopMenuAnchor.parent.width),
+                         desktopMenuAnchor.y / Math.max(1, desktopMenuAnchor.parent.height),
+                         () => { irisDesktopMenu.pickingBubble = false })
+                     : irisDesktopMenu.folderEntry.concat(IrisDesktopActions.menu(bgRoot.screenName, bgRoot.wallpaperPath, bgRoot.wallpaperPath), irisDesktopMenu.bubbleEntry)
+-                // hp-snap: right-click the desktop > New Folder, made where it was clicked
+-                readonly property var folderEntry: [
+-                    { text: Translation.tr("New Folder"), iconName: "create_new_folder",
+-                        action: () => {
++                // hp-snap: right-click the desktop > New Folder: named in the menu, made where it was clicked
++                readonly property var folderNameEntry: [
++                    { type: "input", text: Translation.tr("New folder name"), value: Translation.tr("New Folder"),
++                        detail: Translation.tr("Enter to make it · Esc to cancel"),
++                        accept: name => {
+                             const at = desktopMenuAnchor.mapToItem(desktopDropCoordinator, 0, 0)
+-                            desktopDropCoordinator.newFolderAt(at.x, at.y)
+-                        } },
+-                    { type: "separator" }]
++                            desktopDropCoordinator.newFolderNamedAt(at.x, at.y, name)
++                        } }]
++                readonly property var folderEntry: [
++                    { text: Translation.tr("New Folder"), iconName: "create_new_folder", keepOpen: true,
++                        action: () => { irisDesktopMenu.namingFolder = true } }]
++                    .concat(DesktopFolder.clipboardHasFiles ? [
++                        { text: Translation.tr("Paste"), iconName: "content_paste",
++                            action: () => {
++                                const at = desktopMenuAnchor.mapToItem(desktopDropCoordinator, 0, 0)
++                                desktopDropCoordinator.pasteAt(at.x, at.y)
++                            } }] : [])
++                    .concat(DesktopFolder.canUndo ? [
++                        { text: Translation.tr("Undo %1").arg(DesktopFolder.undoLabel), iconName: "undo",
++                            action: () => DesktopFolder.undo() }] : [])
++                    .concat([
++                        { text: Translation.tr("Open in Files"), iconName: "folder_open",
++                            action: () => CF.ShellExec.openDirectory(DesktopFolder.folder, "Open the Desktop folder") },
++                        { type: "separator" }])
+             }
+ 
+             // Managed items use the same stable screen-level popup path as the
+@@ -2327,8 +2389,15 @@ Scope {
+             ContextMenu {
+                 id: desktopItemContextMenu
+                 z: 27
++                property bool reopenWhenClosed: false
++                onActiveChanged: if (!active && reopenWhenClosed) {
++                    reopenWhenClosed = false
++                    Qt.callLater(() => desktopItemContextMenu.requestOpen())
++                }
+                 anchorItem: desktopMenuAnchor
+                 popupAbove: false
++                // hp-snap: an icon low on the screen opens its menu upward instead of cutting it off
++                popupAdjustment: PopupAdjustment.FlipY | PopupAdjustment.SlideX | PopupAdjustment.SlideY
+                 closeOnFocusLost: false
+                 closeOnHoverLost: true
+                 closeOnHoverLostAfterEntered: true
+@@ -2447,7 +2516,10 @@ Scope {
+                             desktopMenuAnchor.x = position.x
+                             desktopMenuAnchor.y = position.y
+                             desktopItemContextMenu.model = menuModel
+-                            desktopItemContextMenu.requestOpen()
++                            // hp-snap: a menu asked for while the last one is still closing (Empty Trash's
++                            // question) opens once that one has gone, or its closing would hide it.
++                            if (desktopItemContextMenu.item?.closing) desktopItemContextMenu.reopenWhenClosed = true
++                            else desktopItemContextMenu.requestOpen()
+                         }
+                         onContextMenuCloseRequested: {
+                             if (desktopItemContextMenu.active)
+diff --git a/modules/background/desktopItems/DesktopDropCoordinator.qml b/modules/background/desktopItems/DesktopDropCoordinator.qml
+index 221b09b..b20addb 100644
+--- a/modules/background/desktopItems/DesktopDropCoordinator.qml
++++ b/modules/background/desktopItems/DesktopDropCoordinator.qml
+@@ -92,62 +92,97 @@ Item {
+     }
+ 
+     // hp-snap: files dragged to the desktop land in the Desktop folder, where they were let go.
++    // One drop at a time, in order, and only once the Desktop folder is known.
+     property var _arrivals: []
++    property bool _arriving: false
+     function _bringIn(urls, x, y): void {
+         root._arrivals = root._arrivals.concat([{ urls: urls, x: x, y: y, page: root.page }])
+         root._nextArrival()
+     }
+     function _nextArrival(): void {
+-        if (bringIn.running || root._arrivals.length === 0) return
+-        bringIn.job = root._arrivals[0]
++        if (root._arriving || root._arrivals.length === 0) return
++        root._arriving = true
++        const job = root._arrivals[0]
+         root._arrivals = root._arrivals.slice(1)
+-        bringIn.command = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py"), "auto", DesktopFolder.folder]
+-            .concat(bringIn.job.urls)
+-        bringIn.running = true
++        DesktopFolder.whenFolderKnown(() => DesktopFolder.bringInto(DesktopFolder.folder, job.urls, (ok, results) => {
++            root._landed(results, job)
++            root._arriving = false
++            root._nextArrival()
++        }))
+     }
+-    function _landed(lines: var, job: var): void {
++    function _landed(results: var, job: var): void {
+         root._dropX = job.x
+         root._dropY = job.y
+         root._firstCreatedId = ""
+-        lines.forEach((line, index) => {
+-            const landed = JSON.parse(line)
++        // A Cut pasted where it already is stays where its icon is, as on Windows and macOS.
++        const placed = job.paste ? results.filter(r => !(typeof r.from === "string" && r.from === r.path)) : results
++        placed.forEach((landed, index) => {
+             const target = "file://" + landed.path
+             const position = root._position(index)
+             const known = Object.keys(DesktopItems.items).find(id => DesktopItems.items[id].target === target)
+             const place = { output: root.outputName, workspacePage: job.page || undefined, x: position.x, y: position.y }
+             if (known) DesktopItems.update(known, place)
+             else root._recordCreated(DesktopItems.create(Object.assign({ kind: landed.kind, target: target,
++                icon: landed.kind === "folder" ? "system-file-manager" : "",
+                 label: root._labelFor(landed.path), desktopFile: true }, place)))
+         })
+         DesktopFolder.rescan()
+     }
+ 
+     // hp-snap: right-click > New Folder: an empty folder where the desktop was clicked, ready to name.
++    // hp-snap: Paste (the desktop menu, Ctrl+V): the clipboard's files land where it was asked for.
++    function pasteAt(x: real, y: real): void {
++        const job = { x: x, y: y, page: root.page, paste: true }
++        DesktopFolder.whenFolderKnown(() => DesktopFolder.paste(DesktopFolder.folder, (ok, results) => root._landed(results, job)))
++    }
++    function pasteInFreePlace(): void {
++        root.pasteAt(Number(root.workArea.left ?? 0) + DesktopItems.itemWidth / 2,
++            Number(root.workArea.top ?? 0) + DesktopItems.itemHeight / 2)
++    }
++    property bool _makingFolder: false
++    // Ctrl+Shift+N: a new folder in the first free place, ready to name.
++    function newFolderInFreePlace(): void {
++        root.newFolderAt(Number(root.workArea.left ?? 0) + DesktopItems.itemWidth / 2,
++            Number(root.workArea.top ?? 0) + DesktopItems.itemHeight / 2)
++    }
+     function newFolderAt(x: real, y: real): void {
+-        if (newFolder.running) return
++        if (root._makingFolder) return
++        root._makingFolder = true
++        DesktopFolder.pendingRename = true
+         root._dropX = x
+         root._dropY = y
+-        newFolder.position = root._position(0)
+-        newFolder.page = root.page
+-        newFolder.running = true
++        const position = root._position(0)
++        const page = root.page
++        DesktopFolder.newFolder((ok, results) => {
++            root._makingFolder = false
++            if (results.length === 0) { DesktopFolder.pendingRename = false; return }
++            const dest = results[0].path
++            const id = DesktopItems.create({ kind: "folder", target: "file://" + dest, icon: "system-file-manager",
++                label: root._labelFor(dest), desktopFile: true, output: root.outputName,
++                workspacePage: page || undefined, x: position.x, y: position.y })
++            if (id.length === 0) { DesktopFolder.pendingRename = false; return }
++            GlobalStates.selectDesktopItem(root.outputName + "::desktopItem." + id)
++            DesktopFolder.renameNext = id
++        })
+     }
+-    Process {
+-        id: newFolder
+-        property int page: 0
+-        property var position: ({})
+-        command: ["python3", DesktopFolder.script, "new-folder"]
+-        stdout: StdioCollector {
+-            onStreamFinished: {
+-                const dest = text.trim()
+-                if (dest.length === 0) return
+-                const id = DesktopItems.create({ kind: "folder", target: "file://" + dest,
+-                    label: root._labelFor(dest), desktopFile: true, output: root.outputName,
+-                    workspacePage: newFolder.page || undefined, x: newFolder.position.x, y: newFolder.position.y })
+-                if (id.length === 0) return
+-                GlobalStates.selectDesktopItem(root.outputName + "::desktopItem." + id)
+-                DesktopFolder.renameNext = id
+-            }
+-        }
++
++    // The desktop menu's New Folder: named in the menu already, so it is made with that name.
++    function newFolderNamedAt(x: real, y: real, name: string): void {
++        if (root._makingFolder) return
++        root._makingFolder = true
++        root._dropX = x
++        root._dropY = y
++        const position = root._position(0)
++        const page = root.page
++        DesktopFolder.newFolder((ok, results) => {
++            root._makingFolder = false
++            if (results.length === 0) return
++            const dest = results[0].path
++            const id = DesktopItems.create({ kind: "folder", target: "file://" + dest, icon: "system-file-manager",
++                label: root._labelFor(dest), desktopFile: true, output: root.outputName,
++                workspacePage: page || undefined, x: position.x, y: position.y })
++            if (id.length > 0) GlobalStates.selectDesktopItem(root.outputName + "::desktopItem." + id)
++        }, name)
+     }
+ 
+     function createAccesses(urls, x, y): void {
+@@ -202,10 +237,17 @@ Item {
+             root._processNext()
+             return
+         }
+-        folderProbe.path = path
+-        folderProbe.position = position
+-        folderProbe.page = root.page
+-        folderProbe.running = true
++        // hp-snap: anything else naming a file or folder is copied into the Desktop folder (never
++        // overwriting); its icon appears where it was dropped. Network places get a clear message.
++        const page = root.page
++        DesktopFolder.whenFolderKnown(() => DesktopFolder.copyInto(DesktopFolder.folder, [normalized], (ok, results) => {
++            for (const landed of results)
++                root._recordCreated(DesktopItems.create({ kind: landed.kind, target: "file://" + landed.path,
++                    label: root._labelFor(landed.path), desktopFile: true, output: root.outputName,
++                    workspacePage: page || undefined, x: position.x, y: position.y }))
++            root._queueIndex++
++            root._processNext()
++        }))
+     }
+ 
+     Timer {
+@@ -345,47 +387,4 @@ Item {
+             Component.onCompleted: Qt.callLater(() => incomingSlot.placed = true)
+         }
+     }
+-
+-    Process {
+-        id: bringIn
+-        property var job: ({})
+-        stdout: StdioCollector {
+-            onStreamFinished: root._landed(text.split("\n").filter(line => line.length > 0), bringIn.job)
+-        }
+-        onExited: root._nextArrival()
+-    }
+-
+-    Process {
+-        id: folderProbe
+-        property string path: ""
+-        property int page: 0
+-        property var position: ({})
+-        command: ["test", "-d", path]
+-        onExited: (exitCode, exitStatus) => {
+-            // hp-snap: a file or folder dropped on the desktop is copied into the Desktop folder
+-            // (never overwriting); its icon appears where it was dropped.
+-            copyIn.kind = exitCode === 0 ? "folder" : "file"
+-            copyIn.position = folderProbe.position
+-            copyIn.page = folderProbe.page
+-            copyIn.command = ["python3", DesktopFolder.script, "copy-in", folderProbe.path]
+-            copyIn.running = true
+-        }
+-    }
+-    Process {
+-        id: copyIn
+-        property string kind: "file"
+-        property int page: 0
+-        property var position: ({})
+-        stdout: StdioCollector {
+-            onStreamFinished: {
+-                const dest = text.trim()
+-                if (dest.length > 0)
+-                    root._recordCreated(DesktopItems.create({ kind: copyIn.kind, target: "file://" + dest,
+-                        label: root._labelFor(dest), desktopFile: true, output: root.outputName,
+-                        workspacePage: copyIn.page || undefined, x: copyIn.position.x, y: copyIn.position.y }))
+-                root._queueIndex++
+-                root._processNext()
+-            }
+-        }
+-    }
+ }
+diff --git a/modules/background/desktopItems/DesktopItemDelegate.qml b/modules/background/desktopItems/DesktopItemDelegate.qml
+index caeab91..a2bcd10 100644
+--- a/modules/background/desktopItems/DesktopItemDelegate.qml
++++ b/modules/background/desktopItems/DesktopItemDelegate.qml
+@@ -192,6 +192,7 @@ Item {
+     }
+ 
+     function _open(): void {
++        if (root._untrustedLauncher()) { trustAskLater.restart(); return }
+         if (root.fromFolder && root.targetAvailable && root.linkUrl.length > 0) {
+             ShellExec.execDetachedArgs(["xdg-open", root.linkUrl], "Open desktop link")
+             return
+@@ -211,7 +212,10 @@ Item {
+         } else if (root.isFolder) {
+             ShellExec.openDirectory(root._pathForProbe(), "Open desktop folder")
+         } else {
+-            ShellExec.execDetachedArgs(["xdg-open", root.target], "Open desktop item")
++            // A plain path: a file:// address would need escaping for names with % or #.
++            ShellExec.execDetachedArgs(["xdg-open", root._pathForProbe()], "Open desktop item")
++            // hp-snap: and remembered among recent files (the start menu, file dialogs, apps)
++            ShellExec.execDetachedArgs(["hp-os-recents", "record", root._pathForProbe()], "Remember an opened file")
+         }
+     }
+ 
+@@ -284,27 +288,36 @@ Item {
+         root.contextMenuRequested([
+             { text: Translation.tr("Open") + " · " + count, iconName: "open_in_new", monochromeIcon: true,
+                 action: () => GlobalStates.desktopGroupAction("open") },
++            { text: Translation.tr("Cut") + " · " + count, iconName: "content_cut", monochromeIcon: true,
++                action: () => DesktopFolder.copyItems(GlobalStates.selectedDesktopItemIds(), true) },
++            { text: Translation.tr("Copy") + " · " + count, iconName: "content_copy", monochromeIcon: true,
++                action: () => DesktopFolder.copyItems(GlobalStates.selectedDesktopItemIds(), false) },
+             { type: "separator" },
+             { text: Translation.tr("Move to Trash") + " · " + count, iconName: "delete", monochromeIcon: true,
+                 action: () => {
+-                    // files go to the Trash; desktop-only icons (the Trash icon itself) are just removed
++                    // files go to the Trash; desktop-only icons (the Trash icon itself) are just removed.
++                    // Locked items stay where they are, as with the Delete key.
+                     const ids = GlobalStates.selectedDesktopItemIds()
+-                    const paths = [], others = []
++                    const files = [], others = []
+                     for (const id of ids) {
+                         const item = DesktopItems.items[id]
+-                        if (item?.desktopFile === true) paths.push(DesktopFolder.pathOf(item.target))
++                        if (!item || item.locked) continue
++                        if (item.desktopFile === true) files.push(id)
+                         else others.push(id)
+                     }
+-                    if (paths.length > 0) DesktopFolder.trash(paths)
++                    if (files.length > 0) DesktopFolder.trashItems(files)
+                     if (others.length > 0) DesktopItems.removeMany(others)
+                     GlobalStates.clearDesktopItemSelection()
+                 } },
+-            { text: Translation.tr("Undo remove"), iconName: "undo", monochromeIcon: true,
+-                enabled: DesktopItems.canUndo, action: () => DesktopItems.undoRemove() }
+-        ], anchorX, anchorY)
++            { text: DesktopFolder.canUndo ? Translation.tr("Undo %1").arg(DesktopFolder.undoLabel) : Translation.tr("Undo remove"),
++                iconName: "undo", monochromeIcon: true,
++                visible: DesktopFolder.canUndo || DesktopItems.canUndo,
++                action: () => DesktopFolder.canUndo ? DesktopFolder.undo() : DesktopItems.undoRemove() }
++        ].filter(entry => entry.visible !== false), anchorX, anchorY)
+     }
+ 
+     function _remove(): void {
++        if (root.locked) return
+         if (root.fromFolder) {
+             DesktopFolder.trash([root._pathForProbe()])
+             GlobalStates.clearDesktopItemSelection()
+@@ -314,18 +327,39 @@ Item {
+             GlobalStates.clearDesktopItemSelection()
+     }
+ 
++    // The edit lives in DesktopFolder (editingItem, editingMode, editingText), which also holds
++    // rescans and the keyboard while typing; the field shows it, and picks it up again when the
++    // desktop rebuilds its icons halfway through.
+     function beginRename(): void {
+-        root.editText = root.label
+-        root.editMode = "label"
+-        renameField.forceActiveFocus()
+-        renameField.selectAll()
++        DesktopFolder.editingItem = root.itemId
++        DesktopFolder.editingMode = "label"
++        DesktopFolder.editingText = root.label
++        root._applyEdit()
+     }
+ 
+     function beginDestinationEdit(): void {
+-        root.editText = root.target
+-        root.editMode = "destination"
++        DesktopFolder.editingItem = root.itemId
++        DesktopFolder.editingMode = "destination"
++        DesktopFolder.editingText = root.target
++        root._applyEdit()
++    }
++
++    function _applyEdit(): void {
++        if (DesktopFolder.editingItem !== root.itemId || DesktopFolder.editingMode.length === 0) return
++        root.keyboardFocusRequested()
++        root.editText = DesktopFolder.editingText
++        root.editMode = DesktopFolder.editingMode
+         renameField.forceActiveFocus()
+-        renameField.selectAll()
++        if (root.editMode === "label" && root.editText === root.label) {
++            // The name without its extension, as in Files ("Report" of "Report.pdf"); folders whole.
++            const dot = root.isFolder || root.isLauncher ? -1 : root.label.lastIndexOf(".")
++            if (dot > 0) renameField.select(0, dot)
++            else renameField.selectAll()
++        } else if (root.editMode === "destination" && root.editText === root.target) {
++            renameField.selectAll()
++        } else {
++            renameField.cursorPosition = renameField.text.length
++        }
+     }
+ 
+     function finishEdit(commit: bool): void {
+@@ -339,6 +373,50 @@ Item {
+                 DesktopItems.update(root.itemId, { label: value, customLabel: true })
+         }
+         root.editMode = ""
++        DesktopFolder.endEdit(root.itemId)
++        // The desktop's keys (Ctrl+Z, Delete, ...) work again, not the hidden name field's.
++        root.keyboardFocusRequested()
++    }
++
++    // Opens the question once the first menu has finished closing.
++    Timer {
++        id: confirmEmptyLater
++        property real ax: 0
++        property real ay: 0
++        interval: 60
++        onTriggered: root._confirmEmptyTrash(ax, ay)
++    }
++    // hp-snap: a launcher that isn't marked as trusted (not executable: downloaded, or copied in
++    // from elsewhere) could run any program, so it asks first, as Files does. Trusting it marks it
++    // executable. The launchers HP-OS puts on the desktop are trusted already.
++    function _untrustedLauncher(): bool {
++        if (!root.isLauncher) return false
++        const entry = DesktopFolder.entryFor(root._pathForProbe())
++        return entry !== null && entry.trusted === false
++    }
++    Timer { id: trustAskLater; interval: 60; onTriggered: root._askTrust() }
++    function _askTrust(): void {
++        root.contextMenuRequested([
++            { text: Translation.tr("“%1” isn't trusted yet").arg(root.label), iconName: "gpp_maybe", monochromeIcon: true, enabled: false },
++            { text: Translation.tr("Open it only if you trust where it came from"), iconName: "info", monochromeIcon: true, enabled: false },
++            { type: "separator" },
++            { text: Translation.tr("Trust and Open"), iconName: "verified_user", monochromeIcon: true,
++                action: () => DesktopFolder.trustLauncher(root._pathForProbe(), () => root._open()) },
++            { text: Translation.tr("Cancel"), iconName: "close", monochromeIcon: true, action: () => {} }
++        ], root.width / 2, root.height / 2)
++    }
++
++    // Emptying the Trash can't be undone, so it asks first, in the same place.
++    function _confirmEmptyTrash(anchorX: real, anchorY: real): void {
++        const count = DesktopFolder.trashCount
++        root.contextMenuRequested([
++            { text: count === 1 ? Translation.tr("Permanently delete 1 item?")
++                : Translation.tr("Permanently delete %1 items?").arg(count), iconName: "warning", monochromeIcon: true, enabled: false },
++            { type: "separator" },
++            { text: Translation.tr("Empty Trash"), iconName: "delete_forever", monochromeIcon: true, danger: true,
++                action: () => DesktopFolder.emptyTrash() },
++            { text: Translation.tr("Cancel"), iconName: "close", monochromeIcon: true, action: () => {} }
++        ], anchorX, anchorY)
+     }
+ 
+     function _showMenu(anchorX: real, anchorY: real): void {
+@@ -350,14 +428,24 @@ Item {
+             { text: Translation.tr("Open"), iconName: "open_in_new", monochromeIcon: true,
+                 enabled: root.targetAvailable, action: () => root.activate() },
+             { text: Translation.tr("Locate target"), iconName: "folder_open", monochromeIcon: true,
+-                visible: !root.fromFolder,
++                visible: !root.fromFolder && root.target !== "hp-os-trash",
+                 enabled: !root.targetAvailable && !root.isApplication, action: () => root._openTargetParent() },
+             { text: Translation.tr("Edit destination"), iconName: "edit", monochromeIcon: true,
+-                visible: !root.fromFolder,
++                visible: !root.fromFolder && root.target !== "hp-os-trash",
+                 action: () => root.beginDestinationEdit() },
+             { text: Translation.tr("Set as Wallpaper"), iconName: "wallpaper", monochromeIcon: true,
+                 visible: root.fromFolder && Images.isValidImageByName(root._pathForProbe()),
+                 action: () => Wallpapers.setFromFile(root._pathForProbe()) },
++            { text: Translation.tr("Cut"), iconName: "content_cut", monochromeIcon: true,
++                visible: root.fromFolder, enabled: !root.locked, action: () => DesktopFolder.copyItems([root.itemId], true) },
++            { text: Translation.tr("Copy"), iconName: "content_copy", monochromeIcon: true,
++                visible: root.fromFolder, action: () => DesktopFolder.copyItems([root.itemId], false) },
++            { text: Translation.tr("Paste into Folder"), iconName: "content_paste", monochromeIcon: true,
++                visible: root.fromFolder && root.isFolder && DesktopFolder.clipboardHasFiles,
++                action: () => DesktopFolder.paste(root._pathForProbe()) },
++            { text: Translation.tr("Empty Trash…"), iconName: "delete_forever", monochromeIcon: true,
++                visible: root.target === "hp-os-trash", enabled: DesktopFolder.trashFull,
++                action: () => { confirmEmptyLater.ax = anchorX; confirmEmptyLater.ay = anchorY; confirmEmptyLater.restart() } },
+             { text: Translation.tr("Rename"), iconName: "drive_file_rename_outline", monochromeIcon: true,
+                 action: () => root.beginRename() },
+             { text: root.locked ? Translation.tr("Unlock") : Translation.tr("Lock"), iconName: root.locked ? "lock_open" : "lock", monochromeIcon: true,
+@@ -404,9 +492,10 @@ Item {
+         model.push(
+             { type: "separator" },
+             { text: root.fromFolder ? Translation.tr("Move to Trash") : Translation.tr("Remove from desktop"), iconName: "delete", monochromeIcon: true,
+-                action: () => root._remove() },
++                enabled: !root.locked, action: () => root._remove() },
++            // Brings back a removed desktop-only icon. A file in the Trash is restored from the Trash.
+             { text: Translation.tr("Undo remove"), iconName: "undo", monochromeIcon: true,
+-                enabled: DesktopItems.canUndo, action: () => DesktopItems.undoRemove() }
++                visible: !root.fromFolder, enabled: DesktopItems.canUndo, action: () => DesktopItems.undoRemove() }
+         )
+         root.contextMenuRequested(model.filter(entry => entry.visible !== false), anchorX, anchorY)
+     }
+@@ -424,7 +513,11 @@ Item {
+     function _renameIfNew(): void {
+         if (DesktopFolder.renameNext.length === 0 || DesktopFolder.renameNext !== root.itemId) return
+         DesktopFolder.renameNext = ""
+-        Qt.callLater(() => root.beginRename())
++        DesktopFolder.editingItem = root.itemId
++        DesktopFolder.editingMode = "label"
++        DesktopFolder.editingText = root.label
++        DesktopFolder.pendingRename = false
++        Qt.callLater(() => root._applyEdit())
+     }
+     Connections {
+         target: DesktopFolder
+@@ -433,6 +526,7 @@ Item {
+ 
+     Component.onCompleted: {
+         root._renameIfNew()
++        if (DesktopFolder.editingItem === root.itemId) Qt.callLater(() => root._applyEdit())
+         root._land()
+         root._componentReady = true
+         root._refreshTarget()
+@@ -519,13 +613,52 @@ Item {
+             }
+         }
+ 
++        // hp-snap: a picture of the file (a photo, a PDF's first page, a video frame) instead of
++        // its type's icon, once its thumbnail is there (DesktopFolder.thumbnails).
++        Image {
++            id: thumbnail
++            anchors.centerIn: parent
++            readonly property real box: DesktopItems.itemIconSize + 4
++            width: box
++            height: box
++            source: root.fromFolder && !root.isLauncher && !root.isFolder
++                ? String(DesktopFolder.thumbnails[root._pathForProbe()] ?? "") : ""
++            sourceSize: Qt.size(box * 3, box * 3)
++            fillMode: Image.PreserveAspectFit
++            asynchronous: true
++            smooth: true
++            mipmap: true
++            visible: source.toString().length > 0 && status === Image.Ready
++            scale: root._dragging ? 0.92 : mouse.containsMouse ? 1.10 : 1
++            Behavior on scale {
++                enabled: Appearance.animationsEnabled
++                NumberAnimation {
++                    duration: Appearance.animation.elementMoveFast.duration
++                    easing.type: Appearance.animation.elementMoveFast.type
++                    easing.bezierCurve: Appearance.animation.elementMoveFast.bezierCurve
++                }
++            }
++            // A hairline round the picture, so a white page or a pale photo keeps its edge.
++            Rectangle {
++                anchors.centerIn: parent
++                width: thumbnail.paintedWidth + 2
++                height: thumbnail.paintedHeight + 2
++                color: "transparent"
++                radius: 3
++                border.width: 1
++                border.color: ColorUtils.applyAlpha("#000000", 0.28)
++            }
++        }
++
+         IconImage {
+             id: icon
+             anchors.centerIn: parent
++            visible: !thumbnail.visible
+             implicitSize: DesktopItems.itemIconSize
+             source: {
+                 if (root.target === "hp-os-trash")
+-                    return AppSearch.resolveIcon("hp-os-trash", "user-trash")
++                    return DesktopFolder.trashFull ? AppSearch.resolveIcon("hp-os-trash-full", "user-trash-full")
++                        : AppSearch.resolveIcon("hp-os-trash", "user-trash")
+                 const entry = root.isApplication ? AppSearch.lookupDesktopEntry(root.target) : null
+                 const iconName = String(root.itemData?.icon ?? entry?.icon ?? "")
+                 return AppSearch.resolveIcon(iconName,
+@@ -642,7 +775,10 @@ Item {
+         font.pixelSize: Appearance.font.pixelSize.small
+         horizontalAlignment: Text.AlignHCenter
+         selectByMouse: true
+-        onTextChanged: root.editText = text
++        onTextChanged: {
++            root.editText = text
++            if (root.editMode.length > 0 && DesktopFolder.editingItem === root.itemId) DesktopFolder.editingText = text
++        }
+         Keys.onReturnPressed: root.finishEdit(true)
+         Keys.onEscapePressed: root.finishEdit(false)
+     }
+@@ -653,9 +789,10 @@ Item {
+         const urls = []
+         for (const id of ids) {
+             const item = DesktopItems.get(id)
+-            if (!item?.desktopFile || item.locked) return []
++            // Desktop-only icons (the Trash) and locked items stay behind; the files still go.
++            if (!item?.desktopFile || item.locked) continue
+             const path = DesktopFolder.pathOf(item.target)
+-            if (!path.startsWith("/")) return []
++            if (!path.startsWith("/")) continue
+             urls.push("file://" + path.split("/").map(encodeURIComponent).join("/"))
+         }
+         return urls
+@@ -689,9 +826,9 @@ Item {
+                 event.accepted = false
+                 return
+             }
+-            const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py")]
+             const urls = Array.from(event.urls, String)
+-            Quickshell.execDetached(helper.concat(root.isFolder ? ["auto", root._pathForProbe()] : ["trash"], urls))
++            if (root.isFolder) DesktopFolder.bringInto(root._pathForProbe(), urls)
++            else DesktopFolder.trash(urls)
+             event.accept(event.supportedActions & Qt.MoveAction ? Qt.MoveAction : Qt.CopyAction)
+         }
+     }
+@@ -984,8 +1121,10 @@ Item {
+         target: DesktopDragGhost
+         function onLanded(): void { root._land() }
+     }
+-    opacity: root._leaving ? 0 : (root._lifted && !root._landing) || (root._groupFollowing && DesktopDragGhost.lifted)
+-        ? (root.fromFolder ? 0.4 : 0) : 1
++    // hp-snap: a cut item is dimmed until it is pasted somewhere, as in Files.
++    readonly property bool _isCut: root.fromFolder && DesktopFolder.cutPaths.indexOf(root._pathForProbe()) >= 0
++    opacity: (root._leaving ? 0 : (root._lifted && !root._landing) || (root._groupFollowing && DesktopDragGhost.lifted)
++        ? (root.fromFolder ? 0.4 : 0) : 1) * (root._isCut ? 0.5 : 1)
+     Drag.active: root._lifted
+     Drag.dragType: Drag.Automatic
+     Drag.supportedActions: root.fileUris.length ? Qt.CopyAction | Qt.MoveAction : Qt.MoveAction
+diff --git a/modules/hpos/launcher/HposFileSearch.qml b/modules/hpos/launcher/HposFileSearch.qml
+index 5b1419c..31a4733 100644
+--- a/modules/hpos/launcher/HposFileSearch.qml
++++ b/modules/hpos/launcher/HposFileSearch.qml
+@@ -28,11 +28,22 @@ Singleton {
+         smartStatus = "Expand this query using the existing local model"
+         matches = []
+         settle.restart()
++        // hp-snap: searching brings the index up to date (at most every two minutes), so files
++        // added since the last half-hourly run are found once it finishes.
++        if (query.length > 0 && !indexer.running && Date.now() - root._indexedAt > 120000) {
++            root._indexedAt = Date.now()
++            indexer.running = true
++        }
+     }
++    property real _indexedAt: 0
+     // Incremental indexing is independent of typing and serialized across screens.
+-    Timer { interval: 30000; running: true; onTriggered: indexer.running = true }
+-    Timer { interval: 1800000; running: true; repeat: true; onTriggered: { if (!indexer.running) indexer.running = true } }
+-    Process { id: indexer; command: ["hp-os-search", "--index"] }
++    Timer { interval: 30000; running: true; onTriggered: { root._indexedAt = Date.now(); indexer.running = true } }
++    Timer { interval: 1800000; running: true; repeat: true; onTriggered: { if (!indexer.running) { root._indexedAt = Date.now(); indexer.running = true } } }
++    Process {
++        id: indexer
++        command: ["hp-os-search", "--index"]
++        onExited: if (root.query.length > 0) root.refresh()
++    }
+     Timer { id: settle; interval: 120; onTriggered: root.refresh() }
+     Process {
+         id: smartWorker
+diff --git a/modules/iris/components/IrisDesktopMenu.qml b/modules/iris/components/IrisDesktopMenu.qml
+index 4ebf5e3..e3dc59a 100644
+--- a/modules/iris/components/IrisDesktopMenu.qml
++++ b/modules/iris/components/IrisDesktopMenu.qml
+@@ -134,7 +134,7 @@ Loader {
+         readonly property var stops: {
+             const list = []
+             ;(root.shown ?? []).forEach((entry, index) => {
+-                if (entry?.type !== "separator" && entry?.type !== "place" && entry?.type !== "header" && entry?.enabled !== false) list.push({ entry: index, tile: -1 })
++                if (entry?.type !== "separator" && entry?.type !== "place" && entry?.type !== "header" && entry?.type !== "input" && entry?.enabled !== false) list.push({ entry: index, tile: -1 })
+                 if (entry?.type === "hero" && entry?.secondary) list.push({ entry: index, tile: 0 })
+             })
+             return list
+@@ -242,7 +242,78 @@ Loader {
+                         sourceComponent: row.modelData?.type === "separator" ? separatorComponent
+                             : row.modelData?.type === "header" ? headerComponent
+                             : row.modelData?.type === "hero" ? heroComponent
+-                            : row.modelData?.type === "place" ? placeComponent : itemComponent
++                            : row.modelData?.type === "place" ? placeComponent
++                            : row.modelData?.type === "input" ? inputComponent : itemComponent
++
++                        // hp-snap: a text field (the name of a new folder). The menu holds the keyboard, so
++                        // typing lands here wherever the focus was before. Enter accepts, Escape closes.
++                        Component {
++                            id: inputComponent
++                            Item {
++                                implicitWidth: Math.round((root.compact ? 200 : 240) * root.d)
++                                implicitHeight: inputColumn.implicitHeight + Math.round(8 * root.d)
++                                ColumnLayout {
++                                    id: inputColumn
++                                    anchors.left: parent.left
++                                    anchors.right: parent.right
++                                    anchors.leftMargin: Math.round((root.compact ? 6 : 8) * root.d)
++                                    anchors.rightMargin: Math.round((root.compact ? 6 : 8) * root.d)
++                                    anchors.verticalCenter: parent.verticalCenter
++                                    spacing: Math.round(5 * root.d)
++                                    IrisText {
++                                        Layout.fillWidth: true
++                                        visible: text.length > 0
++                                        text: String(row.modelData?.text ?? "")
++                                        color: IrisStyle.subtext
++                                        font.pixelSize: root.compact ? IrisStyle.typeFootnote : IrisStyle.typeMeta
++                                        font.weight: IrisStyle.weight(Font.DemiBold)
++                                        elide: Text.ElideRight
++                                    }
++                                    Rectangle {
++                                        Layout.fillWidth: true
++                                        implicitHeight: root.rowHeight
++                                        radius: IrisStyle.radiusRow
++                                        color: IrisStyle.tintFill(IrisStyle.accent)
++                                        border.width: 1
++                                        border.color: IrisStyle.accent
++                                        TextInput {
++                                            id: field
++                                            anchors.fill: parent
++                                            anchors.leftMargin: Math.round(10 * root.d)
++                                            anchors.rightMargin: Math.round(10 * root.d)
++                                            verticalAlignment: TextInput.AlignVCenter
++                                            clip: true
++                                            text: String(row.modelData?.value ?? "")
++                                            color: IrisStyle.text
++                                            selectionColor: IrisStyle.accent
++                                            selectedTextColor: IrisStyle.inkOnAccent
++                                            font.pixelSize: root.textSize
++                                            selectByMouse: true
++                                            Accessible.role: Accessible.EditableText
++                                            Accessible.name: String(row.modelData?.text ?? "")
++                                            function accept(): void {
++                                                const value = field.text.trim()
++                                                if (value.length === 0) return
++                                                const done = row.modelData?.accept
++                                                popup.run(() => { if (typeof done === "function") done(value) })
++                                            }
++                                            Component.onCompleted: Qt.callLater(() => { field.forceActiveFocus(); field.selectAll() })
++                                            Keys.onReturnPressed: field.accept()
++                                            Keys.onEnterPressed: field.accept()
++                                            Keys.onEscapePressed: popup.dismiss()
++                                        }
++                                    }
++                                    IrisText {
++                                        Layout.fillWidth: true
++                                        visible: text.length > 0
++                                        text: String(row.modelData?.detail ?? "")
++                                        color: IrisStyle.muted
++                                        font.pixelSize: root.compact ? IrisStyle.typeFootnote : IrisStyle.typeMeta
++                                        elide: Text.ElideRight
++                                    }
++                                }
++                            }
++                        }
+ 
+                         Component {
+                             id: placeComponent
+diff --git a/modules/iris/dock/IrisDock.qml b/modules/iris/dock/IrisDock.qml
+index edb6f40..f0c86d0 100644
+--- a/modules/iris/dock/IrisDock.qml
++++ b/modules/iris/dock/IrisDock.qml
+@@ -947,7 +947,7 @@ Item {
+                                     }
+                                     onDropped: drop => {
+                                         if (!drop.hasUrls || !drop.urls.length) { drop.accepted = false; return }
+-                                        const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/folder_drop.py")]
++                                        const helper = ["python3", Quickshell.shellPath("scripts/hp-snap/desktop_files.py")]
+                                         const urls = Array.from(drop.urls, String)
+                                         Quickshell.execDetached(helper.concat(fileDrop.trash ? ["trash"]
+                                             : ["open", String(appSlot.desktopEntry?.id ?? entry.modelData.appId)], urls))
+@@ -1084,7 +1084,11 @@ Item {
+                                         x: root.edgeX(parent.width, width, appButton.iconMargin)
+                                         y: root.edgeY(parent.height, height, appButton.iconMargin)
+                                         transformOrigin: root.edgeOrigin
+-                                        icon: entry.separator ? "" : IrisPieces.appIcon(entry.modelData.appId)
++                                        // hp-snap: the Trash shows when something is in it.
++                                        icon: entry.separator ? ""
++                                            : entry.modelData.appId === "hp-os-trash" && DesktopFolder.trashFull
++                                                ? IconThemeService.smartIconName("hp-os-trash-full", "hp-os-trash-full")
++                                                : IrisPieces.appIcon(entry.modelData.appId)
+                                         fallback: "application-x-executable"
+                                         iconSize: Math.round(root.iconSize)
+                                         readonly property real press: appButton.down || appGrip.pressed ? IrisStyle.pressScale(0.92) : 1
+@@ -1395,9 +1399,12 @@ Item {
+                 property var shownKeys: []
+                 onWindowKeysChanged: if (menu.windowKeys.join("\n") !== menu.shownKeys.join("\n")) menu.shownKeys = menu.windowKeys
+                 property string mode: "menu"
++                // hp-snap: Empty Trash asks first, in the menu itself.
++                property bool confirmEmpty: false
+                 Connections {
+                     target: window
+                     function onMenuAppChanged(): void {
++                        menu.confirmEmpty = false
+                         const app = window.menuApp
+                         if (!app) return
+                         menu.mode = window.menuMode
+@@ -1790,6 +1797,27 @@ Item {
+                             window.menuApp = null
+                         }
+                     }
++                    MenuRow {
++                        visible: menu.app?.appId === "hp-os-trash" && DesktopFolder.trashFull && !menu.confirmEmpty
++                        glyph: "delete_forever"
++                        danger: true
++                        label: Translation.tr("Empty Trash…")
++                        onClicked: menu.confirmEmpty = true
++                    }
++                    MenuRow {
++                        visible: menu.app?.appId === "hp-os-trash" && menu.confirmEmpty
++                        glyph: "delete_forever"
++                        danger: true
++                        label: DesktopFolder.trashCount === 1 ? Translation.tr("Delete 1 item for good")
++                            : Translation.tr("Delete %1 items for good").arg(DesktopFolder.trashCount)
++                        onClicked: { DesktopFolder.emptyTrash(); window.menuApp = null }
++                    }
++                    MenuRow {
++                        visible: menu.app?.appId === "hp-os-trash" && menu.confirmEmpty
++                        glyph: "close"
++                        label: Translation.tr("Cancel")
++                        onClicked: menu.confirmEmpty = false
++                    }
+                     MenuRow {
+                         glyph: menu.app?.pinned ? "keep_off" : "keep"
+                         label: menu.app?.pinned ? Translation.tr("Unpin from dock") : Translation.tr("Keep in dock")
+diff --git a/modules/iris/palette/IrisPalette.qml b/modules/iris/palette/IrisPalette.qml
+index 648fa63..a8766d2 100644
+--- a/modules/iris/palette/IrisPalette.qml
++++ b/modules/iris/palette/IrisPalette.qml
+@@ -96,11 +96,24 @@ Item {
+         }
+         return apps.concat(root.fileResults, acts.map(hit => root.rowOf(hit.entry)), opens.map(hit => root.rowOf(hit.entry)), allApps.slice(apps.length), rest)
+     }
++    // hp-snap: a file found here opens as from the desktop (and is remembered among recent files);
++    // "Show in folder" (its folder button, or Ctrl+Enter) selects it in Files.
++    function openFile(file: var): void {
++        Qt.openUrlExternally(file.url)
++        Quickshell.execDetached(["hp-os-recents", "record", String(file.path)])
++    }
++    function revealFile(file: var): void {
++        // dbus-send separates array items with commas, so a comma in the address is escaped. It waits
++        // for the reply: the bus drops a call whose sender left before Files' service had started.
++        Quickshell.execDetached(["dbus-send", "--session", "--print-reply", "--type=method_call", "--dest=org.freedesktop.FileManager1",
++            "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems",
++            "array:string:" + String(file.url).replace(/,/g, "%2C"), "string:"])
++    }
+     readonly property var fileResults: Config.options?.panelFamily === "hpos" && root.plainQuery
+         ? HposFileSearch.results.slice(0, 2).map(file => ({name: file.name, comment: file.path,
+             type: Translation.tr("File"), verb: Translation.tr("Open"), iconName: "description",
+             iconType: LauncherSearchResult.IconType.Material,
+-            execute: () => Qt.openUrlExternally(file.url)})).concat([{
++            execute: () => root.openFile(file), reveal: () => root.revealFile(file)})).concat([{
+             name: Translation.tr("Search indexed documents"),
+             comment: Translation.tr("Index") + ": " + HposFileSearch.indexStatus + " · Desktop, Documents, Downloads, Pictures, Music, Videos",
+             showDetail: true, type: Translation.tr("Search"), verb: Translation.tr("Preview"), iconName: "manage_search",
+@@ -283,6 +296,11 @@ Item {
+         } else if (backward) {
+             root.disarmPointerSelection()
+             root.moveSelection(-1)
++        } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
++                && (event.modifiers & Qt.ControlModifier)
++                && typeof root.visibleResults[root.selectedIndex]?.reveal === "function") {
++            root.visibleResults[root.selectedIndex].reveal()
++            GlobalStates.searchOpen = false
+         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+             root.executeSelected()
+         } else if (root.clipboardMode && event.key === Qt.Key_Delete) {
+@@ -1045,6 +1063,18 @@ Item {
+                                                     font.pixelSize: IrisStyle.typeMeta
+                                                     font.features: { "tnum": 1 }
+                                                 }
++                                                IrisIconButton {
++                                                    visible: typeof result.modelData?.reveal === "function" && (result.selected || row.containsMouse)
++                                                    Layout.preferredWidth: Math.round(26 * stage.d)
++                                                    Layout.preferredHeight: Math.round(26 * stage.d)
++                                                    materialIcon: "folder_open"
++                                                    iconSize: Math.round(16 * stage.d)
++                                                    Accessible.name: Translation.tr("Show in folder")
++                                                    onClicked: {
++                                                        result.modelData.reveal()
++                                                        GlobalStates.searchOpen = false
++                                                    }
++                                                }
+                                                 IrisIconButton {
+                                                     visible: root.clipboardMode && (result.selected || row.containsMouse)
+                                                     Layout.preferredWidth: Math.round(26 * stage.d)
+diff --git a/scripts/hp-snap/desktop_files.py b/scripts/hp-snap/desktop_files.py
+new file mode 100644
+index 0000000..3f63467
+--- /dev/null
++++ b/scripts/hp-snap/desktop_files.py
+@@ -0,0 +1,1095 @@
++#!/usr/bin/env python3
++"""hp-snap: every file operation of the desktop and the Dock, in one place.
++
++  desktop_files.py scan                      JSON: the Desktop folder and its entries (label, icon, kind)
++  desktop_files.py bring auto FOLDER URL...  move into FOLDER on the same drive, copy from another drive
++  desktop_files.py bring copy FOLDER URL...  always copy
++  desktop_files.py bring move FOLDER URL...  move, also from another drive (copied, then removed there)
++  desktop_files.py clip copy|cut PATH...     put files on the clipboard (returns once they are on it)
++  desktop_files.py paste FOLDER              paste the files on the clipboard (from the desktop or Files) into FOLDER
++  desktop_files.py clipboard                 JSON: {"op": "copy"|"cut"|"", "urls": [...], "paths": [...]} on the clipboard now
++  desktop_files.py trash PATH-OR-URL...      put in the Trash; each result also names its Trash record ("info")
++  desktop_files.py restore INFO...           put Trash items back where they were (INFO: their .trashinfo files)
++  desktop_files.py empty-trash               empty the Trash, every drive's
++  desktop_files.py trash-state               JSON: {"count": items in the Trash}
++  desktop_files.py thumbnails PATH...        make the missing thumbnails: {"path", "thumb", "stamp"} each
++  desktop_files.py trust PATH                mark a launcher as trusted (executable), so it opens without asking
++  desktop_files.py move PATH DEST            move to exactly DEST (a number is added when DEST is taken)
++  desktop_files.py rename PATH NAME          give an item a new name in its folder
++  desktop_files.py mkdir FOLDER [NAME]       make a new, empty folder ("New Folder")
++  desktop_files.py open APP URL...           open with the app (a desktop file id)
++  desktop_files.py migrate JSON              turn the old managed desktop icons into files (once)
++
++Results are JSON lines on stdout: {"path", "kind"} for each item that landed or was made (bring adds
++"from" and "moved", so a move can be undone).
++Nothing is ever overwritten: a name already taken gets a number, as Files numbers them:
++"Report (1).pdf", "Report (2).pdf", "New Folder (1)". A failure is shown as a notification, printed on stderr, and ends with exit
++status 1; whatever did succeed is still printed.
++"""
++import configparser
++import ctypes
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import select
++import shlex
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++from tempfile import TemporaryDirectory
++from urllib.parse import quote, unquote, urlsplit
++import zlib
++
++HOME = os.path.expanduser("~")
++# The clipboard helper (hp-snap/file-clipboard), filled in when the shell is built.
++FILE_CLIPBOARD = "@fileClipboard@"
++AT_FDCWD = -100
++RENAME_NOREPLACE = 1
++LIBC = ctypes.CDLL(None, use_errno=True)
++TITLES = {
++    "bring": "Couldn’t move that item",
++    "trash": "Couldn’t move that item to the Trash",
++    "restore": "Couldn’t put that item back",
++    "empty-trash": "Couldn’t empty the Trash",
++    "move": "Couldn’t move that item back",
++    "paste": "Couldn’t paste",
++    "clip": "Couldn’t copy",
++    "rename": "Couldn’t rename that item",
++    "mkdir": "Couldn’t make a new folder",
++    "open": "Couldn’t open that item",
++    "trust": "Couldn’t trust that launcher",
++}
++
++
++class Problem(Exception):
++    """A failure the person can understand, shown as is."""
++
++
++# ── Where things are ─────────────────────────────────────────────────────────
++
++def desktop_dir():
++    if os.environ.get("HP_SNAP_DESKTOP_DIR"):            # the nested test window uses a copy
++        return os.environ["HP_SNAP_DESKTOP_DIR"]
++    try:
++        out = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True, timeout=5).stdout.strip()
++    except Exception:
++        out = ""
++    return out if out and out != HOME else os.path.join(HOME, "Desktop")
++
++
++def trash_dir():
++    return Path(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share"))) / "Trash"
++
++
++def local_path(uri):
++    """A local path for a dropped URL, a plain path, or an item dragged out of the Trash window."""
++    if uri.startswith("/"):
++        return Path(uri)
++    url = urlsplit(uri)
++    if url.scheme == "trash":
++        # trash:/name (Dolphin's home Trash is trash:/0-name)
++        name = unquote(url.path, errors="strict").lstrip("/")
++        if "/" in name:
++            raise Problem("Drag the whole item out of the Trash.")
++        if name.startswith("0-") and not os.path.lexists(trash_dir() / "files" / name):
++            name = name[2:]
++        return trash_dir() / "files" / name
++    if url.scheme != "file" or url.netloc not in ("", "localhost") or not url.path.startswith("/"):
++        raise Problem("Only files on this device can be put here. Copy it to a folder in Files first.")
++    return Path(unquote(url.path, errors="strict"))
++
++
++def kind_of(path):
++    return "folder" if path.is_dir() and not path.is_symlink() else "file"
++
++
++# ── Names ────────────────────────────────────────────────────────────────────
++
++NUMBERED = re.compile(r"^(.*) \((\d+)\)$")
++DOUBLE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma", ".tar.Z")
++
++
++def split_name(name, whole):
++    """(stem, extension). A folder (whole) or a dot file keeps its whole name as the stem."""
++    if whole or (name.startswith(".") and name.count(".") == 1):
++        return name, ""
++    for suffix in DOUBLE_SUFFIXES:
++        if name.lower().endswith(suffix.lower()) and len(name) > len(suffix):
++            return name[:-len(suffix)], name[-len(suffix):]
++    path = Path(name)
++    return (path.stem, path.suffix) if path.suffix else (name, "")
++
++
++def numbered(folder, name, number, whole=False):
++    """name, then "stem (1).ext", "stem (2).ext" ... as Files numbers a name already taken.
++    A name that already ends in a number counts on from it: "stem (1).ext", then "stem (2).ext"."""
++    if number == 1:
++        return folder / name
++    stem, suffix = split_name(name, whole)
++    match = NUMBERED.match(stem)
++    base, start = (match.group(1), int(match.group(2))) if match else (stem, 0)
++    return folder / f"{base} ({start + number - 1}){suffix}"
++
++
++def checked_name(name):
++    name = name.strip()
++    if not name or name in (".", ".."):
++        raise Problem("A name can’t be empty.")
++    if "/" in name or "\0" in name:
++        raise Problem("A name can’t contain “/”.")
++    if len(os.fsencode(name)) > 255:
++        raise Problem("That name is too long.")
++    return name
++
++
++def rename_new(source, dest):
++    """Renames only if dest doesn't exist. Returns False when the name is taken."""
++    done = LIBC.renameat2(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(dest), RENAME_NOREPLACE)
++    if done == 0:
++        return True
++    error = ctypes.get_errno()
++    if error == 17:  # EEXIST
++        return False
++    if error in (22, 38):  # This filesystem can't promise it, so look first.
++        if os.path.lexists(dest):
++            return False
++        os.rename(source, dest)
++        return True
++    raise OSError(error, os.strerror(error), str(source))
++
++
++def put(source, folder, name):
++    whole = source.is_dir() and not source.is_symlink()
++    number = 1
++    while not rename_new(source, numbered(folder, name, number, whole)):
++        number += 1
++    return numbered(folder, name, number, whole)
++
++
++# ── Moving and copying ───────────────────────────────────────────────────────
++
++def copy_item(source, staged):
++    if source.is_dir() and not source.is_symlink():
++        shutil.copytree(source, staged, symlinks=True)
++    else:
++        shutil.copy2(source, staged, follow_symlinks=False)
++
++
++def trashed(source):
++    """The Trash's record of source when source is an item in the Trash, else None."""
++    files = trash_dir() / "files"
++    try:
++        if source.parent.resolve() != files.resolve():
++            return None
++    except OSError:
++        return None
++    return trash_dir() / "info" / (source.name + ".trashinfo")
++
++
++def original_name(info, fallback):
++    try:
++        for line in info.read_text(errors="replace").splitlines():
++            if line.startswith("Path="):
++                return Path(unquote(line[5:])).name or fallback
++    except OSError:
++        pass
++    return fallback
++
++
++def staged_copy(source, folder, name):
++    # Hidden until complete, so a half-copied file never shows up.
++    with TemporaryDirectory(prefix=".hp-os-copy-", dir=folder) as staging:
++        staged = Path(staging) / "item"
++        copy_item(source, staged)
++        return put(staged, folder, name)
++
++
++def out_of_trash(source, folder, info):
++    """Takes an item out of the Trash into folder, under the name it had before it was trashed."""
++    name = original_name(info, source.name)
++    if os.lstat(source).st_dev == os.stat(folder).st_dev:
++        dest = put(source, folder, name)
++    else:
++        dest = staged_copy(source, folder, name)
++        if source.is_dir() and not source.is_symlink():
++            shutil.rmtree(source)
++        else:
++            source.unlink()
++    info.unlink(missing_ok=True)
++    return dest
++
++
++def transfer(action, folder, url):
++    source = local_path(url)
++    if not os.path.lexists(source) or not source.name:
++        raise Problem(f"“{source.name or source}” is no longer there.")
++    info = trashed(source)
++    if info is not None:
++        return out_of_trash(source, folder, info)
++    real_dir = source.is_dir() and not source.is_symlink()
++    if source.parent.resolve() == folder.resolve() and action in ("auto", "move"):
++        return folder / source.name                       # already here (a cut pasted where it was)
++    if real_dir and folder.resolve().is_relative_to(source.resolve()):
++        raise Problem(f"“{source.name}” can’t be put inside itself.")
++    same_drive = os.lstat(source).st_dev == os.stat(folder).st_dev
++    if action in ("auto", "move") and same_drive:
++        try:
++            return put(source, folder, source.name)
++        except PermissionError:
++            if action == "move":
++                raise
++            # read-only where it is: copy instead
++    landed = staged_copy(source, folder, source.name)
++    if action == "move":                                  # another drive: the copy is done, remove the original
++        if real_dir:
++            shutil.rmtree(source)
++        else:
++            source.unlink()
++    return landed
++
++
++def folder_arg(folder):
++    if not folder:
++        raise Problem("The destination folder isn’t known yet. Try again in a moment.")
++    path = Path(folder)
++    if not path.is_dir():
++        raise Problem(f"The folder “{path.name or folder}” is no longer there.")
++    return path
++
++
++def bring(action, folder, urls):
++    folder = folder_arg(folder)
++    problems = []
++    for url in urls:
++        try:
++            source = local_path(url)
++            from_trash = trashed(source) is not None
++            path = transfer(action, folder, url)
++        except (OSError, Problem, shutil.Error) as error:
++            problems.append(message(error))
++            continue
++        moved = not os.path.lexists(source) or os.path.realpath(source) == os.path.realpath(path)
++        emit(path, **{"from": str(source), "moved": moved and not from_trash, "fromTrash": from_trash})
++    return problems
++
++
++# ── Trash, rename, new folder, open ──────────────────────────────────────────
++
++def trash_dirs_for(path):
++    """The Trash folders an item can go to, with the Path= value its record would have there:
++    the home Trash (an absolute path), then its drive's own Trash (a path relative to the drive)."""
++    from urllib.parse import quote
++    path = Path(os.path.abspath(path))
++    dirs = [(trash_dir(), quote(str(path), safe="/"))]
++    top = path.parent
++    while not os.path.ismount(top) and top != top.parent:
++        top = top.parent
++    relative = quote(os.path.relpath(path, top), safe="/")
++    uid = os.getuid()
++    dirs += [(top / ".Trash" / str(uid), relative), (top / f".Trash-{uid}", relative)]
++    return dirs
++
++
++def trash_record(path, since):
++    """The .trashinfo record made for path at or after since (seconds); the newest when several."""
++    best = None
++    for directory, wanted in trash_dirs_for(path):
++        try:
++            records = [r for r in (directory / "info").iterdir() if r.name.endswith(".trashinfo")]
++        except OSError:
++            continue
++        for record in records:
++            try:
++                stat = record.stat()
++                if stat.st_mtime < since - 2:
++                    continue
++                lines = record.read_text(errors="replace").splitlines()
++            except OSError:
++                continue
++            value = next((l[5:] for l in lines if l.startswith("Path=")), "")
++            if unquote(value) == unquote(wanted) and (best is None or stat.st_mtime > best[0]):
++                best = (stat.st_mtime, record)
++    return best[1] if best else None
++
++
++def trash(items):
++    import time
++    problems = []
++    for item in items:
++        try:
++            path = local_path(item)
++        except Problem as error:
++            problems.append(message(error))
++            continue
++        if not os.path.lexists(path):
++            continue                                      # already gone
++        kind = kind_of(path)
++        since = time.time()
++        done = subprocess.run(["gio", "trash", "--", str(path)], capture_output=True, text=True)
++        if done.returncode != 0:
++            detail = done.stderr.strip().split(": ")[-1] or "it can’t be moved there"
++            problems.append(f"“{path.name}”: {detail}")
++            continue
++        record = trash_record(path, since)
++        extra = {"info": str(record), "trashed": str(record.parent.parent / "files" / record.name[:-10])} if record else {}
++        print(json.dumps({"path": str(path), "kind": kind, **extra}), flush=True)
++    return problems
++
++
++def restore(records):
++    """Puts Trash items back where they were, under their old name (a number when it is taken)."""
++    problems = []
++    for value in records:
++        record = Path(value)
++        item = record.parent.parent / "files" / record.name[:-len(".trashinfo")]
++        try:
++            lines = record.read_text(errors="replace").splitlines()
++        except OSError:
++            problems.append("That item is no longer in the Trash.")
++            continue
++        original = next((unquote(l[5:]) for l in lines if l.startswith("Path=")), "")
++        if not original or not os.path.lexists(item):
++            problems.append("That item is no longer in the Trash.")
++            continue
++        if not original.startswith("/"):                  # a drive's own Trash keeps paths relative to it
++            original = str(record.parent.parent.parent / original) if record.parent.parent.name.startswith(".Trash-") \
++                else str(record.parent.parent.parent.parent / original)
++        dest = Path(original)
++        try:
++            dest.parent.mkdir(parents=True, exist_ok=True)
++            landed = put(item, dest.parent, dest.name)
++            record.unlink(missing_ok=True)
++        except OSError as error:
++            problems.append(message(error))
++            continue
++        emit(landed)
++    return problems
++
++
++def all_trash_dirs():
++    """The home Trash and the Trash on each mounted drive (Trash spec: $top/.Trash/$uid, $top/.Trash-$uid)."""
++    dirs = [trash_dir()]
++    uid = os.getuid()
++    try:
++        with open("/proc/self/mounts") as mounts:
++            tops = [line.split()[1].encode().decode("unicode_escape") for line in mounts if len(line.split()) > 1]
++    except OSError:
++        tops = []
++    for top in dict.fromkeys(tops):
++        for candidate in (Path(top) / ".Trash" / str(uid), Path(top) / f".Trash-{uid}"):
++            try:
++                if candidate.is_dir() and not candidate.is_symlink() and candidate not in dirs:
++                    dirs.append(candidate)
++            except OSError:
++                continue
++    return dirs
++
++
++def trash_count():
++    total = 0
++    for directory in all_trash_dirs():
++        try:
++            total += sum(1 for _ in (directory / "files").iterdir())
++        except OSError:
++            continue
++    return total
++
++
++def remove_tree(path):
++    """Deletes path for good, never following a link out of the Trash; read-only items too."""
++    if path.is_symlink() or not path.is_dir():
++        path.unlink()
++        return
++
++    def writable_then_retry(function, failed, _info):
++        os.chmod(os.path.dirname(failed), 0o700)
++        if not os.path.islink(failed):
++            os.chmod(failed, 0o700)
++        function(failed)
++    shutil.rmtree(path, onexc=writable_then_retry) if sys.version_info >= (3, 12) \
++        else shutil.rmtree(path, onerror=lambda f, p, e: writable_then_retry(f, p, e))
++
++
++def empty_trash():
++    """Empties every Trash this account has (home and drives), as the Trash spec describes."""
++    problems = []
++    for directory in all_trash_dirs():
++        for sub in ("files", "info"):
++            try:
++                entries = list((directory / sub).iterdir())
++            except OSError:
++                continue
++            for entry in entries:
++                try:
++                    remove_tree(entry)
++                except OSError as error:
++                    problems.append(message(error))
++        try:
++            (directory / "directorysizes").unlink(missing_ok=True)
++        except OSError:
++            pass
++    print(json.dumps({"count": trash_count()}))
++    return problems
++
++
++def move(path, dest):
++    """Moves path to exactly dest (Undo of a move); a number is added when dest is taken."""
++    source, dest = Path(path), Path(dest)
++    if not os.path.lexists(source):
++        raise Problem(f"“{source.name}” is no longer there.")
++    dest.parent.mkdir(parents=True, exist_ok=True)
++    try:
++        landed = put(source, dest.parent, dest.name)
++    except OSError as error:
++        if error.errno != 18:                             # EXDEV: another drive
++            raise
++        landed = staged_copy(source, dest.parent, dest.name)
++        if source.is_dir() and not source.is_symlink():
++            shutil.rmtree(source)
++        else:
++            source.unlink()
++    emit(landed)
++    return []
++
++
++def rename(path, name):
++    source = Path(path)
++    name = checked_name(name)
++    if not os.path.lexists(source):
++        raise Problem(f"“{source.name}” is no longer there.")
++    dest = source.parent / name
++    if dest == source:
++        emit(source)
++        return []
++    if name.lower() == source.name.lower() and os.path.lexists(dest) and os.path.samefile(dest, source):
++        os.rename(source, dest)                           # only the case changes
++    elif not rename_new(source, dest):
++        raise Problem(f"There is already an item named “{name}” here. Choose a different name.")
++    emit(dest)
++    return []
++
++
++def make_folder(folder, name=None):
++    folder = folder_arg(folder)
++    name = checked_name(name or "New Folder")
++    number = 1
++    while True:
++        dest = numbered(folder, name, number, whole=True)
++        try:
++            os.mkdir(dest)
++            emit(dest)
++            return []
++        except FileExistsError:
++            number += 1
++
++
++def desktop_file(app):
++    home = os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share"))
++    stem = app[:-8] if app.endswith(".desktop") else app
++    for base in [home] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
++        candidate = Path(base) / "applications" / (stem + ".desktop")
++        if candidate.is_file():
++            return candidate
++    raise Problem(f"{stem} is no longer installed.")
++
++
++def open_with(app, urls):
++    entry = desktop_file(app)
++    if "inode/directory" in entry.read_text(errors="replace"):  # Files shows the folder a file is in.
++        urls = [p.as_uri() if p.is_dir() else p.parent.as_uri() for p in map(local_path, urls)]
++    subprocess.run(["gio", "launch", str(entry)] + list(dict.fromkeys(urls)), check=True)
++    return []
++
++
++# ── The Desktop folder ───────────────────────────────────────────────────────
++
++def read_entry(path):
++    parser = configparser.ConfigParser(interpolation=None, strict=False)
++    parser.optionxform = str
++    try:
++        parser.read(path, encoding="utf-8")
++        return dict(parser["Desktop Entry"]) if "Desktop Entry" in parser else {}
++    except Exception:
++        return {}
++
++
++def file_icons(paths):
++    """{path: (icon, type)}: the most generic, non-symbolic theme icon gio knows for each file and
++    its content type, matched by its address."""
++    infos = {}
++    if not paths:
++        return infos
++    try:
++        out = subprocess.run(["gio", "info", "-a", "standard::icon,standard::content-type"] + [str(p) for p in paths],
++                             capture_output=True, text=True, timeout=20).stdout
++    except Exception:
++        return infos
++    current = None
++    for line in out.splitlines():
++        if line.startswith("uri: "):
++            try:
++                current = str(local_path(line[5:].strip()))
++            except Problem:
++                current = None
++            continue
++        stripped = line.strip()
++        if current is None:
++            continue
++        icon, kind = infos.get(current, ("", ""))
++        if stripped.startswith("standard::icon:") and not icon:
++            names = [n.strip() for n in stripped.split(": ", 1)[-1].split(",")
++                     if n.strip() and not n.strip().endswith("-symbolic")]
++            infos[current] = (names[-1] if names else "text-x-generic", kind)
++        elif stripped.startswith("standard::content-type:") and not kind:
++            infos[current] = (icon, stripped.split(": ", 1)[-1].strip())
++    return infos
++
++
++def scan():
++    folder = desktop_dir()
++    try:
++        os.makedirs(folder, exist_ok=True)               # every desktop has its Desktop folder
++    except OSError:
++        pass
++    entries, plain = [], []
++    try:
++        names = sorted(os.listdir(folder), key=str.lower)
++    except OSError:
++        names = []
++    for name in names:
++        if name.startswith("."):
++            continue
++        path = os.path.join(folder, name)
++        if not os.path.lexists(path):
++            continue
++        info = os.lstat(path)
++        # The file's identity: the same after a rename, so its icon keeps its place.
++        entry = {"path": path, "name": name, "symlink": os.path.islink(path), "inode": f"{info.st_dev}:{info.st_ino}"}
++        if name.endswith(".desktop") and os.path.isfile(path):
++            fields = read_entry(path)
++            entry.update(kind="file", launcher=True, label=fields.get("Name") or name[:-8],
++                         icon=fields.get("Icon", "application-x-executable"))
++            if fields.get("Type") == "Link" and fields.get("URL"):
++                entry.update(link=fields["URL"], icon=fields.get("Icon", "text-html"))
++        elif os.path.isdir(path):
++            entry.update(kind="folder", launcher=False, label=name, icon="system-file-manager")
++        else:
++            entry.update(kind="file", launcher=False, label=name, icon="")
++            if os.path.exists(path):
++                plain.append(path)
++        entries.append(entry)
++    infos = file_icons(plain)
++    makers = thumbnailers()
++    for entry in entries:
++        icon, kind = infos.get(entry["path"], ("", ""))
++        if entry["icon"] == "":
++            entry["icon"] = icon or "text-x-generic"
++        if entry.get("launcher"):
++            # A launcher opens only when it is marked as trusted (executable), as in Files.
++            entry["trusted"] = os.access(entry["path"], os.X_OK)
++        elif kind:
++            entry["mime"] = kind
++            entry.update(thumbnail_state(entry["path"], kind, makers))
++    print(json.dumps({"folder": folder, "entries": entries}))
++    return []
++
++
++def app_desktop_file(app_id):
++    dirs = [os.path.join(HOME, ".local/share")] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
++    stem = app_id[:-8] if app_id.endswith(".desktop") else app_id
++    for base in dirs:
++        candidate = os.path.join(base, "applications", stem + ".desktop")
++        if os.path.isfile(candidate):
++            return candidate
++    return None
++
++
++def free_path(folder, name):
++    number = 1
++    while os.path.lexists(numbered(Path(folder), name, number)):
++        number += 1
++    return str(numbered(Path(folder), name, number))
++
++
++def migrate(items):
++    """The old managed desktop icons (apps, folder shortcuts, web links) become files in the Desktop
++    folder, once; prints {itemId: path}. Only ever creates new files."""
++    folder = desktop_dir()
++    os.makedirs(folder, exist_ok=True)
++    existing = {}
++    for name in os.listdir(folder):
++        if name.endswith(".desktop"):
++            existing[(read_entry(os.path.join(folder, name)).get("Name") or "").lower()] = os.path.join(folder, name)
++    mapping = {}
++    for item_id, item in items.items():
++        kind, target, label = item.get("kind"), str(item.get("target", "")), str(item.get("label") or "")
++        if item.get("desktopFile") or target in ("hp-os-trash",):
++            continue
++        path = None
++        safe = (label or target).replace("/", "-").strip() or "Item"
++        if kind == "application":
++            if label.lower() in existing:                       # already a launcher in the folder
++                path = existing[label.lower()]
++            else:
++                source = app_desktop_file(target)
++                path = free_path(folder, safe + ".desktop")
++                if source:
++                    shutil.copyfile(source, path)
++                else:
++                    with open(path, "w") as f:
++                        f.write(f"[Desktop Entry]\nType=Application\nName={label}\nExec=gtk-launch {target}\n"
++                                f"Icon={item.get('icon') or 'application-x-executable'}\n")
++                os.chmod(path, 0o755)
++        elif kind == "folder" or (kind == "file" and target.startswith("file://")):
++            real = target[7:] if target.startswith("file://") else target
++            if os.path.dirname(os.path.abspath(real)) == folder:
++                path = real                                       # already in the folder
++            else:
++                path = free_path(folder, os.path.basename(real) if not label else safe)
++                os.symlink(real, path)
++        elif kind == "url":
++            path = free_path(folder, (label.replace("/", "-").strip() or "Link") + ".desktop")
++            with open(path, "w") as f:
++                f.write(f"[Desktop Entry]\nType=Link\nName={label}\nURL={target}\nIcon=text-html\n")
++            os.chmod(path, 0o755)
++        if path:
++            mapping[item_id] = path
++    print(json.dumps(mapping))
++    return []
++
++
++# ── Launchers ────────────────────────────────────────────────────────────────
++
++def trust(path):
++    """Marks a launcher as trusted, as Files does: executable (wherever it can be read), so it
++    opens without asking. Launchers HP-OS puts on the desktop are trusted already."""
++    launcher = Path(path)
++    if not launcher.name.endswith(".desktop") or not launcher.is_file():
++        raise Problem("Only a launcher can be marked as trusted.")
++    mode = os.stat(launcher).st_mode
++    os.chmod(launcher, mode | ((mode & 0o444) >> 2))
++    emit(launcher)
++    return []
++
++
++# ── Thumbnails ───────────────────────────────────────────────────────────────
++# A picture of a file for its icon, kept where Files and every other app keeps them
++# (the freedesktop.org thumbnail spec): ~/.cache/thumbnails/large/<md5 of its URI>.png, marked
++# with its URI and modification time. Missing ones are made by the installed thumbnailers
++# (their .thumbnailer files, as GNOME's), the same ones GNOME apps use.
++
++THUMB_SIZE = ("large", 256)
++THUMB_READ = ("large", "x-large", "normal")       # any of these, if still current
++THUMB_TIMEOUT = 20
++FAIL_DIR = "hp-os-desktop"
++# What GLib leaves unescaped in a file's URI (g_filename_to_uri), so the names match Files' and GNOME's.
++URI_SAFE = "/!$&'()*+,:=@"
++PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
++
++
++def file_uri(path):
++    return "file://" + quote(os.fsencode(os.path.abspath(path)), safe=URI_SAFE)
++
++
++def thumb_root():
++    return Path(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")) / "thumbnails"
++
++
++def thumb_name(uri):
++    return hashlib.md5(uri.encode()).hexdigest() + ".png"
++
++
++def png_text(path):
++    """The text chunks of a PNG (tEXt, zTXt, iTXt), read up to its image data; None if not a PNG."""
++    found = {}
++    with open(path, "rb") as image:
++        if image.read(8) != PNG_SIGNATURE:
++            return None
++        while True:
++            head = image.read(8)
++            if len(head) < 8:
++                break
++            length, kind = struct.unpack(">I4s", head)
++            if kind in (b"IDAT", b"IEND"):
++                break
++            data = image.read(length)
++            image.read(4)
++            try:
++                if kind == b"tEXt":
++                    key, value = data.split(b"\0", 1)
++                elif kind == b"zTXt":
++                    key, rest = data.split(b"\0", 1)
++                    value = zlib.decompress(rest[1:])
++                elif kind == b"iTXt":
++                    key, rest = data.split(b"\0", 1)
++                    compressed, rest = rest[0], rest[2:]
++                    _language, _translated, value = rest.split(b"\0", 2)
++                    value = zlib.decompress(value) if compressed else value
++                else:
++                    continue
++            except (ValueError, zlib.error):
++                continue
++            found[key.decode("latin-1")] = value.decode("utf-8", errors="replace")
++    return found
++
++
++def png_chunk(kind, data):
++    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
++
++
++def with_text(png, text):
++    """The PNG with its Thumb:: text replaced by text (a dict)."""
++    if not png.startswith(PNG_SIGNATURE):
++        raise ValueError("not a PNG")
++    chunks, at = [], 8
++    while at + 8 <= len(png):
++        length, kind = struct.unpack(">I4s", png[at:at + 8])
++        end = at + 12 + length
++        data = png[at + 8:at + 8 + length]
++        thumb_text = kind in (b"tEXt", b"zTXt", b"iTXt") and data.startswith(b"Thumb::")
++        if not thumb_text:
++            chunks.append(png[at:end])
++        at = end
++        if kind == b"IEND":
++            break
++    if not chunks or chunks[0][4:8] != b"IHDR":
++        raise ValueError("not a PNG")
++    added = [png_chunk(b"tEXt", key.encode("latin-1") + b"\0" + value.encode("utf-8")) for key, value in text.items()]
++    return PNG_SIGNATURE + chunks[0] + b"".join(added) + b"".join(chunks[1:])
++
++
++def blank_png():
++    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
++    return PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", zlib.compress(b"\0\0\0\0\0")) + png_chunk(b"IEND", b"")
++
++
++def current_thumbnail(path, uri=None):
++    """(the cached thumbnail, the file's modification time) when the thumbnail is still current."""
++    uri = uri or file_uri(path)
++    mtime = str(int(os.stat(path).st_mtime))
++    name = thumb_name(uri)
++    for size in THUMB_READ:
++        candidate = thumb_root() / size / name
++        try:
++            text = png_text(candidate)
++        except OSError:
++            continue
++        if text and text.get("Thumb::MTime") == mtime and text.get("Thumb::URI", uri) == uri:
++            return str(candidate), mtime
++    return "", mtime
++
++
++def failed_before(uri, mtime):
++    try:
++        text = png_text(thumb_root() / "fail" / FAIL_DIR / thumb_name(uri))
++    except OSError:
++        return False
++    return bool(text) and text.get("Thumb::MTime") == mtime
++
++
++def thumbnail_dirs():
++    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share")
++    dirs = [data_home] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
++    dirs += [os.path.join(HOME, ".nix-profile/share"),
++             f"/etc/profiles/per-user/{os.environ.get('USER', '')}/share", "/run/current-system/sw/share"]
++    return [os.path.join(d, "thumbnailers") for d in dict.fromkeys(dirs) if d]
++
++
++def thumbnailers():
++    """{content type: [Exec line, ...]} of the installed thumbnailers whose program is there, earlier
++    folders first (the next is tried when one fails: Ubuntu's own may be broken)."""
++    makers = {}
++    for folder in thumbnail_dirs():
++        try:
++            names = sorted(os.listdir(folder))
++        except OSError:
++            continue
++        for name in names:
++            if not name.endswith(".thumbnailer"):
++                continue
++            parser = configparser.ConfigParser(interpolation=None, strict=False)
++            try:
++                parser.read(os.path.join(folder, name))
++                entry = parser["Thumbnailer Entry"]
++                command = entry.get("Exec", "").strip()
++                program = entry.get("TryExec", "").strip() or (shlex.split(command) or [""])[0]
++            except (configparser.Error, KeyError, ValueError):
++                continue
++            if not command or not program:
++                continue
++            found = program if os.path.isabs(program) else shutil.which(program)
++            if not found or not os.access(found, os.X_OK):
++                continue
++            for kind in entry.get("MimeType", "").split(";"):
++                if kind.strip() and command not in makers.setdefault(kind.strip(), []):
++                    makers[kind.strip()].append(command)
++    return makers
++
++
++# Pictures the desktop can draw itself (Qt's image formats), when no thumbnailer could.
++SELF_PREVIEW = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "image/svg+xml"}
++SELF_PREVIEW_MAX = 40 * 1024 * 1024
++
++
++def thumbnail_state(path, kind, makers):
++    """What scan says about a file's thumbnail: {"thumb", "stamp"}, {"needsThumb": true}, {"preview":
++    true} (a picture the desktop draws from the file itself), or nothing."""
++    try:
++        uri = file_uri(path)
++        thumb, mtime = current_thumbnail(path, uri)
++    except OSError:
++        return {}
++    if thumb:
++        return {"thumb": thumb, "stamp": mtime}
++    if kind in makers and not failed_before(uri, mtime):
++        return {"needsThumb": True, "stamp": mtime}
++    try:
++        if kind in SELF_PREVIEW and os.path.getsize(path) <= SELF_PREVIEW_MAX:
++            return {"preview": True, "stamp": mtime}
++    except OSError:
++        pass
++    return {}
++
++
++def thumbnail_command(command, path, uri, output):
++    values = {"i": path, "u": uri, "o": output, "s": str(THUMB_SIZE[1]), "%": "%"}
++    return [re.sub(r"%([iuos%])", lambda m: values[m.group(1)], word) for word in shlex.split(command)]
++
++
++def make_thumbnail(path, kind, makers):
++    """Makes the file's large thumbnail with its thumbnailer; returns it, or "" (and remembers the failure)."""
++    uri = file_uri(path)
++    mtime = str(int(os.stat(path).st_mtime))
++    folder = thumb_root() / THUMB_SIZE[0]
++    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
++    for maker in makers.get(kind, []):
++        handle, output = tempfile.mkstemp(prefix=".hp-os-thumb-", suffix=".png", dir=folder)
++        os.close(handle)
++        try:
++            command = thumbnail_command(maker, path, uri, output)
++            subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                           stderr=subprocess.DEVNULL, timeout=THUMB_TIMEOUT, check=True)
++            with open(output, "rb") as made:
++                png = with_text(made.read(), {"Thumb::URI": uri, "Thumb::MTime": mtime, "Software": "HP-OS desktop"})
++            with open(output, "wb") as final:
++                final.write(png)
++            os.chmod(output, 0o600)
++            target = folder / thumb_name(uri)
++            os.replace(output, target)
++            return str(target)
++        except (OSError, ValueError, subprocess.SubprocessError):
++            continue                                      # the next thumbnailer for this type, if any
++        finally:
++            try:
++                os.unlink(output)
++            except FileNotFoundError:
++                pass
++    try:
++        fail = thumb_root() / "fail" / FAIL_DIR
++        fail.mkdir(parents=True, exist_ok=True, mode=0o700)
++        (fail / thumb_name(uri)).write_bytes(with_text(blank_png(), {"Thumb::URI": uri, "Thumb::MTime": mtime}))
++    except OSError:
++        pass
++    return ""
++
++
++def thumbnails(paths):
++    """Makes the thumbnails the given files are missing, one at a time; a line for each as it is done."""
++    makers = thumbnailers()
++    infos = file_icons([p for p in paths if os.path.isfile(p)])
++    for path in paths:
++        kind = infos.get(path, ("", ""))[1]
++        try:
++            thumb, mtime = current_thumbnail(path)
++            if not thumb and kind in makers and not failed_before(file_uri(path), mtime):
++                thumb = make_thumbnail(path, kind, makers)
++        except OSError:
++            continue
++        result = {"path": path, "thumb": thumb, "stamp": mtime}
++        if not thumb:
++            result.update(thumbnail_state(path, kind, {}))     # a picture the desktop can draw itself
++        print(json.dumps(result), flush=True)
++    return []
++
++
++# ── The clipboard ────────────────────────────────────────────────────────────
++
++def clipboard_tool():
++    if not FILE_CLIPBOARD.startswith("@"):
++        return FILE_CLIPBOARD
++    return os.environ.get("HP_SNAP_FILE_CLIPBOARD") or shutil.which("hp-os-file-clipboard") or ""
++
++
++def clip(mode, paths):
++    """Puts the files on the clipboard and returns once they are on it. The helper that holds them
++    there (hp-os-file-clipboard) runs on its own until something else is copied: as a systemd user
++    service when the session has one, like the shell's other clipboard owners, else in its own
++    session. Either way it outlives this command and a restart of the shell."""
++    tool = clipboard_tool()
++    if not tool:
++        raise Problem("The clipboard helper is missing.")
++    command = [tool, mode] + [str(local_path(p)) for p in paths]
++    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
++    if runtime and os.path.exists(os.path.join(runtime, "systemd", "private")) and shutil.which("systemd-run"):
++        unit = f"hp-os-file-clipboard-{os.getpid()}-{time.time_ns()}"
++        env = [f"--setenv={name}={os.environ[name]}" for name in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
++               if os.environ.get(name)]
++        try:
++            done = subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
++                                   "--service-type=notify", "--property=TimeoutStartSec=10", *env, *command],
++                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
++            if done.returncode == 0:
++                return []
++        except (OSError, subprocess.SubprocessError):
++            pass                                          # start it directly instead
++    return start_clipboard_helper(command)
++
++
++def start_clipboard_helper(command, timeout=10):
++    try:
++        helper = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                                  stderr=subprocess.PIPE, start_new_session=True)
++    except OSError as error:
++        raise Problem(f"The clipboard helper didn’t start ({error.strerror}).")
++    deadline = time.monotonic() + timeout
++    line = b""
++    while not line.endswith(b"\n"):
++        left = deadline - time.monotonic()
++        if left <= 0 or not select.select([helper.stdout], [], [], left)[0]:
++            helper.kill()
++            raise Problem("The files didn’t go on the clipboard in time.")
++        chunk = os.read(helper.stdout.fileno(), 64)
++        if not chunk:
++            break                                         # it ended without saying it was ready
++        line += chunk
++    if line.strip() == b"ready":
++        return []
++    try:
++        error = helper.communicate(timeout=2)[1].decode(errors="replace").strip()
++    except subprocess.TimeoutExpired:
++        helper.kill()
++        error = ""
++    raise Problem(error.splitlines()[-1] if error else "The files couldn’t be put on the clipboard.")
++
++
++def wl_paste(*args):
++    done = subprocess.run(["wl-paste", "--no-newline", *args], capture_output=True, timeout=3)
++    return done.stdout if done.returncode == 0 else b""
++
++
++def read_clipboard():
++    """The files on the clipboard and whether they were cut: GNOME's form, else the list and KDE's mark."""
++    try:
++        types = wl_paste("--list-types").decode(errors="replace").split()
++    except (OSError, subprocess.SubprocessError):
++        return "", []
++    lines = []
++    op = "copy"
++    if "x-special/gnome-copied-files" in types:
++        lines = wl_paste("--type", "x-special/gnome-copied-files").decode(errors="replace").splitlines()
++        if lines and lines[0] in ("copy", "cut"):
++            op, lines = lines[0], lines[1:]
++    elif "text/uri-list" in types:
++        lines = wl_paste("--type", "text/uri-list").decode(errors="replace").splitlines()
++        if "application/x-kde-cutselection" in types:
++            op = "cut" if wl_paste("--type", "application/x-kde-cutselection").strip() == b"1" else "copy"
++    urls = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
++    urls = [u for u in urls if u.startswith(("file:", "trash:")) or u.startswith("/")]
++    return (op if urls else ""), urls
++
++
++def paste(folder):
++    op, urls = read_clipboard()
++    if not urls:
++        raise Problem("There are no files on the clipboard to paste.")
++    problems = bring("move" if op == "cut" else "copy", folder, urls)
++    if op == "cut":                                       # a cut is used up once pasted, as in Files
++        subprocess.run(["wl-copy", "--clear"], capture_output=True, timeout=5, check=False)
++    return problems
++
++
++# ── Running ──────────────────────────────────────────────────────────────────
++
++def emit(path, **extra):
++    print(json.dumps({"path": str(path), "kind": kind_of(Path(path)), **extra}), flush=True)
++
++
++def message(error):
++    if isinstance(error, Problem):
++        return str(error)
++    if isinstance(error, PermissionError):
++        return f"“{Path(error.filename or '').name or 'That item'}”: you don’t have permission."
++    if isinstance(error, OSError) and error.strerror:
++        name = Path(error.filename).name if error.filename else ""
++        return f"“{name}”: {error.strerror}." if name else f"{error.strerror}."
++    return str(error)
++
++
++def run(action, args):
++    if action == "scan":
++        return scan()
++    if action == "bring" and len(args) >= 3 and args[0] in ("auto", "copy", "move"):
++        return bring(args[0], args[1], args[2:])
++    if action == "trash" and args:
++        return trash(args)
++    if action == "clip" and len(args) >= 2 and args[0] in ("copy", "cut"):
++        return clip(args[0], args[1:])
++    if action == "clipboard" and not args:
++        op, urls = read_clipboard()
++        paths = []
++        for url in urls:
++            try:
++                paths.append(str(local_path(url)))
++            except (Problem, ValueError):
++                pass
++        print(json.dumps({"op": op, "urls": urls, "paths": paths}))
++        return []
++    if action == "paste" and len(args) == 1:
++        return paste(args[0])
++    if action == "restore" and args:
++        return restore(args)
++    if action == "empty-trash" and not args:
++        return empty_trash()
++    if action == "thumbnails" and args:
++        return thumbnails(args)
++    if action == "trust" and len(args) == 1:
++        return trust(args[0])
++    if action == "trash-state" and not args:
++        print(json.dumps({"count": trash_count()}))
++        return []
++    if action == "move" and len(args) == 2:
++        return move(args[0], args[1])
++    if action == "rename" and len(args) == 2:
++        return rename(args[0], args[1])
++    if action == "mkdir" and 1 <= len(args) <= 2:
++        return make_folder(args[0], args[1] if len(args) == 2 else None)
++    if action == "open" and len(args) >= 2:
++        return open_with(args[0], args[1:])
++    if action == "migrate" and len(args) == 1:
++        return migrate(json.loads(args[0]))
++    raise Problem("That isn’t possible here.")
++
++
++def main(argv):
++    action = argv[1] if len(argv) > 1 else ""
++    try:
++        problems = run(action, argv[2:])
++    except (OSError, Problem, ValueError, shutil.Error, subprocess.CalledProcessError) as error:
++        problems = [message(error)]
++    if not problems:
++        return 0
++    text = "\n".join(problems)
++    print(text, file=sys.stderr)
++    if os.environ.get("HP_SNAP_QUIET") != "1":
++        subprocess.run(["notify-send", "-a", "Files", "-i", "dialog-warning",
++                        TITLES.get(action, "Something went wrong"), text], check=False)
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/scripts/hp-snap/desktop_folder.py b/scripts/hp-snap/desktop_folder.py
+deleted file mode 100755
+index cefd4af..0000000
+--- a/scripts/hp-snap/desktop_folder.py
++++ /dev/null
+@@ -1,192 +0,0 @@
+-#!/usr/bin/env python3
+-"""hp-snap: the desktop shows the Desktop folder (like Windows and macOS).
+-
+-  desktop_folder.py scan              JSON: the Desktop folder's entries with a label and an icon
+-  desktop_folder.py migrate <json>    turn the old managed desktop icons into files in the Desktop
+-                                      folder (launchers, folder shortcuts, web links) and print
+-                                      {itemId: path}. Only ever creates new files; never deletes,
+-                                      moves or overwrites anything.
+-"""
+-import configparser, json, os, shutil, subprocess, sys
+-
+-HOME = os.path.expanduser("~")
+-
+-
+-def desktop_dir():
+-    if os.environ.get("HP_SNAP_DESKTOP_DIR"):            # the nested test window uses a copy
+-        return os.environ["HP_SNAP_DESKTOP_DIR"]
+-    try:
+-        out = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True, timeout=5).stdout.strip()
+-    except Exception:
+-        out = ""
+-    return out if out and out != HOME else os.path.join(HOME, "Desktop")
+-
+-
+-def read_entry(path):
+-    parser = configparser.ConfigParser(interpolation=None, strict=False)
+-    parser.optionxform = str
+-    try:
+-        parser.read(path, encoding="utf-8")
+-        return dict(parser["Desktop Entry"]) if "Desktop Entry" in parser else {}
+-    except Exception:
+-        return {}
+-
+-
+-def gio_icons(paths):
+-    """The most generic, non-symbolic theme icon gio knows for each file (image-x-generic, ...)."""
+-    icons = {}
+-    if not paths:
+-        return icons
+-    try:
+-        out = subprocess.run(["gio", "info", "-a", "standard::icon"] + paths, capture_output=True, text=True, timeout=20).stdout
+-    except Exception:
+-        return icons
+-    current = None
+-    for line in out.splitlines():
+-        if line.startswith("uri: ") or line.startswith("display name: "):
+-            continue
+-        if not line.startswith(" ") and line.strip():
+-            current = None
+-        if line.strip().startswith("standard::icon:") and current is None:
+-            names = [n.strip() for n in line.split(":", 2)[2].split(",") if n.strip() and not n.strip().endswith("-symbolic")]
+-            icons[len(icons)] = names[-1] if names else "text-x-generic"
+-    return {paths[i]: icons.get(i, "text-x-generic") for i in range(len(paths))}
+-
+-
+-def scan():
+-    folder = desktop_dir()
+-    entries, plain = [], []
+-    try:
+-        names = sorted(os.listdir(folder), key=str.lower)
+-    except FileNotFoundError:
+-        names = []
+-    for name in names:
+-        if name.startswith("."):
+-            continue
+-        path = os.path.join(folder, name)
+-        if not os.path.lexists(path):
+-            continue
+-        entry = {"path": path, "name": name, "symlink": os.path.islink(path)}
+-        if name.endswith(".desktop") and os.path.isfile(path):
+-            fields = read_entry(path)
+-            entry.update(kind="file", launcher=True, label=fields.get("Name") or name[:-8], icon=fields.get("Icon", "application-x-executable"))
+-            if fields.get("Type") == "Link" and fields.get("URL"):
+-                entry.update(link=fields["URL"], icon=fields.get("Icon", "text-html"))
+-        elif os.path.isdir(path):
+-            entry.update(kind="folder", launcher=False, label=name, icon="system-file-manager")
+-        else:
+-            entry.update(kind="file", launcher=False, label=name, icon="")
+-            plain.append(path)
+-        entries.append(entry)
+-    icons = gio_icons(plain)
+-    for entry in entries:
+-        if entry["icon"] == "":
+-            entry["icon"] = icons.get(entry["path"], "text-x-generic")
+-    print(json.dumps({"folder": folder, "entries": entries}))
+-
+-
+-def app_desktop_file(app_id):
+-    dirs = [os.path.join(HOME, ".local/share")] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+-    stem = app_id[:-8] if app_id.endswith(".desktop") else app_id
+-    for base in dirs:
+-        candidate = os.path.join(base, "applications", stem + ".desktop")
+-        if os.path.isfile(candidate):
+-            return candidate
+-    return None
+-
+-
+-def free_name(folder, stem, suffix):
+-    safe = stem.replace("/", "-").strip() or "Item"
+-    name = safe + suffix
+-    n = 2
+-    while os.path.lexists(os.path.join(folder, name)):
+-        name = f"{safe} ({n}){suffix}"
+-        n += 1
+-    return os.path.join(folder, name)
+-
+-
+-def migrate(items):
+-    folder = desktop_dir()
+-    os.makedirs(folder, exist_ok=True)
+-    existing = {}
+-    for name in os.listdir(folder):
+-        if name.endswith(".desktop"):
+-            existing[(read_entry(os.path.join(folder, name)).get("Name") or "").lower()] = os.path.join(folder, name)
+-    mapping = {}
+-    for item_id, item in items.items():
+-        kind, target, label = item.get("kind"), str(item.get("target", "")), str(item.get("label") or "")
+-        if item.get("desktopFile") or target in ("hp-os-trash",):
+-            continue
+-        path = None
+-        if kind == "application":
+-            if label.lower() in existing:                       # already a launcher in the folder
+-                path = existing[label.lower()]
+-            else:
+-                source = app_desktop_file(target)
+-                path = free_name(folder, label or target, ".desktop")
+-                if source:
+-                    shutil.copyfile(source, path)
+-                else:
+-                    with open(path, "w") as f:
+-                        f.write(f"[Desktop Entry]\nType=Application\nName={label}\nExec=gtk-launch {target}\nIcon={item.get('icon') or 'application-x-executable'}\n")
+-                os.chmod(path, 0o755)
+-        elif kind == "folder" or (kind == "file" and target.startswith("file://")):
+-            real = target[7:] if target.startswith("file://") else target
+-            if os.path.dirname(os.path.abspath(real)) == folder:
+-                path = real                                       # already in the folder
+-            else:
+-                path = free_name(folder, label or os.path.basename(real), "")
+-                os.symlink(real, path)
+-        elif kind == "url":
+-            path = free_name(folder, label or "Link", ".desktop")
+-            with open(path, "w") as f:
+-                f.write(f"[Desktop Entry]\nType=Link\nName={label}\nURL={target}\nIcon=text-html\n")
+-            os.chmod(path, 0o755)
+-        if path:
+-            mapping[item_id] = path
+-    print(json.dumps(mapping))
+-
+-
+-def copy_in(source):
+-    """Copy a dropped file or folder into the Desktop folder (never overwriting); print its new path."""
+-    folder = desktop_dir()
+-    source = os.path.abspath(source)
+-    if os.path.dirname(source) == folder:
+-        print(source)
+-        return
+-    stem, suffix = os.path.splitext(os.path.basename(source.rstrip("/")))
+-    if os.path.isdir(source):
+-        stem, suffix = os.path.basename(source.rstrip("/")), ""
+-    dest = free_name(folder, stem, suffix)
+-    if os.path.isdir(source):
+-        shutil.copytree(source, dest, symlinks=True)
+-    else:
+-        shutil.copy2(source, dest)
+-    print(dest)
+-
+-
+-def new_folder():
+-    """Make an empty folder on the desktop ("New Folder", "New Folder (2)", ...); print its path."""
+-    folder = desktop_dir()
+-    os.makedirs(folder, exist_ok=True)
+-    while True:
+-        path = free_name(folder, "New Folder", "")
+-        try:
+-            os.mkdir(path)
+-            break
+-        except FileExistsError:
+-            continue
+-    print(path)
+-
+-
+-if __name__ == "__main__":
+-    if len(sys.argv) >= 2 and sys.argv[1] == "scan":
+-        scan()
+-    elif len(sys.argv) >= 2 and sys.argv[1] == "new-folder":
+-        new_folder()
+-    elif len(sys.argv) >= 3 and sys.argv[1] == "copy-in":
+-        copy_in(sys.argv[2])
+-    elif len(sys.argv) >= 3 and sys.argv[1] == "migrate":
+-        migrate(json.loads(sys.argv[2]))
+-    else:
+-        sys.exit(__doc__)
+diff --git a/scripts/hp-snap/folder_drop.py b/scripts/hp-snap/folder_drop.py
+deleted file mode 100644
+index dc64343..0000000
+--- a/scripts/hp-snap/folder_drop.py
++++ /dev/null
+@@ -1,187 +0,0 @@
+-"""Where a dragged file lands, decided the way macOS decides it.
+-
+-  folder_drop.py auto FOLDER URL...   move within the same drive, copy to another drive
+-  folder_drop.py copy FOLDER URL...   always copy
+-  folder_drop.py trash URL...         put in the Trash
+-  folder_drop.py open APP URL...      open with the app (a desktop file id)
+-
+-auto and copy print one JSON line {"path", "kind"} for each item, wherever it ended up. Nothing is ever
+-overwritten: a name already taken gets a number, as in "Report 2.pdf".
+-"""
+-import ctypes
+-import json
+-import os
+-from pathlib import Path
+-import shutil
+-import subprocess
+-import sys
+-from tempfile import TemporaryDirectory
+-from urllib.parse import unquote, urlsplit
+-
+-AT_FDCWD = -100
+-RENAME_NOREPLACE = 1
+-LIBC = ctypes.CDLL(None, use_errno=True)
+-
+-
+-def trash_dir():
+-    return Path(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))) / "Trash"
+-
+-
+-def local_path(uri):
+-    url = urlsplit(uri)
+-    if url.scheme == "trash":
+-        # Dragged out of the Trash window: trash:/name (Dolphin's home Trash is trash:/0-name).
+-        name = unquote(url.path, errors="strict").lstrip("/")
+-        if "/" in name:
+-            raise ValueError("Drag the whole item out of the Trash.")
+-        if name.startswith("0-") and not os.path.lexists(trash_dir() / "files" / name):
+-            name = name[2:]
+-        return trash_dir() / "files" / name
+-    if url.scheme != "file" or url.netloc not in ("", "localhost") or not url.path.startswith("/"):
+-        raise ValueError("Only files on this device can be dropped here.")
+-    return Path(unquote(url.path, errors="strict"))
+-
+-
+-def numbered(folder, name, number):
+-    if number == 1:
+-        return folder / name
+-    path = Path(name)
+-    stem, suffix = (name, "") if name.startswith(".") and path.suffix == "" else (path.stem, path.suffix)
+-    return folder / f"{stem} {number}{suffix}"
+-
+-
+-def rename_new(source, dest):
+-    """Renames only if dest doesn't exist. Returns False when the name is taken."""
+-    done = LIBC.renameat2(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(dest), RENAME_NOREPLACE)
+-    if done == 0:
+-        return True
+-    error = ctypes.get_errno()
+-    if error == 17:  # EEXIST
+-        return False
+-    if error in (22, 38):  # This filesystem can't promise it, so look first.
+-        if os.path.lexists(dest):
+-            return False
+-        os.rename(source, dest)
+-        return True
+-    raise OSError(error, os.strerror(error), str(source))
+-
+-
+-def put(source, folder, name):
+-    number = 1
+-    while not rename_new(source, numbered(folder, name, number)):
+-        number += 1
+-    return numbered(folder, name, number)
+-
+-
+-def copy_item(source, staged):
+-    if source.is_dir() and not source.is_symlink():
+-        shutil.copytree(source, staged, symlinks=True)
+-    else:
+-        shutil.copy2(source, staged, follow_symlinks=False)
+-
+-
+-def trashed(source):
+-    """The Trash's record of source when source is an item in the Trash, else None."""
+-    files = trash_dir() / "files"
+-    if source.parent.resolve() != files.resolve():
+-        return None
+-    return trash_dir() / "info" / (source.name + ".trashinfo")
+-
+-
+-def original_name(info, fallback):
+-    try:
+-        for line in info.read_text(errors="replace").splitlines():
+-            if line.startswith("Path="):
+-                return Path(unquote(line[5:])).name or fallback
+-    except OSError:
+-        pass
+-    return fallback
+-
+-
+-def out_of_trash(source, folder, info):
+-    """Takes an item out of the Trash into folder, under the name it had before it was trashed."""
+-    name = original_name(info, source.name)
+-    if os.lstat(source).st_dev == os.stat(folder).st_dev:
+-        dest = put(source, folder, name)
+-    else:
+-        with TemporaryDirectory(prefix=".hp-os-copy-", dir=folder) as staging:
+-            staged = Path(staging) / "item"
+-            copy_item(source, staged)
+-            dest = put(staged, folder, name)
+-        if source.is_dir() and not source.is_symlink():
+-            shutil.rmtree(source)
+-        else:
+-            source.unlink()
+-    info.unlink(missing_ok=True)
+-    return dest
+-
+-
+-def transfer(action, folder, url):
+-    source = local_path(url)
+-    if not os.path.lexists(source) or not source.name:
+-        raise ValueError(f"{source.name or source} is no longer available.")
+-    info = trashed(source)
+-    if info is not None:
+-        return out_of_trash(source, folder, info)
+-    real_dir = source.is_dir() and not source.is_symlink()
+-    if source.parent.resolve() == folder and action == "auto":
+-        return source
+-    if real_dir and folder.is_relative_to(source.resolve()):
+-        raise ValueError(f"{source.name} can't be put inside itself.")
+-    if action == "auto" and os.lstat(source).st_dev == os.stat(folder).st_dev:
+-        return put(source, folder, source.name)
+-    # Hidden until complete, so a half-copied file never shows up.
+-    with TemporaryDirectory(prefix=".hp-os-copy-", dir=folder) as staging:
+-        staged = Path(staging) / "item"
+-        copy_item(source, staged)
+-        return put(staged, folder, source.name)
+-
+-
+-def bring(action, folder, urls):
+-    folder = Path(folder).resolve(strict=True)
+-    if not folder.is_dir():
+-        raise ValueError("That folder is no longer available.")
+-    errors = []
+-    for url in urls:
+-        try:
+-            path = transfer(action, folder, url)
+-        except (OSError, ValueError, shutil.Error) as error:
+-            errors.append(str(error))
+-            continue
+-        kind = "folder" if path.is_dir() and not path.is_symlink() else "file"
+-        print(json.dumps({"path": str(path), "kind": kind}), flush=True)
+-    if errors:
+-        raise ValueError("\n".join(errors))
+-
+-
+-def desktop_file(app):
+-    home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+-    stem = app[:-8] if app.endswith(".desktop") else app
+-    for base in [home] + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+-        candidate = Path(base) / "applications" / (stem + ".desktop")
+-        if candidate.is_file():
+-            return candidate
+-    raise ValueError(f"{stem} is no longer installed.")
+-
+-
+-def main(action, args):
+-    if action in ("auto", "copy") and len(args) > 1:
+-        bring(action, args[0], args[1:])
+-    elif action == "trash" and args:
+-        subprocess.run(["gio", "trash", "--"] + [str(local_path(url)) for url in args], check=True)
+-    elif action == "open" and len(args) > 1:
+-        app = desktop_file(args[0])
+-        urls = args[1:]
+-        if "inode/directory" in app.read_text(errors="replace"):  # Files shows the folder a file is in.
+-            urls = [path.as_uri() if path.is_dir() else path.parent.as_uri() for path in map(local_path, urls)]
+-        subprocess.run(["gio", "launch", str(app)] + list(dict.fromkeys(urls)), check=True)
+-    else:
+-        raise ValueError("That drop isn't possible.")
+-
+-
+-if __name__ == "__main__":
+-    try:
+-        main(sys.argv[1], sys.argv[2:])
+-    except (IndexError, OSError, ValueError, subprocess.CalledProcessError) as error:
+-        subprocess.run(["notify-send", "Couldn’t move that item", str(error)], check=False)
+-        sys.exit(1)
+diff --git a/scripts/hp-snap/test_desktop_files.py b/scripts/hp-snap/test_desktop_files.py
+new file mode 100644
+index 0000000..a57f9bd
+--- /dev/null
++++ b/scripts/hp-snap/test_desktop_files.py
+@@ -0,0 +1,456 @@
++"""Tests for desktop_files.py (python3 -m unittest test_desktop_files, from this folder)."""
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++import contextlib
++import sys
++import tempfile
++import unittest
++import zlib
++
++os.environ["HP_SNAP_QUIET"] = "1"
++spec = importlib.util.spec_from_file_location("desktop_files", Path(__file__).with_name("desktop_files.py"))
++files = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(files)
++
++
++def run(*args):
++    out, err = io.StringIO(), io.StringIO()
++    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++        status = files.main(["desktop_files.py", *map(str, args)])
++    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{\"path\"")]
++    return status, lines, err.getvalue()
++
++
++class DesktopFilesTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.desk = self.root / "Desktop"
++        self.desk.mkdir()
++        self.docs = self.root / "Documents"
++        self.docs.mkdir()
++        os.environ["HP_SNAP_DESKTOP_DIR"] = str(self.desk)
++        os.environ["XDG_DATA_HOME"] = str(self.root / "data")
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_move_keeps_both_when_name_is_taken(self):
++        (self.desk / "Report.pdf").write_text("old")
++        (self.docs / "Report.pdf").write_text("new")
++        status, lines, _ = run("bring", "auto", self.desk, (self.docs / "Report.pdf").as_uri())
++        self.assertEqual(status, 0)
++        self.assertEqual([(l["path"], l["kind"]) for l in lines], [(str(self.desk / "Report (1).pdf"), "file")])
++        self.assertEqual((self.desk / "Report.pdf").read_text(), "old")
++        self.assertFalse((self.docs / "Report.pdf").exists())  # moved, same drive
++
++    def test_names_with_spaces_percent_hash_and_unicode(self):
++        name = "50% off #1 – Ünïcødé.txt"
++        (self.docs / name).write_text("x")
++        status, lines, _ = run("bring", "auto", self.desk, (self.docs / name).as_uri())
++        self.assertEqual(status, 0)
++        self.assertEqual(lines[0]["path"], str(self.desk / name))
++
++    def test_copy_leaves_the_original(self):
++        (self.docs / "a.txt").write_text("x")
++        status, lines, _ = run("bring", "copy", self.desk, (self.docs / "a.txt").as_uri())
++        self.assertEqual(status, 0)
++        self.assertTrue((self.docs / "a.txt").exists() and (self.desk / "a.txt").exists())
++        self.assertEqual([p.name for p in self.desk.iterdir()], ["a.txt"])  # no staging left behind
++
++    def test_folder_numbering_keeps_its_whole_name(self):
++        (self.desk / "photos.2024").mkdir()
++        (self.docs / "photos.2024").mkdir()
++        status, lines, _ = run("bring", "auto", self.desk, (self.docs / "photos.2024").as_uri())
++        self.assertEqual((lines[0]["path"], lines[0]["kind"]), (str(self.desk / "photos.2024 (1)"), "folder"))
++
++    def test_folder_into_itself_is_refused(self):
++        inner = self.docs / "inner"
++        inner.mkdir()
++        status, lines, err = run("bring", "auto", inner, self.docs.as_uri())
++        self.assertEqual((status, lines), (1, []))
++        self.assertIn("inside itself", err)
++
++    def test_unknown_folder_is_refused_not_guessed(self):
++        (self.docs / "a.txt").write_text("x")
++        status, lines, err = run("bring", "auto", "", (self.docs / "a.txt").as_uri())
++        self.assertEqual((status, lines), (1, []))
++        self.assertIn("isn’t known yet", err)
++        self.assertTrue((self.docs / "a.txt").exists())
++
++    def test_network_items_get_a_clear_message(self):
++        status, lines, err = run("bring", "auto", self.desk, "smb://server/share/file.txt")
++        self.assertEqual(status, 1)
++        self.assertIn("Only files on this device", err)
++
++    def test_partial_success_reports_both(self):
++        (self.docs / "a.txt").write_text("x")
++        status, lines, err = run("bring", "auto", self.desk, (self.docs / "a.txt").as_uri(),
++                                 (self.docs / "gone.txt").as_uri())
++        self.assertEqual(status, 1)
++        self.assertEqual([l["path"] for l in lines], [str(self.desk / "a.txt")])
++        self.assertIn("gone.txt", err)
++
++    def test_out_of_trash_gets_its_old_name(self):
++        trash = self.root / "data/Trash"
++        (trash / "files").mkdir(parents=True)
++        (trash / "info").mkdir()
++        (trash / "files/notes.2.txt").write_text("x")
++        (trash / "info/notes.2.txt.trashinfo").write_text("[Trash Info]\nPath=/home/u/notes.txt\nDeletionDate=2026-01-01T00:00:00\n")
++        status, lines, _ = run("bring", "auto", self.desk, "trash:/notes.2.txt")
++        self.assertEqual(lines[0]["path"], str(self.desk / "notes.txt"))
++        self.assertFalse((trash / "info/notes.2.txt.trashinfo").exists())
++
++    def test_rename_refuses_a_taken_name(self):
++        (self.desk / "a.txt").write_text("a")
++        (self.desk / "b.txt").write_text("b")
++        status, lines, err = run("rename", self.desk / "a.txt", "b.txt")
++        self.assertEqual((status, lines), (1, []))
++        self.assertIn("already an item named “b.txt”", err)
++        self.assertEqual((self.desk / "b.txt").read_text(), "b")
++        self.assertTrue((self.desk / "a.txt").exists())
++
++    def test_rename_and_bad_names(self):
++        (self.desk / "a.txt").write_text("a")
++        status, lines, _ = run("rename", self.desk / "a.txt", "  Notes.txt ")
++        self.assertEqual(lines, [{"path": str(self.desk / "Notes.txt"), "kind": "file"}])
++        for bad in ("", "x/y", ".."):
++            self.assertEqual(run("rename", self.desk / "Notes.txt", bad)[0], 1)
++        self.assertTrue((self.desk / "Notes.txt").exists())
++
++    def test_new_folder_names(self):
++        self.assertEqual(run("mkdir", self.desk)[1][0]["path"], str(self.desk / "New Folder"))
++        self.assertEqual(run("mkdir", self.desk)[1][0]["path"], str(self.desk / "New Folder (1)"))
++
++    def test_scan_icons_follow_their_files_past_a_broken_link(self):
++        (self.desk / "a-broken").symlink_to(self.root / "nowhere")
++        (self.desk / "b.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
++        (self.desk / "c.txt").write_text("hello")
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            files.scan()
++        result = json.loads(out.getvalue())
++        icons = {Path(e["path"]).name: e["icon"] for e in result["entries"]}
++        self.assertEqual(set(icons), {"a-broken", "b.png", "c.txt"})
++        self.assertIn("image", icons["b.png"])
++        self.assertIn("text", icons["c.txt"])
++
++    def test_scan_makes_a_missing_desktop_folder(self):
++        os.rmdir(self.desk)
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            files.scan()
++        self.assertTrue(self.desk.is_dir())
++        self.assertEqual(json.loads(out.getvalue())["entries"], [])
++
++    def run_all(self, *args):
++        out, err = io.StringIO(), io.StringIO()
++        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++            status = files.main(["desktop_files.py", *map(str, args)])
++        return status, [json.loads(l) for l in out.getvalue().splitlines() if l.startswith("{")], err.getvalue()
++
++    def test_trash_names_its_record_and_restore_puts_it_back(self):
++        os.environ["XDG_DATA_HOME"] = str(self.root / "data")
++        os.environ["HOME"] = str(self.root)
++        note = self.desk / "50% note #1.txt"
++        note.write_text("keep me")
++        status, lines, err = self.run_all("trash", note)
++        self.assertEqual(status, 0, err)
++        self.assertFalse(note.exists())
++        self.assertTrue(lines[0]["info"].endswith(".trashinfo"), lines)
++        self.assertTrue(Path(lines[0]["trashed"]).exists())
++        self.assertEqual(self.run_all("trash-state")[1][0]["count"], 1)
++        status, lines2, err = self.run_all("restore", lines[0]["info"])
++        self.assertEqual(status, 0, err)
++        self.assertEqual(lines2[0]["path"], str(note))
++        self.assertEqual(note.read_text(), "keep me")
++        self.assertFalse(Path(lines[0]["info"]).exists())
++        self.assertEqual(self.run_all("trash-state")[1][0]["count"], 0)
++
++    def test_restore_beside_a_new_file_of_the_same_name(self):
++        os.environ["XDG_DATA_HOME"] = str(self.root / "data")
++        os.environ["HOME"] = str(self.root)
++        (self.desk / "a.txt").write_text("old")
++        _, lines, _ = self.run_all("trash", self.desk / "a.txt")
++        (self.desk / "a.txt").write_text("new")
++        _, back, _ = self.run_all("restore", lines[0]["info"])
++        self.assertEqual(back[0]["path"], str(self.desk / "a (1).txt"))
++        self.assertEqual((self.desk / "a.txt").read_text(), "new")
++
++    def test_bring_says_where_from_and_move_undoes_it(self):
++        (self.docs / "r.pdf").write_text("x")
++        _, lines, _ = self.run_all("bring", "auto", self.desk, (self.docs / "r.pdf").as_uri())
++        self.assertEqual(lines[0]["from"], str(self.docs / "r.pdf"))
++        self.assertTrue(lines[0]["moved"])
++        _, back, _ = self.run_all("move", lines[0]["path"], lines[0]["from"])
++        self.assertEqual(back[0]["path"], str(self.docs / "r.pdf"))
++        self.assertFalse((self.desk / "r.pdf").exists())
++
++    def test_copy_is_not_reported_as_moved(self):
++        (self.docs / "c.txt").write_text("x")
++        _, lines, _ = self.run_all("bring", "copy", self.desk, (self.docs / "c.txt").as_uri())
++        self.assertFalse(lines[0]["moved"])
++
++    def test_empty_trash_removes_everything_without_following_links(self):
++        os.environ["XDG_DATA_HOME"] = str(self.root / "data")
++        trash = self.root / "data/Trash"
++        (trash / "files/folder/sub").mkdir(parents=True)
++        (trash / "info").mkdir()
++        (trash / "files/folder/sub/locked.txt").write_text("x")
++        os.chmod(trash / "files/folder/sub", 0o500)          # read-only folder in the Trash
++        outside = self.root / "keep-me"
++        outside.mkdir()
++        (outside / "precious.txt").write_text("keep")
++        (trash / "files/link").symlink_to(outside)          # a link out of the Trash
++        (trash / "info/folder.trashinfo").write_text("[Trash Info]\nPath=/x/folder\n")
++        (trash / "directorysizes").write_text("")
++        status, lines, err = self.run_all("empty-trash")
++        self.assertEqual(status, 0, err)
++        self.assertEqual(lines[0]["count"], 0)
++        self.assertEqual(list((trash / "files").iterdir()), [])
++        self.assertEqual(list((trash / "info").iterdir()), [])
++        self.assertFalse((trash / "directorysizes").exists())
++        self.assertEqual((outside / "precious.txt").read_text(), "keep")
++
++    def fake_clipboard(self, types):
++        """A wl-paste/wl-copy pair on PATH serving the given {type: text} clipboard."""
++        tools = self.root / "tools"
++        tools.mkdir(exist_ok=True)
++        for mime, text in types.items():
++            (tools / ("clip-" + mime.replace("/", "_"))).write_text(text)
++        (tools / "types").write_text("\n".join(types) + "\n")
++        (tools / "wl-paste").write_text(
++            "#!/bin/sh\nd=$(dirname \"$0\")\n"
++            "for a; do case $a in --list-types) cat \"$d/types\"; exit 0;; esac; done\n"
++            "t=\"\"; while [ $# -gt 0 ]; do [ \"$1\" = --type ] && t=$2; shift; done\n"
++            "f=\"$d/clip-$(echo \"$t\" | tr / _)\"; [ -f \"$f\" ] && cat \"$f\"\n")
++        (tools / "wl-copy").write_text("#!/bin/sh\necho cleared > \"$(dirname \"$0\")/cleared\"\n")
++        for tool in ("wl-paste", "wl-copy"):
++            (tools / tool).chmod(0o755)
++        self._old_path = os.environ["PATH"]
++        os.environ["PATH"] = f"{tools}:{self._old_path}"
++        self.addCleanup(lambda: os.environ.__setitem__("PATH", self._old_path))
++        return tools
++
++    def test_paste_a_cut_from_files_moves(self):
++        (self.docs / "Plan.txt").write_text("p")
++        tools = self.fake_clipboard({"text/uri-list": (self.docs / "Plan.txt").as_uri() + "\r\n",
++                                     "application/x-kde-cutselection": "1"})
++        status, lines, err = self.run_all("paste", self.desk)
++        self.assertEqual(status, 0, err)
++        self.assertEqual(lines[0]["path"], str(self.desk / "Plan.txt"))
++        self.assertTrue(lines[0]["moved"])
++        self.assertFalse((self.docs / "Plan.txt").exists())
++        self.assertTrue((tools / "cleared").exists())         # a cut is used up
++
++    def test_paste_a_gnome_copy_copies(self):
++        (self.docs / "Notes.txt").write_text("n")
++        self.fake_clipboard({"x-special/gnome-copied-files": "copy\n" + (self.docs / "Notes.txt").as_uri()})
++        status, lines, err = self.run_all("paste", self.desk)
++        self.assertEqual(status, 0, err)
++        self.assertFalse(lines[0]["moved"])
++        self.assertTrue((self.docs / "Notes.txt").exists() and (self.desk / "Notes.txt").exists())
++
++    def test_copy_pasted_where_it_is_makes_a_numbered_copy_and_cut_does_nothing(self):
++        (self.desk / "a.txt").write_text("a")
++        self.fake_clipboard({"x-special/gnome-copied-files": "copy\n" + (self.desk / "a.txt").as_uri()})
++        self.assertEqual(self.run_all("paste", self.desk)[1][0]["path"], str(self.desk / "a (1).txt"))
++        self.assertEqual(self.run_all("paste", self.desk)[1][0]["path"], str(self.desk / "a (2).txt"))
++        self.fake_clipboard({"x-special/gnome-copied-files": "cut\n" + (self.desk / "a.txt").as_uri()})
++        self.assertEqual(self.run_all("paste", self.desk)[1][0]["path"], str(self.desk / "a.txt"))
++        self.assertTrue((self.desk / "a.txt").exists())
++
++    def test_names_are_numbered_as_files_numbers_them(self):
++        folder = Path("/x")
++        names = lambda name, whole=False: [files.numbered(folder, name, n, whole).name for n in (1, 2, 3)]
++        self.assertEqual(names("Guide.pdf"), ["Guide.pdf", "Guide (1).pdf", "Guide (2).pdf"])
++        self.assertEqual(names("Guide (1).pdf"), ["Guide (1).pdf", "Guide (2).pdf", "Guide (3).pdf"])
++        self.assertEqual(names("New Folder", True), ["New Folder", "New Folder (1)", "New Folder (2)"])
++        self.assertEqual(names("my.stuff", True)[1], "my.stuff (1)")
++        self.assertEqual(names("archive.tar.gz")[1], "archive (1).tar.gz")
++        self.assertEqual(names(".bashrc")[1], ".bashrc (1)")
++
++    def fake_helper(self, script):
++        helper = self.root / "helper"
++        helper.write_text("#!/bin/sh\n" + script)
++        helper.chmod(0o755)
++        old = os.environ.get("HP_SNAP_FILE_CLIPBOARD")
++        os.environ["HP_SNAP_FILE_CLIPBOARD"] = str(helper)
++        runtime = self.root / "runtime"                      # no systemd here: the helper is started directly
++        runtime.mkdir(exist_ok=True)
++        old_runtime = os.environ.get("XDG_RUNTIME_DIR")
++        os.environ["XDG_RUNTIME_DIR"] = str(runtime)
++
++        def restore():
++            for name, value in (("HP_SNAP_FILE_CLIPBOARD", old), ("XDG_RUNTIME_DIR", old_runtime)):
++                if value is None:
++                    os.environ.pop(name, None)
++                else:
++                    os.environ[name] = value
++        self.addCleanup(restore)
++        return helper
++
++    def test_clip_returns_once_the_helper_is_ready_and_leaves_it_running(self):
++        (self.desk / "a.txt").write_text("a")
++        marker = self.root / "args"
++        pidfile = self.root / "pid"
++        self.fake_helper(f'echo "$@" > "{marker}"; echo $$ > "{pidfile}"; echo ready; exec sleep 30\n')
++        status, _, err = self.run_all("clip", "cut", self.desk / "a.txt")
++        self.assertEqual(status, 0, err)
++        self.assertEqual(marker.read_text().strip(), f"cut {self.desk / 'a.txt'}")
++        pid = int(pidfile.read_text())
++        self.assertTrue(Path(f"/proc/{pid}").exists())       # still holding the clipboard
++        os.kill(pid, 15)
++
++    def test_clip_reports_why_the_helper_failed(self):
++        (self.desk / "a.txt").write_text("a")
++        self.fake_helper('echo "This desktop doesn\'t offer the clipboard." >&2; exit 1\n')
++        status, _, err = self.run_all("clip", "copy", self.desk / "a.txt")
++        self.assertEqual(status, 1)
++        self.assertIn("doesn't offer the clipboard", err)
++
++    def test_clipboard_state_names_the_paths(self):
++        (self.docs / "Plan.txt").write_text("p")
++        self.fake_clipboard({"x-special/gnome-copied-files": "cut\n" + (self.docs / "Plan.txt").as_uri()})
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            self.assertEqual(files.main(["desktop_files.py", "clipboard"]), 0)
++        state = json.loads(out.getvalue())
++        self.assertEqual((state["op"], state["paths"]), ("cut", [str(self.docs / "Plan.txt")]))
++
++    def fake_thumbnailer(self, script):
++        """A thumbnailer for text files (run as python3 SCRIPT %i %o %s) in its own data folder."""
++        data = self.root / "thumbdata"
++        (data / "thumbnailers").mkdir(parents=True, exist_ok=True)
++        program = self.root / "thumbnailer.py"
++        program.write_text(script)
++        (data / "thumbnailers" / "fake.thumbnailer").write_text(
++            "[Thumbnailer Entry]\nTryExec=" + sys.executable + "\nExec=" + sys.executable
++            + " " + str(program) + " %i %o %s\nMimeType=text/plain;\n")
++        saved = {name: os.environ.get(name) for name in ("XDG_DATA_DIRS", "XDG_CACHE_HOME")}
++        os.environ["XDG_DATA_DIRS"] = str(data)
++        os.environ["XDG_CACHE_HOME"] = str(self.root / "cache")
++
++        def restore():
++            for name, value in saved.items():
++                if value is None:
++                    os.environ.pop(name, None)
++                else:
++                    os.environ[name] = value
++        self.addCleanup(restore)
++
++    def scan_entry(self, name):
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            files.main(["desktop_files.py", "scan"])
++        return next(e for e in json.loads(out.getvalue())["entries"] if e["name"] == name)
++
++    def test_file_uris_are_written_as_glib_writes_them(self):
++        self.assertEqual(files.file_uri("/home/x/Guide (1) & a+b;c é.pdf"),
++                         "file:///home/x/Guide%20(1)%20&%20a+b%3Bc%20%C3%A9.pdf")
++        self.assertEqual(files.file_uri("/a/It's [x] #1 50%.txt"), "file:///a/It's%20%5Bx%5D%20%231%2050%25.txt")
++
++    def test_png_text_reads_plain_and_compressed_text(self):
++        png = files.with_text(files.blank_png(), {"Thumb::URI": "file:///a", "Thumb::MTime": "5"})
++        ztxt = files.png_chunk(b"zTXt", b"Software\0\0" + zlib.compress(b"Files"))
++        png = png[:33] + ztxt + png[33:]                    # after the 8-byte signature and 25-byte IHDR
++        path = self.root / "t.png"
++        path.write_bytes(png)
++        self.assertEqual(files.png_text(path), {"Thumb::URI": "file:///a", "Thumb::MTime": "5", "Software": "Files"})
++        (self.root / "not.png").write_text("x")
++        self.assertIsNone(files.png_text(self.root / "not.png"))
++
++    def test_a_missing_thumbnail_is_made_once_and_then_found_by_the_scan(self):
++        self.fake_thumbnailer(
++            "import sys, importlib.util\n"
++            "s = importlib.util.spec_from_file_location('d', " + repr(str(Path(files.__file__))) + ")\n"
++            "d = importlib.util.module_from_spec(s); s.loader.exec_module(d)\n"
++            "open(sys.argv[2], 'wb').write(d.blank_png())\n"
++            "open(sys.argv[2] + '.size', 'w').write(sys.argv[3])\n")
++        note = self.desk / "note.txt"
++        note.write_text("hello")
++        entry = self.scan_entry("note.txt")
++        self.assertEqual((entry.get("needsThumb"), entry.get("mime")), (True, "text/plain"))
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            self.assertEqual(files.main(["desktop_files.py", "thumbnails", str(note)]), 0)
++        made = json.loads(out.getvalue())
++        self.assertTrue(made["thumb"].startswith(str(self.root / "cache/thumbnails/large/")))
++        text = files.png_text(made["thumb"])
++        self.assertEqual(text["Thumb::URI"], files.file_uri(note))
++        self.assertEqual(text["Thumb::MTime"], str(int(note.stat().st_mtime)))
++        self.assertEqual(Path(made["thumb"]).stat().st_mode & 0o777, 0o600)
++        entry = self.scan_entry("note.txt")
++        self.assertEqual((entry.get("thumb"), entry.get("needsThumb")), (made["thumb"], None))
++        os.utime(note, (1, 1))                               # changed: the thumbnail is old now
++        self.assertTrue(self.scan_entry("note.txt").get("needsThumb"))
++
++    def test_a_thumbnail_that_cannot_be_made_is_not_tried_again(self):
++        self.fake_thumbnailer("import sys\nsys.exit(1)\n")
++        note = self.desk / "note.txt"
++        note.write_text("hello")
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            files.main(["desktop_files.py", "thumbnails", str(note)])
++        self.assertEqual(json.loads(out.getvalue())["thumb"], "")
++        self.assertNotIn("needsThumb", self.scan_entry("note.txt"))
++        self.assertEqual(list((self.root / "cache/thumbnails/large").iterdir()), [])   # no half-made file left
++
++    def test_the_next_thumbnailer_is_tried_when_one_fails(self):
++        self.fake_thumbnailer(
++            "import sys, importlib.util\n"
++            "s = importlib.util.spec_from_file_location('d', " + repr(str(Path(files.__file__))) + ")\n"
++            "d = importlib.util.module_from_spec(s); s.loader.exec_module(d)\n"
++            "open(sys.argv[2], 'wb').write(d.blank_png())\n")
++        data = Path(os.environ["XDG_DATA_DIRS"])
++        broken = self.root / "broken"
++        (broken / "thumbnailers").mkdir(parents=True)
++        (broken / "thumbnailers" / "broken.thumbnailer").write_text(
++            "[Thumbnailer Entry]\nExec=" + sys.executable + " -c 'raise SystemExit(1)' %i %o\nMimeType=text/plain;\n")
++        os.environ["XDG_DATA_DIRS"] = f"{broken}:{data}"
++        self.assertEqual(len(files.thumbnailers()["text/plain"]), 2)
++        note = self.desk / "note.txt"
++        note.write_text("hello")
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            files.main(["desktop_files.py", "thumbnails", str(note)])
++        self.assertTrue(json.loads(out.getvalue())["thumb"])
++
++    def test_a_picture_without_a_thumbnailer_is_drawn_from_itself(self):
++        self.fake_thumbnailer("import sys\nsys.exit(1)\n")
++        state = files.thumbnail_state(str(self.desk / "missing.png"), "image/png", {})
++        self.assertEqual(state, {})
++        picture = self.desk / "p.png"
++        picture.write_bytes(files.blank_png())
++        state = files.thumbnail_state(str(picture), "image/png", {})
++        self.assertEqual(state, {"preview": True, "stamp": str(int(picture.stat().st_mtime))})
++        self.assertEqual(files.thumbnail_state(str(picture), "application/pdf", {}), {})
++
++    def test_launchers_are_trusted_only_when_executable(self):
++        (self.desk / "Mine.desktop").write_text("[Desktop Entry]\nType=Application\nName=Mine\nExec=true\n")
++        (self.desk / "Mine.desktop").chmod(0o755)
++        (self.desk / "Downloaded.desktop").write_text("[Desktop Entry]\nType=Application\nName=Got\nExec=true\n")
++        (self.desk / "Downloaded.desktop").chmod(0o644)
++        self.assertTrue(self.scan_entry("Mine.desktop")["trusted"])
++        self.assertFalse(self.scan_entry("Downloaded.desktop")["trusted"])
++        status, _, err = self.run_all("trust", self.desk / "Downloaded.desktop")
++        self.assertEqual(status, 0, err)
++        self.assertEqual((self.desk / "Downloaded.desktop").stat().st_mode & 0o777, 0o755)
++        self.assertTrue(self.scan_entry("Downloaded.desktop")["trusted"])
++        (self.desk / "a.txt").write_text("a")
++        status, _, err = self.run_all("trust", self.desk / "a.txt")
++        self.assertEqual(status, 1)
++        self.assertIn("Only a launcher", err)
++
++    def test_paste_with_no_files_says_so(self):
++        self.fake_clipboard({"text/plain": "just words"})
++        status, lines, err = self.run_all("paste", self.desk)
++        self.assertEqual((status, lines), (1, []))
++        self.assertIn("no files on the clipboard", err)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/services/DesktopFolder.qml b/services/DesktopFolder.qml
+index 5b8e4eb..9ebab8b 100644
+--- a/services/DesktopFolder.qml
++++ b/services/DesktopFolder.qml
+@@ -12,10 +12,14 @@ import qs.modules.common
+ // launcher in it is an icon (DesktopItems keeps where each one sits); files added or removed
+ // there appear or go. The older managed icons (apps, folder shortcuts, links) become files in the
+ // folder once, in place. The Trash stays a desktop-only icon, like the Recycle Bin.
++//
++// Every change to files goes through one helper, scripts/hp-snap/desktop_files.py, run here (run()).
++// The desktop changes an icon only after the helper says what happened, and a scan that overlapped
++// a file operation is thrown away and repeated, so icons never jump back or vanish half-way.
+ Singleton {
+     id: root
+ 
+-    readonly property string script: Quickshell.shellPath("scripts/hp-snap/desktop_folder.py")
++    readonly property string script: Quickshell.shellPath("scripts/hp-snap/desktop_files.py")
+     property string folder: ""
+     property var entries: []
+     property bool _scanning: false
+@@ -23,6 +27,41 @@ Singleton {
+     property bool _migrating: false
+     // hp-snap: the icon to start renaming once it is on the desktop (a new folder)
+     property string renameNext: ""
++    // File operations running now, and how many have finished (a scan started before one finished is stale).
++    property int _opsRunning: 0
++    property int _opSerial: 0
++    property int _scanSerial: 0
++    property var _waitingForFolder: []
++    // The icon whose name is being typed: the desktop holds its rescan (which would rebuild the
++    // icons and drop what is being typed) and keeps the keyboard until the name is done.
++    property string editingItem: ""
++    // What is being typed, kept here: the desktop rebuilds its icons on every change, and a
++    // rebuilt icon picks the edit up again (DesktopItemDelegate._applyEdit).
++    property string editingMode: ""
++    property string editingText: ""
++    function endEdit(itemId: string): void {
++        if (root.editingItem !== itemId) return
++        root.editingMode = ""
++        root.editingText = ""
++        root.editingItem = ""
++    }
++    // An icon that went away while its name was being typed (its file removed elsewhere).
++    Connections {
++        target: DesktopItems
++        function onItemsChanged(): void {
++            if (root.editingItem.length > 0 && DesktopItems.items[root.editingItem] === undefined)
++                root.endEdit(root.editingItem)
++        }
++    }
++    // A new folder is on its way and will start renaming: keep the keyboard the menu's click took.
++    property bool pendingRename: false
++    onPendingRenameChanged: if (root.pendingRename) pendingRenameLimit.restart()
++    Timer { id: pendingRenameLimit; interval: 5000; onTriggered: root.pendingRename = false }
++    property bool _reconcileAfterEdit: false
++    onEditingItemChanged: if (root.editingItem.length === 0 && root._reconcileAfterEdit) {
++        root._reconcileAfterEdit = false
++        rescanSoon.restart()
++    }
+ 
+     function pathOf(target: string): string {
+         return String(target ?? "").replace(/^file:\/\//, "")
+@@ -30,27 +69,412 @@ Singleton {
+     function isFolderItem(item: var): bool {
+         return item?.desktopFile === true
+     }
++    function nameOf(path: string): string {
++        return String(path ?? "").replace(/\/+$/, "").split("/").pop()
++    }
+     function rescan(): void {
+         if (root._scanning) { root._rescanQueued = true; return }
+         root._scanning = true
++        root._scanSerial = root._opSerial
+         scanProc.running = true
+     }
++    // Runs fn once the Desktop folder is known (the first scan tells it).
++    function whenFolderKnown(fn: var): void {
++        if (root.folder.length > 0) { fn(); return }
++        root._waitingForFolder = root._waitingForFolder.concat([fn])
++        root.rescan()
++    }
++    onFolderChanged: {
++        if (root.folder.length === 0 || root._waitingForFolder.length === 0) return
++        const waiting = root._waitingForFolder
++        root._waitingForFolder = []
++        for (const fn of waiting) fn()
++    }
++
++    // ── File operations ──────────────────────────────────────────────────────
++    // run(["bring", "auto", folder, url...], (ok, results) => ...): results are {path, kind} for
++    // each item that landed or was made, also when something else failed (ok is false). The
++    // helper shows what went wrong as a notification.
++    function run(args: var, done: var): void {
++        root._opsRunning++
++        const proc = opComponent.createObject(root, { command: ["python3", root.script].concat(args), done: done ?? null })
++        proc.running = true
++    }
++    function _finish(proc: var): void {
++        const results = []
++        for (const line of String(proc.out).split("\n")) {
++            if (!line.startsWith("{")) continue
++            try {
++                const result = JSON.parse(line)
++                if (result && typeof result.path === "string") results.push(result)
++            } catch (error) {}
++        }
++        root._opsRunning = Math.max(0, root._opsRunning - 1)
++        root._opSerial++
++        try {
++            if (typeof proc.done === "function") proc.done(proc.exitCode === 0, results)
++        } catch (error) {
++            console.warn("[DesktopFolder] after", proc.command[2], error)
++        }
++        Qt.callLater(() => proc.destroy())
++        rescanSoon.restart()
++    }
++    Component {
++        id: opComponent
++        Process {
++            id: op
++            property var done: null
++            property string out: ""
++            property int exitCode: -1
++            property bool _streamed: false
++            property bool _exited: false
++            stdout: StdioCollector {
++                onStreamFinished: { op.out = text; op._streamed = true; if (op._exited) root._finish(op) }
++            }
++            onExited: (exitCode, exitStatus) => {
++                op.exitCode = exitCode
++                op._exited = true
++                if (op._streamed) root._finish(op)
++            }
++        }
++    }
++
++    // Moves (same drive) or copies (another drive) urls into folder. Undo puts them back.
++    function bringInto(folder: string, urls: var, done: var): void {
++        root.run(["bring", "auto", folder].concat(Array.from(urls ?? [], String)), (ok, results) => {
++            root._rememberBring(results)
++            if (typeof done === "function") done(ok, results)
++        })
++    }
++    function copyInto(folder: string, urls: var, done: var): void {
++        root.run(["bring", "copy", folder].concat(Array.from(urls ?? [], String)), (ok, results) => {
++            root._rememberBring(results)
++            if (typeof done === "function") done(ok, results)
++        })
++    }
++    // A new, empty folder in the Desktop folder ("New Folder", "New Folder (1)", ...).
++    function newFolder(done: var, name: var): void {
++        const named = typeof name === "string" && name.length > 0 ? [name] : []
++        root.whenFolderKnown(() => root.run(["mkdir", root.folder].concat(named), (ok, results) => {
++            if (results.length > 0)
++                root._remember({ kind: "new", label: Translation.tr("New Folder"), path: results[0].path })
++            if (typeof done === "function") done(ok, results)
++        }))
++    }
++
++    // Removing a file-backed icon moves its file to the Trash (recoverable there, and with Undo).
++    function trash(paths: var, done: var): void {
++        if (paths.length === 0) return
++        const places = root._placesOf(paths.map(p => String(p).startsWith("file://") ? root.pathOf(decodeURIComponent(p)) : String(p)))
++        root.run(["trash"].concat(paths), (ok, results) => {
++            const items = results.filter(r => typeof r.info === "string" && r.info.length > 0)
++                .map(r => ({ info: r.info, path: r.path, place: places[r.path] ?? null }))
++            if (items.length > 0)
++                root._remember({ kind: "trash", label: Translation.tr("Move to Trash"), items: items })
++            root.checkTrash()
++            if (typeof done === "function") done(ok, results)
++        })
++    }
++    function trashItems(ids: var): bool {
++        const paths = []
++        for (const id of ids) {
++            const item = DesktopItems.items[id]
++            if (!root.isFolderItem(item) || item.locked) continue
++            const path = root.pathOf(item.target)
++            if (path.slice(0, path.lastIndexOf("/")) === root.folder)
++                paths.push(path)
++        }
++        if (paths.length === 0) return false
++        root.trash(paths)
++        GlobalStates.clearDesktopItemSelection()
++        return true
++    }
++
++    // Renames the file; the icon keeps its place and takes the new name once the file has it.
++    function renameFile(itemId: string, newName: string): void {
++        const item = DesktopItems.items[itemId]
++        if (!item) return
++        const from = root.pathOf(item.target)
++        const name = String(newName ?? "").trim()
++        if (name.length === 0 || name === root.nameOf(from)) return
++        root.run(["rename", from, name], (ok, results) => {
++            if (!ok || results.length === 0) return
++            root._remember({ kind: "rename", label: Translation.tr("Rename"), from: from, to: results[0].path })
++            if (DesktopItems.items[itemId] === undefined) return
++            DesktopItems.update(itemId, { target: "file://" + results[0].path, label: root.nameOf(results[0].path) })
++        })
++    }
++
++    // ── Undo (Ctrl+Z, and "Undo …" in the desktop menu) ──────────────────────
++    // The desktop's own file changes, newest last: Move to Trash, Rename, New Folder, a move or
++    // copy by dropping. Undo brings the files back, and their icons to where they were.
++    property var _undoStack: []
++    readonly property bool canUndo: root._undoStack.length > 0
++    readonly property string undoLabel: root.canUndo ? root._undoStack[root._undoStack.length - 1].label : ""
++    function _remember(entry: var): void {
++        root._undoStack = root._undoStack.concat([entry]).slice(-20)
++    }
++    function _rememberBring(results: var, label: string): void {
++        const entries = results.filter(r => typeof r.from === "string" && r.from.length > 0 && r.from !== r.path)
++            .map(r => ({ path: r.path, from: r.from, moved: r.moved === true, fromTrash: r.fromTrash === true }))
++        if (entries.length === 0) return
++        const moved = entries.every(e => e.moved)
++        root._remember({ kind: "bring", label: label || (moved ? Translation.tr("Move") : Translation.tr("Copy")), entries: entries })
++    }
++
++    // ── The clipboard: Copy, Cut and Paste, between the desktop and Files ────
++    // Copy and Cut put the files on the clipboard in every form apps read: desktop_files.py clip
++    // starts the helper that holds them there, on its own (it stays until something else is
++    // copied), and returns once they are on. Files pastes a Cut as a move. Paste takes whatever
++    // files are on the clipboard, from here or from Files.
++    // What the clipboard holds is read back from it whenever it changes: whether there are files
++    // to paste, and which were cut (their icons are dimmed, also for a Cut made in Files).
++    property var cutPaths: []
++    property bool clipboardHasFiles: false
++    property var _pendingClip: null
++    function copyItems(ids: var, cut: bool): bool {
++        const paths = []
++        for (const id of ids) {
++            const item = DesktopItems.items[id]
++            if (!root.isFolderItem(item) || (cut && item.locked)) continue
++            paths.push(root.pathOf(item.target))
++        }
++        if (paths.length === 0) return false
++        root._pendingClip = { mode: cut ? "cut" : "copy", paths: paths }
++        if (!clipProc.running) root._startClip()          // else the newest starts when this one is done
++        return true
++    }
++    function _startClip(): void {
++        const job = root._pendingClip
++        if (!job) return
++        root._pendingClip = null
++        clipProc.mode = job.mode
++        clipProc.paths = job.paths
++        clipProc.command = ["python3", root.script, "clip", job.mode].concat(job.paths)
++        clipProc.running = true
++    }
++    Process {
++        id: clipProc
++        property string mode: ""
++        property var paths: []
++        onExited: (exitCode, exitStatus) => {
++            if (exitCode === 0 && !root._pendingClip) {
++                // At once, before the clipboard's own change comes back to say the same.
++                root.cutPaths = clipProc.mode === "cut" ? clipProc.paths : []
++                root.clipboardHasFiles = true
++            }
++            if (root._pendingClip) root._startClip()
++        }
++    }
++    // Pastes the clipboard's files into folder (the Desktop folder, or a folder icon's). Undo takes them back.
++    function paste(folder: string, done: var): void {
++        root.run(["paste", folder], (ok, results) => {
++            root._rememberBring(results, Translation.tr("Paste"))
++            if (results.some(r => r.moved === true)) root.cutPaths = []
++            if (typeof done === "function") done(ok, results)
++        })
++    }
++    // Every change of the clipboard, from any app.
++    Process {
++        id: clipWatch
++        running: true
++        command: ["wl-paste", "--watch", "echo", "changed"]
++        stdout: SplitParser { onRead: root._checkClipboard() }
++        onExited: clipWatchRestart.restart()
++    }
++    Timer { id: clipWatchRestart; interval: 5000; onTriggered: clipWatch.running = true }
++    property bool _clipCheckAgain: false
++    function _checkClipboard(): void {
++        if (clipState.running) { root._clipCheckAgain = true; return }
++        clipState.running = true
++    }
++    Process {
++        id: clipState
++        command: ["python3", root.script, "clipboard"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                let state = null
++                try { state = JSON.parse(text) } catch (error) {}
++                if (!state) return
++                const paths = Array.isArray(state.paths) ? state.paths : []
++                root.clipboardHasFiles = Array.isArray(state.urls) && state.urls.length > 0
++                root.cutPaths = state.op === "cut" ? paths : []
++            }
++        }
++        onExited: if (root._clipCheckAgain) { root._clipCheckAgain = false; root._checkClipboard() }
++    }
++    // ── Thumbnails: a picture of the file instead of its type's icon ─────────
++    // From the thumbnail cache Files and other apps share (the freedesktop.org spec); the scan names
++    // the current ones, and the missing ones are made in the background, a batch at a time.
++    property var thumbnails: ({})               // path → image URL
++    property var _thumbQueue: []
++    function _thumbUrl(path: string, stamp: var): string {
++        return "file://" + String(path).split("/").map(encodeURIComponent).join("/") + "?" + String(stamp ?? "")
++    }
++    function _takeThumbnails(entries: var): void {
++        const next = {}
++        const wanted = []
++        for (const entry of entries ?? []) {
++            if (typeof entry?.thumb === "string" && entry.thumb.length > 0) {
++                next[entry.path] = root._thumbUrl(entry.thumb, entry.stamp)
++            } else if (entry?.preview === true) {
++                next[entry.path] = root._thumbUrl(entry.path, entry.stamp)      // a picture drawn from itself
++            } else if (entry?.needsThumb === true) {
++                // Made since this scan looked: still current while the file is unchanged.
++                const made = String(root.thumbnails[entry.path] ?? "")
++                if (made.length > 0 && made.endsWith("?" + String(entry.stamp ?? ""))) next[entry.path] = made
++                else wanted.push(String(entry.path))
++            }
++        }
++        root.thumbnails = next
++        const queued = root._thumbQueue.concat(thumbProc.running ? thumbProc.paths : [])
++        root._thumbQueue = root._thumbQueue.concat(wanted.filter(path => queued.indexOf(path) < 0))
++        root._nextThumbnails()
++    }
++    function _nextThumbnails(): void {
++        if (thumbProc.running || root._thumbQueue.length === 0) return
++        thumbProc.paths = root._thumbQueue.slice(0, 8)
++        root._thumbQueue = root._thumbQueue.slice(8)
++        thumbProc.running = true
++    }
++    Process {
++        id: thumbProc
++        property var paths: []
++        command: ["python3", root.script, "thumbnails"].concat(thumbProc.paths)
++        stdout: SplitParser {
++            onRead: line => {
++                let result = null
++                try { result = JSON.parse(line) } catch (error) { return }
++                if (!result || typeof result.path !== "string" || !(result.thumb || result.preview)) return
++                const next = Object.assign({}, root.thumbnails)
++                next[result.path] = root._thumbUrl(result.thumb || result.path, result.stamp)
++                root.thumbnails = next
++            }
++        }
++        onExited: root._nextThumbnails()
++    }
++
++    // ── Launchers ─────────────────────────────────────────────────────────────
++    function entryFor(path: string): var {
++        return root.entries.find(entry => entry.path === path) ?? null
++    }
++    // Marks a launcher as trusted (executable), then done() opens it.
++    function trustLauncher(path: string, done: var): void {
++        root.run(["trust", path], (ok, results) => {
++            if (!ok) return
++            root.entries = root.entries.map(entry => entry.path === path ? Object.assign({}, entry, { trusted: true }) : entry)
++            if (typeof done === "function") done()
++        })
++    }
+ 
++    // Where each path's icon is now, to put it back there on Undo.
++    function _placesOf(paths: var): var {
++        const places = {}
++        for (const id of Object.keys(DesktopItems.items)) {
++            const item = DesktopItems.items[id]
++            if (!root.isFolderItem(item)) continue
++            const path = root.pathOf(item.target)
++            if (paths.indexOf(path) >= 0)
++                places[path] = { output: item.output, x: item.x, y: item.y, workspacePage: item.workspacePage }
++        }
++        return places
++    }
++    function undo(): bool {
++        if (!root.canUndo) return false
++        const entry = root._undoStack[root._undoStack.length - 1]
++        root._undoStack = root._undoStack.slice(0, -1)
++        if (entry.kind === "trash") {
++            root.run(["restore"].concat(entry.items.map(i => i.info)), (ok, results) => {
++                results.forEach((landed, index) => {
++                    const was = entry.items.find(i => i.path === landed.path) ?? entry.items[index]
++                    if (!was?.place || landed.path.slice(0, landed.path.lastIndexOf("/")) !== root.folder) return
++                    const target = "file://" + landed.path
++                    const known = Object.keys(DesktopItems.items).find(id => DesktopItems.items[id].target === target)
++                    const place = { output: was.place.output, x: was.place.x, y: was.place.y, workspacePage: was.place.workspacePage }
++                    if (known) DesktopItems.update(known, place)
++                    else DesktopItems.create(Object.assign({ kind: landed.kind, target: target,
++                        icon: landed.kind === "folder" ? "system-file-manager" : "",
++                        label: root.nameOf(landed.path), desktopFile: true }, place))
++                })
++                root.checkTrash()
++            })
++        } else if (entry.kind === "rename") {
++            const itemId = Object.keys(DesktopItems.items).find(id => DesktopItems.items[id].target === "file://" + entry.to)
++            root.run(["rename", entry.to, root.nameOf(entry.from)], (ok, results) => {
++                if (!ok || results.length === 0 || itemId === undefined || DesktopItems.items[itemId] === undefined) return
++                DesktopItems.update(itemId, { target: "file://" + results[0].path, label: root.nameOf(results[0].path) })
++            })
++        } else if (entry.kind === "new") {
++            root.run(["trash", entry.path], () => root.checkTrash())
++        } else if (entry.kind === "bring") {
++            for (const e of entry.entries) {
++                if (e.moved) root.run(["move", e.path, e.from])
++                else root.run(["trash", e.path], () => root.checkTrash())
++            }
++        }
++        return true
++    }
++
++    // ── The Trash ────────────────────────────────────────────────────────────
++    readonly property string trashFiles: (Quickshell.env("XDG_DATA_HOME") || (Quickshell.env("HOME") + "/.local/share")) + "/Trash/files"
++    property int _trashProbed: 0
++    readonly property int trashCount: trashModel.status === FolderListModel.Ready ? trashModel.count : root._trashProbed
++    readonly property bool trashFull: root.trashCount > 0
+     FolderListModel {
++        id: trashModel
++        folder: "file://" + root.trashFiles
++        showHidden: true
++        showDirs: true
++        showDotAndDotDot: false
++    }
++    function checkTrash(): void { if (!trashProbe.running) trashProbe.running = true }
++    Process {
++        id: trashProbe
++        command: ["python3", root.script, "trash-state"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try { root._trashProbed = Number(JSON.parse(text).count) || 0 } catch (error) {}
++                // A Trash made after the shell started: point the watch at it again.
++                if (root._trashProbed > 0 && trashModel.status !== FolderListModel.Ready) {
++                    trashModel.folder = ""
++                    trashModel.folder = "file://" + root.trashFiles
++                }
++            }
++        }
++    }
++    // Empties the Trash for good (the menus ask first). Nothing in it can be brought back afterwards.
++    function emptyTrash(): void {
++        root.run(["empty-trash"], () => {
++            root._undoStack = root._undoStack.filter(e => e.kind !== "trash")
++            root.checkTrash()
++        })
++    }
++
++    // ── Watching the folder ──────────────────────────────────────────────────
++    FolderListModel {
++        id: folderModel
+         folder: root.folder.length > 0 ? "file://" + root.folder : ""
+         showHidden: false
+         showDirs: true
+         showDotAndDotDot: false
+         onCountChanged: rescanSoon.restart()
+     }
++    // Names change without the count changing (a rename): the model reports those as rows too.
++    Connections {
++        target: folderModel
++        function onRowsInserted(): void { rescanSoon.restart() }
++        function onRowsRemoved(): void { rescanSoon.restart() }
++        function onDataChanged(): void { rescanSoon.restart() }
++        function onModelReset(): void { rescanSoon.restart() }
++    }
+     Timer { id: rescanSoon; interval: 250; onTriggered: root.rescan() }
+-    // A rename keeps the count, so look again now and then too.
+-    Timer { interval: 4000; repeat: true; running: DesktopItems.ready; onTriggered: root.rescan() }
++    // A safety net for changes the folder watch can miss (another drive, a network folder).
++    Timer { interval: 30000; repeat: true; running: DesktopItems.ready; onTriggered: { root.rescan(); root.checkTrash() } }
+     Connections {
+         target: DesktopItems
+         function onReadyChanged(): void { if (DesktopItems.ready) root.rescan() }
+     }
+-    Component.onCompleted: if (DesktopItems.ready) root.rescan()
++    Component.onCompleted: { if (DesktopItems.ready) root.rescan(); root.checkTrash(); root._checkClipboard() }
+ 
+     Process {
+         id: scanProc
+@@ -58,15 +482,26 @@ Singleton {
+         stdout: StdioCollector {
+             onStreamFinished: {
+                 root._scanning = false
++                let result = null
+                 try {
+-                    const result = JSON.parse(text)
+-                    root.folder = String(result.folder ?? "")
+-                    root.entries = Array.isArray(result.entries) ? result.entries : []
+-                    root.reconcile()
++                    result = JSON.parse(text)
+                 } catch (error) {
+                     console.warn("[DesktopFolder] scan failed:", error)
+                 }
+-                if (root._rescanQueued) { root._rescanQueued = false; root.rescan() }
++                if (result !== null) {
++                    if (root.folder.length === 0 || root.folder === String(result.folder ?? ""))
++                        root.folder = String(result.folder ?? "")
++                    // A file operation ran while this scan looked: what it saw may already be old.
++                    const stale = root._opsRunning > 0 || root._scanSerial !== root._opSerial
++                    if (stale) {
++                        root._rescanQueued = root._opsRunning === 0
++                    } else {
++                        root.entries = Array.isArray(result.entries) ? result.entries : []
++                        root.reconcile()
++                        root._takeThumbnails(root.entries)
++                    }
++                }
++                if (root._rescanQueued) { root._rescanQueued = false; rescanSoon.restart() }
+             }
+         }
+     }
+@@ -101,21 +536,27 @@ Singleton {
+         }
+     }
+ 
+-    function _freeCells(count: int, taken: var): var {
++    // Free places on a display's first page for files that appeared in the folder.
++    function _freeCells(count: int, taken: var, screenName: string): var {
+         const grid = Number(Config.getNestedValue("background.widgets.editGrid.size", 16))
+         const pitchX = DesktopItems.gridPitchX(grid), pitchY = DesktopItems.gridPitchY(grid)
+-        const screen = Quickshell.screens[0]
++        const screen = Quickshell.screens.find(s => s.name === screenName) ?? Quickshell.screens[0]
+         const rows = Math.max(1, Math.floor(((screen?.height ?? 1080) - 160) / pitchY))
++        const columns = Math.max(1, Math.floor(((screen?.width ?? 1920) - 40) / pitchX))
+         const used = new Set(taken.map(p => Math.round(p.x / pitchX) + ":" + Math.round(p.y / pitchY)))
+         const out = []
+-        for (let column = 0; out.length < count && column < 60; column++)
++        for (let column = 0; out.length < count && column < columns; column++)
+             for (let row = 0; out.length < count && row < rows; row++)
+                 if (!used.has(column + ":" + row)) { used.add(column + ":" + row); out.push({ x: column * pitchX, y: row * pitchY }) }
++        // A full desktop: the rest stack in the last place rather than off the screen.
++        while (out.length < count)
++            out.push({ x: (columns - 1) * pitchX, y: (rows - 1) * pitchY })
+         return out
+     }
+ 
+     function reconcile(): void {
+         if (!DesktopItems.ready || !DesktopItems.available || root.folder.length === 0 || root._migrating) return
++        if (root.editingItem.length > 0) { root._reconcileAfterEdit = true; return }
+         const legacy = root._legacyItems()
+         if (Object.keys(legacy).length > 0) {
+             root._migrating = true
+@@ -129,13 +570,29 @@ Singleton {
+         for (const itemId of Object.keys(items))
+             if (root.isFolderItem(items[itemId])) byPath[root.pathOf(items[itemId].target)] = itemId
+         const present = new Set(root.entries.map(entry => String(entry.path)))
+-        const additions = root.entries.filter(entry => byPath[String(entry.path)] === undefined)
++        let additions = root.entries.filter(entry => byPath[String(entry.path)] === undefined)
+         const patches = {}
++        // A file renamed outside the desktop (in Files, say) is the same file under a new name:
++        // its icon follows it and keeps its place.
++        const goneByInode = {}
++        for (const path of Object.keys(byPath))
++            if (!present.has(path) && items[byPath[path]].inode) goneByInode[items[byPath[path]].inode] = byPath[path]
++        const renamed = new Set()
++        additions = additions.filter(entry => {
++            const itemId = entry.inode ? goneByInode[entry.inode] : undefined
++            if (itemId === undefined || renamed.has(itemId)) return true
++            renamed.add(itemId)
++            delete goneByInode[entry.inode]
++            byPath[String(entry.path)] = itemId
++            patches[itemId] = { target: "file://" + entry.path }
++            return false
++        })
+         for (const entry of root.entries) {
+             const itemId = byPath[String(entry.path)]
+             if (itemId === undefined) continue
+-            const item = items[itemId], patch = {}
++            const item = items[itemId], patch = patches[itemId] ?? {}
+             if (!item.customLabel && item.label !== entry.label) patch.label = entry.label
++            if (entry.inode && item.inode !== entry.inode) patch.inode = entry.inode
+             if (item.icon !== entry.icon) patch.icon = entry.icon
+             if (item.kind !== entry.kind) patch.kind = entry.kind
+             if ((item.launcher === true) !== (entry.launcher === true)) patch.launcher = entry.launcher === true
+@@ -144,50 +601,18 @@ Singleton {
+             if (Object.keys(patch).length > 0) patches[itemId] = patch
+         }
+         const gone = Object.keys(byPath).filter(path => !present.has(path)).map(path => byPath[path])
++            .filter(itemId => !renamed.has(itemId))
+         if (additions.length === 0 && Object.keys(patches).length === 0 && gone.length === 0) return
+         const output = String(GlobalStates.focusedScreen?.name ?? Quickshell.screens[0]?.name ?? "")
+         // Files discovered in the Desktop folder start on the first page.
+         const page = Config.workspacePageContents && CompositorService.isNiri ? 1 : 0
+         const cells = root._freeCells(additions.length,
+-            DesktopItems.listForPage(DesktopWidgetLayout.mainOutputName(), page))
++            DesktopItems.listForPage(DesktopWidgetLayout.mainOutputName(), page), output)
+         const creates = additions.map((entry, i) => ({
+             kind: entry.kind, target: "file://" + entry.path, label: entry.label, icon: entry.icon,
+             launcher: entry.launcher === true, symlink: entry.symlink === true, link: String(entry.link ?? ""), desktopFile: true,
+-            output: output, x: cells[i]?.x ?? 0, y: cells[i]?.y ?? 0
++            inode: String(entry.inode ?? ""), output: output, x: cells[i]?.x ?? 0, y: cells[i]?.y ?? 0
+         }))
+         DesktopItems.applyFolderSync(creates, patches, gone)
+     }
+-
+-    // Removing a file-backed icon moves its file to the Trash (recoverable there).
+-    function trash(paths: var): void {
+-        Quickshell.execDetached(["gio", "trash", "--"].concat(paths))
+-        rescanSoon.restart()
+-    }
+-    function trashItems(ids: var): bool {
+-        const paths = []
+-        for (const id of ids) {
+-            const item = DesktopItems.items[id]
+-            if (!root.isFolderItem(item) || item.locked) continue
+-            const path = root.pathOf(item.target)
+-            if (path.slice(0, path.lastIndexOf("/")) === root.folder)
+-                paths.push(path)
+-        }
+-        if (paths.length === 0) return false
+-        root.trash(paths)
+-        GlobalStates.clearDesktopItemSelection()
+-        return true
+-    }
+-
+-    function renameFile(itemId: string, newName: string): void {
+-        const item = DesktopItems.items[itemId]
+-        if (!item) return
+-        const from = root.pathOf(item.target)
+-        const name = newName.replace(/\//g, "-").trim()
+-        if (name.length === 0) return
+-        const to = from.replace(/[^/]*$/, "") + name
+-        if (to === from) return
+-        DesktopItems.update(itemId, { target: "file://" + to, label: name })   // keeps its place
+-        Quickshell.execDetached(["mv", "-n", "--", from, to])
+-        rescanSoon.restart()
+-    }
+ }
+diff --git a/services/DesktopItems.qml b/services/DesktopItems.qml
+index b2e0663..f05cb1b 100644
+--- a/services/DesktopItems.qml
++++ b/services/DesktopItems.qml
+@@ -30,6 +30,9 @@ Singleton {
+     property bool _pendingWrite: false
+     property bool _pendingReload: false
+     property bool _stateDirPending: false
++    // hp-snap: what this desktop last wrote. Re-reading it would only rebuild every icon (and drop
++    // a name being typed), so a file that still says exactly that is not read again.
++    property string _lastWritten: ""
+ 
+     signal itemCreated(string itemId, var item)
+     signal itemUpdated(string itemId, var item)
+@@ -307,7 +310,9 @@ Singleton {
+             Math.round(clampedX / pitchX) * pitchX))
+         const anchorY = Math.max(0, Math.min(maxY,
+             Math.round(clampedY / pitchY) * pitchY))
+-        const items = page > 0 ? root.listForPage(output, page) : root.listForOutput(output)
++        // hp-snap: every item the desktop shows here counts as taken, also those filed under
++        // no display or another one (the main display shows them all; see listForPage).
++        const items = root.listForPage(output, page)
+         // hp-snap: several ids can be left out (a selection moving together), and places already given to
+         // others of it count as taken, so they do not land on each other.
+         const excluded = Array.isArray(excludeItemId) ? excludeItemId : [excludeItemId]
+@@ -524,7 +529,8 @@ Singleton {
+                 return
+             root._pendingWrite = false
+             root._writeInFlight = true
+-            stateFileView.setText(root._serializedDocument())
++            root._lastWritten = root._serializedDocument()
++            stateFileView.setText(root._lastWritten)
+         }
+     }
+ 
+@@ -546,6 +552,8 @@ Singleton {
+                 root._pendingReload = true
+                 return
+             }
++            if (root.ready && root.available && root._lastWritten.length > 0 && stateFileView.text() === root._lastWritten)
++                return
+             root._loadDocument(stateFileView.text())
+             root.ready = true
+         }

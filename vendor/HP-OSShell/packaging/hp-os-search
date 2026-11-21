@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -14,6 +15,31 @@ from urllib.request import Request, urlopen
 import time
 
 TEXT = {'.txt', '.md', '.csv', '.log', '.json', '.yaml', '.yml', '.rst', '.html'}
+USER_FOLDERS = (('DESKTOP', 'Desktop'), ('DOCUMENTS', 'Documents'), ('DOWNLOAD', 'Downloads'),
+                ('PICTURES', 'Pictures'), ('MUSIC', 'Music'), ('VIDEOS', 'Videos'))
+
+
+def user_folders(home=None):
+    """The user's Desktop, Documents, Downloads, Pictures, Music and Videos folders as
+    user-dirs.dirs names them (so in the user's language), else by their English names.
+    A folder set to the home folder itself is turned off there, and is left out."""
+    home = Path(home or Path.home())
+    named = {}
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or str(home / '.config')) / 'user-dirs.dirs'
+    try:
+        for line in config.read_text(errors='replace').splitlines():
+            match = re.match(r'\s*XDG_([A-Z]+)_DIR="(.*)"\s*$', line)
+            if match:
+                named[match.group(1)] = match.group(2).replace('$HOME', str(home))
+    except OSError:
+        pass
+    folders = []
+    for key, english in USER_FOLDERS:
+        path = Path(named.get(key) or str(home / english))
+        if path.is_absolute() and path != home and path not in folders:
+            folders.append(path)
+    return folders
+
 
 def search(home, query, limit=8, seconds=1.0):
     terms = query.casefold().split()
@@ -22,7 +48,7 @@ def search(home, query, limit=8, seconds=1.0):
     deadline = time.monotonic() + seconds
     results = []
     count = 0
-    roots = [home / name for name in ('Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos')]
+    roots = user_folders(home)
     seen = set()
     for root in roots:
         if root.is_symlink():
@@ -63,13 +89,19 @@ def config_dir():
 def configure():
     conf = config_dir()
     conf.mkdir(parents=True, exist_ok=True, mode=0o700)
-    roots = [Path.home() / n for n in ('Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos')]
-    roots = [p for p in roots if p.is_dir() and not p.is_symlink()]
+    roots = [p for p in user_folders() if p.is_dir() and not p.is_symlink()]
     # An empty topdirs means HOME to Recoll. Use an empty private directory instead.
     empty = conf / 'empty'; empty.mkdir(exist_ok=True)
     config = conf / 'recoll.conf'
-    if not config.exists():
-        config.write_text('topdirs = ' + ' '.join(json.dumps(str(p), ensure_ascii=False) for p in (roots or [empty])) + '\n' +
+    topdirs = 'topdirs = ' + ' '.join(json.dumps(str(p), ensure_ascii=False) for p in (roots or [empty]))
+    if config.exists():
+        # The folders follow the user's (renamed, or another language's) folders; the rest is kept.
+        lines = config.read_text().splitlines()
+        updated = [topdirs if line.startswith('topdirs') else line for line in lines]
+        if updated != lines:
+            config.write_text('\n'.join(updated) + '\n')
+    else:
+        config.write_text(topdirs + '\n' +
             'followLinks = 0\nskippedNames+ = .* node_modules target build __pycache__\n'
             'thrQSizes = -1\nidxflushmb = 20\nfiltermaxseconds = 30\n'
             'pdfocr = 1\nimgocr = 1\nocrprogs = tesseract\ntesseractlang = eng+chi_sim\n')

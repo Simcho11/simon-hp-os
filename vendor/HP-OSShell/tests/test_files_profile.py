@@ -53,6 +53,30 @@ class FilesProfileTests(unittest.TestCase):
             profile.upgrade_seeded_fonts(path)
             self.assertEqual(path.stat().st_mtime_ns, before)
 
+    def test_icon_theme_moves_to_the_files_theme_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'kdeglobals'
+            path.write_text('[General]\nfont=HarmonyOS Sans,12,-1,5,50,0,0,0,0,0\n[Icons]\nTheme=HarmonyOS\n')
+            profile.upgrade_seeded_fonts(path)
+            self.assertIn('[Icons]\nTheme=HP-OS-Files\n', path.read_text())
+            path.write_text('[Icons]\nTheme=Papirus\n')
+            profile.upgrade_seeded_fonts(path)
+            self.assertEqual(path.read_text(), '[Icons]\nTheme=Papirus\n')
+
+    def test_files_icon_theme_is_hp_os_drawn_in_the_palette_colours(self):
+        icons = Path(__file__).parents[1] / 'packaging/files/data/icons'
+        text = (icons / 'HP-OS-Files/index.theme').read_text()
+        own = (icons / 'HP-OS/index.theme').read_text()
+        # The same icons, folders and fallbacks as HP-OS, so every icon resolves as it did.
+        self.assertEqual((icons / 'HP-OS-Files/256x256').resolve(), (icons / 'HP-OS/256x256').resolve())
+        for line in ('Inherits=Adwaita,hicolor', 'Directories=256x256', '[256x256]', 'Size=256', 'Type=Scalable'):
+            self.assertIn(line, own)
+            self.assertIn(line, text)
+        self.assertIn('FollowsColorScheme=true', text)
+        for name in ('kdeglobals', 'kdeglobals-dark'):
+            seeded = (Path(__file__).parents[1] / 'packaging/files' / name).read_text()
+            self.assertIn('[Icons]\nTheme=HP-OS-Files\n', seeded)
+
     def test_isolation_and_repeat_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -81,6 +105,26 @@ class FilesProfileTests(unittest.TestCase):
             profile.prepare_environment(env, ROOT / 'packaging/files')
             self.assertEqual((scoped / 'dolphinrc').read_text(), 'custom Files layout')
             self.assertNotIn('QT_STYLE_OVERRIDE', env)
+
+    def test_opened_apps_get_the_environment_files_started_with(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            env = {'HOME': directory, 'XDG_CONFIG_HOME': directory + '/.config',
+                   'QT_PLUGIN_PATH': '/user/qt', 'XDG_DATA_DIRS': '/installed/share',
+                   'XDG_ACTIVATION_TOKEN': 'used-by-files', 'DESKTOP_STARTUP_ID': 'used-too'}
+            actual = profile.prepare_environment(env, ROOT / 'packaging/files')
+            parent = json.loads(actual['HP_OS_FILES_PARENT_ENV'])
+            self.assertEqual(parent, {'HOME': directory, 'XDG_CONFIG_HOME': directory + '/.config',
+                                      'QT_PLUGIN_PATH': '/user/qt', 'XDG_DATA_DIRS': '/installed/share'})
+            self.assertNotEqual(actual['XDG_CONFIG_HOME'], parent['XDG_CONFIG_HOME'])
+            # Files started from Files: apps still get the original environment.
+            again = profile.prepare_environment(actual, ROOT / 'packaging/files')
+            self.assertEqual(json.loads(again['HP_OS_FILES_PARENT_ENV']), parent)
+            # A damaged copy is replaced, not trusted.
+            broken = dict(env, HP_OS_FILES_PARENT_ENV='{not json')
+            fixed = json.loads(profile.prepare_environment(broken, ROOT / 'packaging/files')['HP_OS_FILES_PARENT_ENV'])
+            self.assertNotIn('HP_OS_FILES_PARENT_ENV', fixed)
+            self.assertEqual(fixed['QT_PLUGIN_PATH'], '/user/qt')
 
     def test_default_data_location_remains_default(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2,7 +2,7 @@
 """Read desktop recent files and maintain private HP-OS application history."""
 import argparse
 import configparser
-from datetime import datetime
+from datetime import datetime, timezone
 import fcntl
 import json
 import math
@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 import xml.etree.ElementTree as ET
 
 MAX_BYTES = 8 * 1024 * 1024
@@ -146,6 +146,90 @@ def recent_files(limit):
     return sorted(unique.values(), key=lambda entry: (-entry["modified"], entry["path"]))[:limit]
 
 
+XBEL_NAMESPACES = {"bookmark": "http://www.freedesktop.org/standards/desktop-bookmarks",
+                   "mime": "http://www.freedesktop.org/standards/shared-mime-info"}
+BOOKMARK = "{%s}" % XBEL_NAMESPACES["bookmark"]
+MIME = "{%s}" % XBEL_NAMESPACES["mime"]
+
+
+def file_uri(path):
+    """A file's URI as GLib (and so GTK's recent list) writes it."""
+    return "file://" + quote(os.fsencode(os.path.abspath(path)), safe="/!$&'()*+,:=@")
+
+
+def xbel_time(moment):
+    return datetime.fromtimestamp(moment, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def record_files(paths, application="HP-OS", command="xdg-open %u"):
+    """Adds opened files to the desktop's recent list (recently-used.xbel), as a GTK app does
+    when it opens one, so files opened from the desktop or search show among recent files
+    everywhere: the start menu, file dialogs and apps. Never rewrites a list it cannot read."""
+    files = [Path(os.path.abspath(p)) for p in paths if os.path.isfile(p)]
+    if not files:
+        return 0
+    data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+    data_home.mkdir(parents=True, exist_ok=True)
+    xbel = data_home / "recently-used.xbel"
+    for prefix, uri in XBEL_NAMESPACES.items():
+        ET.register_namespace(prefix, uri)
+    lock_fd = os.open(str(data_home / ".recently-used.xbel.hp-os-lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if xbel.stat().st_size > MAX_BYTES:
+                return 0
+            root = ET.fromstring(xbel.read_bytes())
+        except FileNotFoundError:
+            root = ET.Element("xbel", {"version": "1.0"})
+        if root.tag != "xbel":
+            raise ValueError("recently-used.xbel is not a recent-files list")
+        now = xbel_time(time.time())
+        for path in files:
+            href = file_uri(path)
+            bookmark = next((b for b in root.findall("bookmark") if b.get("href") == href), None)
+            if bookmark is None:
+                bookmark = ET.SubElement(root, "bookmark", {"href": href, "added": now})
+            bookmark.set("modified", now)
+            bookmark.set("visited", now)
+            info = bookmark.find("info")
+            if info is None:
+                info = ET.SubElement(bookmark, "info")
+            metadata = next((m for m in info.findall("metadata") if m.get("owner") == "http://freedesktop.org"), None)
+            if metadata is None:
+                metadata = ET.SubElement(info, "metadata", {"owner": "http://freedesktop.org"})
+            if metadata.find(MIME + "mime-type") is None:
+                kind = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                metadata.insert(0, ET.Element(MIME + "mime-type", {"type": kind}))
+            apps = metadata.find(BOOKMARK + "applications")
+            if apps is None:
+                apps = ET.SubElement(metadata, BOOKMARK + "applications")
+            app = next((a for a in apps.findall(BOOKMARK + "application") if a.get("name") == application), None)
+            if app is None:
+                app = ET.SubElement(apps, BOOKMARK + "application",
+                                    {"name": application, "exec": "'" + command + "'", "count": "0"})
+            app.set("modified", now)
+            try:
+                app.set("count", str(int(app.get("count", "0")) + 1))
+            except ValueError:
+                app.set("count", "1")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=data_home, prefix=".recently-used.", delete=False) as output:
+                temporary = Path(output.name)
+                output.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+                output.write(ET.tostring(root, encoding="utf-8"))
+                output.write(b"\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, xbel)
+        finally:
+            if temporary:
+                temporary.unlink(missing_ok=True)
+    return len(files)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -153,8 +237,15 @@ def main():
     listing.add_argument("--limit", type=int, default=8)
     observer = commands.add_parser("observe-app")
     observer.add_argument("id")
+    recorder = commands.add_parser("record", help="add opened files to the recent-files list")
+    recorder.add_argument("paths", nargs="+")
     args = parser.parse_args()
-    if args.command == "observe-app":
+    if args.command == "record":
+        try:
+            record_files(args.paths)
+        except (ValueError, OSError, ET.ParseError) as error:
+            parser.exit(1, str(error) + "\n")
+    elif args.command == "observe-app":
         try:
             observe_app(args.id)
         except (ValueError, OSError) as error:

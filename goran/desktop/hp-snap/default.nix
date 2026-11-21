@@ -15,7 +15,10 @@ let
     "dock-keep-cursor.patch" "carry-scroll-desktops.patch" "unminimize-to-current-desktop.patch"
     "overview-workspaces.patch" "snap-overlay-keeps-windows-active.patch" "keyboard-carry.patch"
     "advertise-minimize.patch" "carry-keeps-desktop.patch" "desktop-pages.patch"
+    "fullscreen-at-once.patch"
   ];
+  # Puts files on the clipboard in every form apps read (desktop Copy and Cut).
+  fileClipboard = import ./file-clipboard { inherit pkgs; };
 in {
   niri = baseNiri.overrideAttrs (old: {
     pname = "niri-hp-snap-hpos";  # same name as hp-snap's build, so an existing build is reused
@@ -62,5 +65,13 @@ in {
     git apply ${./device-settings.patch}
     git apply ${./desktop-pages.patch}
     git apply ${./desktop-polish.patch}
+    # One note on every display, the main display remembered by the monitor itself, displays turned off.
+    git apply ${./displays.patch}
+    # The desktop's files: one helper for every file operation, and no scan racing an operation.
+    git apply ${./desktop-files.patch}
+    # Opening an app that's already open brings its window back, a minimized one restored, instead of another copy.
+    git apply ${./bring-back.patch}
+    substituteInPlace scripts/hp-snap/desktop_files.py \
+      --replace-fail '@fileClipboard@' ${fileClipboard}/bin/hp-os-file-clipboard
   '';
 }

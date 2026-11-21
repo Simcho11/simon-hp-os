@@ -1,0 +1,807 @@
+diff --git a/modules/background/Background.qml b/modules/background/Background.qml
+index a13d313..292f224 100644
+--- a/modules/background/Background.qml
++++ b/modules/background/Background.qml
+@@ -2578,6 +2578,11 @@ Scope {
+                 function initializeOutputWidgetLayout(): void {
+                     if (!Config.ready || !widgetCanvas.visible || !desktopPage.current)
+                         return
++                    // hp-snap: layouts are filed under the display itself, known once niri has listed it.
++                    if (!DesktopWidgetLayout.identitiesReady) {
++                        outputLayoutTimer.restart()
++                        return
++                    }
+                     const outputName = String(bgRoot.screen?.name ?? "")
+                     const outputWidth = Math.round(widgetCanvas.width)
+                     const outputHeight = Math.round(widgetCanvas.height)
+diff --git a/modules/background/widgets/AbstractBackgroundWidget.qml b/modules/background/widgets/AbstractBackgroundWidget.qml
+index 3b2c4f1..6a6f5ad 100644
+--- a/modules/background/widgets/AbstractBackgroundWidget.qml
++++ b/modules/background/widgets/AbstractBackgroundWidget.qml
+@@ -2048,8 +2048,8 @@ AbstractWidget {
+         const updates = {};
+         for (const key in root.defaultConfig) {
+             // Reset the selected instance, not its siblings on other outputs.
+-            // Keep the lifecycle and lock controls intact.
+-            if (key !== "enable" && key !== "locked")
++            // Keep the lifecycle and lock controls intact, and what the widget holds (a note's text).
++            if (key !== "enable" && key !== "locked" && !DesktopWidgetLayout.isShared(root.configEntryName, key))
+                 updates[key] = root.defaultConfig[key];
+         }
+         updates["palette.primary"] = "primary"
+diff --git a/modules/common/Config.qml b/modules/common/Config.qml
+index 4938fc1..d1c0e79 100644
+--- a/modules/common/Config.qml
++++ b/modules/common/Config.qml
+@@ -2877,6 +2877,9 @@ Singleton {
+ 
+             property JsonObject display: JsonObject {
+                 property string primaryMonitor: ""
++                // hp-snap: the main display's own "make model serial"; primaryMonitor follows it to
++                // whatever connector it is plugged into.
++                property string primaryMonitorId: ""
+             }
+ 
+             property JsonObject dock: JsonObject {
+diff --git a/modules/iris/settings/IrisNiri.qml b/modules/iris/settings/IrisNiri.qml
+index 85dfd54..ab0461f 100644
+--- a/modules/iris/settings/IrisNiri.qml
++++ b/modules/iris/settings/IrisNiri.qml
+@@ -262,7 +262,7 @@ Singleton {
+         id: outputsReader
+         command: ["python3", root.script, "outputs"]
+         stdout: StdioCollector {
+-            onStreamFinished: root.parse(text, value => { root.outputs = Array.isArray(value) ? value : [] })
++            onStreamFinished: root.parse(text, value => { root.outputs = Array.isArray(value) ? value.filter(entry => entry.enabled !== false) : [] })
+         }
+     }
+     Process {
+diff --git a/modules/settings/DisplayArrangement.qml b/modules/settings/DisplayArrangement.qml
+index f52d11e..9a17e1e 100644
+--- a/modules/settings/DisplayArrangement.qml
++++ b/modules/settings/DisplayArrangement.qml
+@@ -124,9 +124,10 @@ ColumnLayout {
+     function niriOutputNames(): var {
+         const source = Object.keys(monitorLayoutSnapshot).length > 0
+             ? monitorLayoutSnapshot : (NiriService.outputs ?? ({}))
++        // A display that is turned off has no place in the arrangement (niri reports it without one).
+         return Object.keys(source).filter(name => {
+             const entry = source[name]
+-            return entry?.logical !== undefined || entry?.width !== undefined
++            return Boolean(entry?.logical) || entry?.width !== undefined
+         })
+             .sort((a, b) => {
+                 const ao = niriLogicalRect(a)
+@@ -927,7 +928,79 @@ ColumnLayout {
+                     options: [{ label: Translation.tr("Automatic (%1)").arg(root.displayLabel(root.connectedScreenNames()[0] ?? "")), value: "" }]
+                         .concat(root.niriOutputNames().map(name => ({ label: root.displayLabel(name), value: name })))
+                     current: Config.options?.display?.primaryMonitor ?? ""
+-                    onPicked: value => Config.setNestedValue("display.primaryMonitor", value)
++                    onPicked: value => NiriService.setMainDisplay(value)
++                }
++            }
++            // hp-snap: a display can stay plugged in and still be left out: dark, with nothing on it,
++            // until it is turned back on here. That is kept when it is plugged in again.
++            ColumnLayout {
++                id: usedDisplays
++                Layout.fillWidth: true
++                readonly property var names: Object.keys(NiriService.outputs ?? ({})).sort((a, b) => {
++                    const on = Number(NiriService.outputInUse(b)) - Number(NiriService.outputInUse(a))
++                    return on !== 0 ? on : root.connectedScreenNames().indexOf(a) - root.connectedScreenNames().indexOf(b)
++                })
++                readonly property int inUse: names.filter(name => NiriService.outputInUse(name)).length
++                visible: names.length > 1
++                spacing: 8 * root.d
++                IrisText {
++                    text: Translation.tr("Use these displays")
++                    font.pixelSize: IrisStyle.typeLabel
++                }
++                IrisText {
++                    Layout.fillWidth: true
++                    text: Translation.tr("A display that's off stays dark and holds nothing, even while it's plugged in.")
++                    role: IrisText.Meta
++                    wrapMode: Text.WordWrap
++                }
++                Repeater {
++                    model: usedDisplays.names
++                    RowLayout {
++                        id: displayRow
++                        required property string modelData
++                        readonly property bool on: NiriService.outputInUse(modelData)
++                        readonly property bool lastOn: on && usedDisplays.inUse <= 1
++                        Layout.fillWidth: true
++                        spacing: 8 * root.d
++                        MaterialSymbol {
++                            text: /^(eDP|LVDS|DSI)/.test(displayRow.modelData) ? "laptop" : "desktop_windows"
++                            iconSize: IrisStyle.typeBody
++                            color: displayRow.on ? IrisStyle.text : IrisStyle.subtext
++                        }
++                        ColumnLayout {
++                            Layout.fillWidth: true
++                            spacing: 0
++                            IrisText {
++                                Layout.fillWidth: true
++                                text: root.displayLabel(displayRow.modelData)
++                                color: displayRow.on ? IrisStyle.text : IrisStyle.subtext
++                                elide: Text.ElideRight
++                            }
++                            IrisText {
++                                Layout.fillWidth: true
++                                text: !displayRow.on ? Translation.tr("Off")
++                                    : displayRow.modelData === root.primaryScreenName() ? Translation.tr("Main display")
++                                    : displayRow.lastOn ? Translation.tr("The only display in use") : ""
++                                visible: text.length > 0
++                                role: IrisText.Meta
++                            }
++                        }
++                        IrisSwitch {
++                            name: Translation.tr("Use %1").arg(root.displayLabel(displayRow.modelData))
++                            on: displayRow.on
++                            enabled: !root.controlsLocked && !root.monitorLayoutBusy && !NiriService.outputPowerBusy && !displayRow.lastOn
++                            opacity: enabled ? 1 : 0.45
++                            onToggled: NiriService.setOutputPower(displayRow.modelData, !displayRow.on)
++                        }
++                    }
++                }
++                IrisText {
++                    Layout.fillWidth: true
++                    visible: text.length > 0
++                    text: NiriService.outputPowerError
++                    color: IrisStyle.danger
++                    font.pixelSize: IrisStyle.typeMeta
++                    wrapMode: Text.WordWrap
+                 }
+             }
+             ColumnLayout {
+diff --git a/modules/settings/MonitorVisibilityConfig.qml b/modules/settings/MonitorVisibilityConfig.qml
+index 48a15d7..35e15c4 100644
+--- a/modules/settings/MonitorVisibilityConfig.qml
++++ b/modules/settings/MonitorVisibilityConfig.qml
+@@ -334,7 +334,7 @@ ContentPage {
+                 visible: !primary
+                 materialIcon: "low_priority"
+                 mainText: Translation.tr("Make primary")
+-                onClicked: if (screenName.length > 0) Config.setNestedValue("display.primaryMonitor", screenName)
++                onClicked: if (screenName.length > 0) NiriService.setMainDisplay(screenName)
+             }
+         }
+     }
+@@ -611,7 +611,7 @@ ContentPage {
+                 ConfigSelectionArray {
+                     currentValue: Config.options?.display?.primaryMonitor ?? ""
+                     options: root.monitorOptions()
+-                    onSelected: newValue => Config.setNestedValue("display.primaryMonitor", newValue)
++                    onSelected: newValue => NiriService.setMainDisplay(newValue)
+                 }
+             }
+ 
+diff --git a/modules/waffle/settings/pages/WMonitorVisibilityPage.qml b/modules/waffle/settings/pages/WMonitorVisibilityPage.qml
+index e37409b..65e9248 100644
+--- a/modules/waffle/settings/pages/WMonitorVisibilityPage.qml
++++ b/modules/waffle/settings/pages/WMonitorVisibilityPage.qml
+@@ -338,7 +338,7 @@ WSettingsPage {
+                 visible: !primary
+                 text: Translation.tr("Use")
+                 icon.name: "checkmark"
+-                onClicked: if (screenName.length > 0) Config.setNestedValue("display.primaryMonitor", screenName)
++                onClicked: if (screenName.length > 0) NiriService.setMainDisplay(screenName)
+             }
+         }
+     }
+@@ -594,7 +594,7 @@ WSettingsPage {
+             description: Translation.tr("Fallback output for popups when the focused monitor is unknown")
+             currentValue: Config.options?.display?.primaryMonitor ?? ""
+             options: root.monitorOptions()
+-            onSelected: newValue => Config.setNestedValue("display.primaryMonitor", newValue)
++            onSelected: newValue => NiriService.setMainDisplay(newValue)
+         }
+ 
+         SectionLabel {
+diff --git a/scripts/niri-config.py b/scripts/niri-config.py
+index d6906b0..ce8b0d8 100755
+--- a/scripts/niri-config.py
++++ b/scripts/niri-config.py
+@@ -11,6 +11,7 @@ Commands:
+   apply-output NAME    Apply temporary output changes via niri msg
+   persist-output NAME  Write one output config to KDL config.d/15-outputs.kdl
+   persist-layout JSON  Persist all connected output positions atomically
++  set-output-power NAME on|off  Use a connected display or leave it dark, kept across reconnects
+   get-input            Read current input config from KDL
+   get-hot-corners      Read effective Niri overview hot corners
+   get-layout           Read current layout config from KDL
+@@ -208,6 +209,8 @@ def cmd_outputs():
+         result.append(
+             {
+                 "name": name,
++                "id": output_display_id(out),
++                "enabled": bool(out.get("logical")),
+                 "make": out.get("make", ""),
+                 "model": out.get("model", ""),
+                 "serial": out.get("serial", ""),
+@@ -446,6 +449,92 @@ def cmd_persist_layout(args):
+     return _write_validated(outputs_file, result)
+ 
+ 
++def output_display_id(out):
++    """A display's lasting name, "make model serial", as niri's config can name an output.
++
++    Connector names such as "Unknown-1" change each time a display behind a USB-C dock is
++    plugged in; the monitor's own make, model and serial do not.
++    """
++    make = str(out.get("make") or "").strip()
++    model = str(out.get("model") or "").strip()
++    serial = str(out.get("serial") or "").strip()
++    if (not make or make == "Unknown") and (not model or model == "Unknown") and not serial:
++        return ""
++    return f"{make or 'Unknown'} {model or 'Unknown'} {serial or 'Unknown'}"
++
++
++def _remove_flag_line(block_content, flag):
++    return re.sub(rf"(?m)^[ \t]*{re.escape(flag)}[ \t]*(//[^\n]*)?\n?", "", block_content)
++
++
++def cmd_set_output_power(args):
++    """Turn a connected display on or off, now and whenever it is plugged in again.
++
++    Off is written to an output block named after the monitor itself, placed before every other
++    output block: niri uses the first block that matches, so it wins over one named after the
++    connector the monitor happens to be on today.
++    """
++    if len(args) != 2 or args[1] not in ("on", "off"):
++        print(json.dumps({"error": "Usage: set-output-power <name> on|off"}))
++        return 1
++    output_name, power = args
++    raw, rc = run_niri("-j", "outputs")
++    if rc != 0:
++        print(json.dumps({"error": f"niri msg failed: {raw}"}))
++        return 1
++    outputs = json.loads(raw)
++    out = outputs.get(output_name)
++    if out is None:
++        print(json.dumps({"error": f"{output_name} is not connected."}))
++        return 1
++    if power == "off":
++        others_on = [name for name, other in outputs.items()
++                     if name != output_name and other.get("logical")]
++        if not others_on:
++            print(json.dumps({"error": "At least one display has to stay on."}))
++            return 1
++
++    key = output_display_id(out) or output_name
++    outputs_file = resolve_niri_section_file("config.d/15-outputs.kdl")
++    outputs_file.parent.mkdir(parents=True, exist_ok=True)
++    content = outputs_file.read_text() if outputs_file.exists() else ""
++
++    if power == "off":
++        bounds = _find_output_block_bounds(content, key)
++        inner = ""
++        if bounds:
++            start, inner_start, inner_end, end = bounds
++            inner = content[inner_start:inner_end]
++            content = content[:start] + content[end:].lstrip("\n")
++        inner = _set_in_block(inner, "off", "")
++        block = f'output "{key}" {{\n' + "\n".join(
++            line for line in inner.strip("\n").splitlines() if line.strip()) + "\n}\n"
++        first = next((m for m in re.finditer(r'(?m)^[ \t]*output\s+"', content)
++                      if _brace_depth_before(content, m.start()) == 0), None)
++        if first:
++            content = content[:first.start()] + block + "\n" + content[first.start():]
++        else:
++            content = (content.rstrip() + "\n\n" if content.strip() else "") + block
++    else:
++        for name in dict.fromkeys([key, output_name]):
++            bounds = _find_output_block_bounds(content, name)
++            if not bounds:
++                continue
++            start, inner_start, inner_end, end = bounds
++            inner = _remove_flag_line(content[inner_start:inner_end], "off")
++            if inner.strip() or name != key or key == output_name:
++                content = content[:inner_start] + inner + content[inner_end:]
++            else:
++                # The block only kept this display dark: nothing left to say about it.
++                content = content[:start] + content[end:].lstrip("\n")
++
++    result = _write_validated(outputs_file, content)
++    if result == 0:
++        # niri reloads the edited config by itself; this makes the change immediate too.
++        run_niri("output", output_name, power)
++    return result
++
++
+ def _ensure_vrr_window_rule():
+     """Add the default on-demand VRR window rule if no rule opts into VRR yet.
+ 
+@@ -3489,6 +3578,7 @@ def main():
+         "apply-output": lambda: cmd_apply_output(args),
+         "persist-output": lambda: cmd_persist_output(args),
+         "persist-layout": lambda: cmd_persist_layout(args),
++        "set-output-power": lambda: cmd_set_output_power(args),
+         "get-input": lambda: cmd_get_input(),
+         "get-hot-corners": lambda: cmd_get_hot_corners(),
+         "get-layout": lambda: cmd_get_layout(),
+diff --git a/services/DesktopItems.qml b/services/DesktopItems.qml
+index 4ca04aa..b2e0663 100644
+--- a/services/DesktopItems.qml
++++ b/services/DesktopItems.qml
+@@ -170,10 +170,40 @@ Singleton {
+     }
+ 
+     function _commit(nextItems: var): void {
+-        root.items = nextItems
++        root.items = root._filedUnderDisplays(nextItems) ?? nextItems
+         root._queuePersist()
+     }
+ 
++    // hp-snap: an item remembers the display it was placed on as the monitor itself ("make model
++    // serial"), not its connector, which changes when a display behind a USB-C dock is plugged in again.
++    // Returns the items refiled, or null when there is nothing to change.
++    function _filedUnderDisplays(source: var): var {
++        if (!DesktopWidgetLayout.identitiesReady)
++            return null
++        let next = null
++        for (const itemId of Object.keys(source ?? ({}))) {
++            const output = String(source[itemId]?.output ?? "")
++            const key = output ? DesktopWidgetLayout.recordKey(output) : ""
++            if (key === output)
++                continue
++            next = next ?? Object.assign({}, source)
++            next[itemId] = Object.assign({}, source[itemId], { output: key })
++        }
++        return next
++    }
++    function _adoptDisplays(): void {
++        if (!root.ready || !root.available || !CompositorService.isNiri)
++            return
++        const next = root._filedUnderDisplays(root.items)
++        if (next !== null)
++            root._commit(next)
++    }
++    Connections {
++        target: NiriService
++        function onOutputsChanged(): void { root._adoptDisplays() }
++    }
++    onReadyChanged: root._adoptDisplays()
++
+     function withWorkspacePage(input: var): var {
+         if (!input || input.workspacePage !== undefined
+                 || !Config.workspacePageContents || !CompositorService.isNiri)
+@@ -239,7 +269,8 @@ Singleton {
+     }
+ 
+     function listForOutput(output: string): list<var> {
+-        return root.listItems().filter(item => item.output === output)
++        const key = DesktopWidgetLayout.recordKey(output)
++        return root.listItems().filter(item => item.output === output || DesktopWidgetLayout.recordKey(item.output) === key)
+     }
+ 
+     // The main display shows all items, including those last placed on a disconnected display.
+diff --git a/services/DesktopWidgetLayout.qml b/services/DesktopWidgetLayout.qml
+index 5de121a..12516c4 100644
+--- a/services/DesktopWidgetLayout.qml
++++ b/services/DesktopWidgetLayout.qml
+@@ -33,6 +33,81 @@ Singleton {
+         return "lock:" + root._outputName(outputName)
+     }
+ 
++    // hp-snap: each display's layout is kept under the monitor itself ("make model serial"), not the
++    // connector it is plugged into: a display behind a USB-C dock comes back as "Unknown-7" after being
++    // "Unknown-1", and its widgets, places and pages come back with it. Layouts saved before that, under
++    // a connector, are taken over once that connector shows the same display (adoptConnectorRecords).
++    readonly property bool identitiesReady: !CompositorService.isNiri
++        || Object.keys(NiriService.outputs ?? ({})).length > 0
++    function recordKey(outputName): string {
++        const name = root._outputName(outputName)
++        if (root.isLockScope(name))
++            return "lock:" + root.recordKey(name.slice(5))
++        return NiriService.displayId(name) || name
++    }
++    // The connector a record's display is plugged into now, or the record's own key when it is away.
++    function connectorFor(key): string {
++        const name = root._outputName(key)
++        if (root.isLockScope(name))
++            return "lock:" + root.connectorFor(name.slice(5))
++        if (Object.prototype.hasOwnProperty.call(NiriService.outputs ?? ({}), name))
++            return name
++        return NiriService.outputForDisplayId(name) || name
++    }
++    function _sameDisplay(recordOutput, key): bool {
++        const stored = root._outputName(recordOutput)
++        return stored === key || (stored.length > 0 && root.recordKey(stored) === key
++            && Object.prototype.hasOwnProperty.call(NiriService.outputs ?? ({}), stored.replace(/^lock:/, "")))
++    }
++
++    function adoptConnectorRecords(): bool {
++        if (!Config.ready || !CompositorService.isNiri || !root.identitiesReady)
++            return false
++        const list = root._normalizedRecords()
++        let changed = false
++        for (let i = list.length - 1; i >= 0; --i) {
++            const record = list[i]
++            const key = root.recordKey(record.output)
++            if (key === record.output)
++                continue
++            const bare = record.output.replace(/^lock:/, "")
++            const logical = NiriService.outputs?.[bare]?.logical
++            // A connector that once held another display (a different size) keeps that display's layout.
++            const width = Math.round(Number(record.width ?? 0))
++            const height = Math.round(Number(record.height ?? 0))
++            if (width > 0 && height > 0 && logical
++                    && (width !== Math.round(Number(logical.width)) || height !== Math.round(Number(logical.height))))
++                continue
++            const target = list.find(item => item.output === key)
++            if (target) {
++                // What was saved under the display itself is newer; the connector's record fills gaps.
++                for (const holder of Object.keys(record.widgets))
++                    target.widgets[holder] = Object.assign({}, record.widgets[holder], target.widgets[holder] ?? {})
++                target.layouts = Object.assign({}, record.layouts ?? {}, target.layouts ?? {})
++                for (const field of ["layoutVersion", "width", "height"])
++                    if (target[field] === undefined && record[field] !== undefined)
++                        target[field] = record[field]
++                list.splice(i, 1)
++            } else {
++                record.output = key
++            }
++            changed = true
++        }
++        if (changed)
++            Config.setNestedValue("background.widgets.outputOverrides", list)
++        return changed
++    }
++    Connections {
++        target: NiriService
++        function onOutputsChanged(): void { root.adoptConnectorRecords() }
++    }
++    Connections {
++        target: Config
++        function onReadyChanged(): void { root.adoptConnectorRecords() }
++    }
++    // niri and the config can both be ready before this service is first used.
++    Component.onCompleted: Qt.callLater(root.adoptConnectorRecords)
++
+     function _widgetKey(value): string {
+         return String(value ?? "").trim()
+     }
+@@ -45,15 +120,20 @@ Singleton {
+     }
+ 
+     function outputRecord(outputName): var {
+-        const name = root._outputName(outputName)
+-        if (!name)
++        if (!root._outputName(outputName))
+             return null
++        const name = root.recordKey(outputName)
+         const list = root.records
+         for (let i = 0; i < list.length; ++i) {
+             const record = list[i]
+             if (root._outputName(record?.output) === name)
+                 return record
+         }
++        // Not taken over yet: the connector's own record, while it shows that display.
++        for (let i = 0; i < list.length; ++i) {
++            if (root._sameDisplay(list[i]?.output, name))
++                return list[i]
++        }
+         return null
+     }
+ 
+@@ -123,16 +203,75 @@ Singleton {
+         return Config.getNestedValue(path + "." + valueKey, fallback)
+     }
+ 
++    // What a widget holds, not where it sits or how it looks: one copy for every display, so a note
++    // stays the same note when another display becomes the main one or widgets move between displays.
++    readonly property var sharedKeys: ({ notes: ["text"] })
++    function isShared(widgetKey, key): bool {
++        return (root.sharedKeys[root._widgetKey(widgetKey)] ?? []).includes(String(key ?? ""))
++    }
++
++    // Before content was shared each display kept its own copy: until it is written again, the longest
++    // copy any display has stands for all of them.
++    function sharedValue(widgetKey, key, fallback): var {
++        const widget = root._widgetKey(widgetKey)
++        const valueKey = String(key ?? "")
++        const base = root.baseValue(widget, valueKey, undefined)
++        if (base !== undefined && base !== null && base !== "")
++            return base
++        let best = undefined
++        for (const record of root.records) {
++            const own = record?.widgets?.[widget]
++            if (!own || typeof own !== "object" || !Object.prototype.hasOwnProperty.call(own, valueKey))
++                continue
++            const candidate = own[valueKey]
++            if (candidate === undefined || candidate === null || candidate === "")
++                continue
++            if (best === undefined || String(candidate).length > String(best).length)
++                best = candidate
++        }
++        return best !== undefined ? best : (base !== undefined ? base : fallback)
++    }
++
+     function value(outputName, widgetKey, key, fallback): var {
+         const valueKey = String(key ?? "")
++        if (root.isShared(widgetKey, valueKey))
++            return root.sharedValue(widgetKey, valueKey, fallback)
+         const holder = root._holder(outputName, widgetKey, valueKey)
+         const override = root.widgetOverride(outputName, holder)
+         if (override !== null
+                 && Object.prototype.hasOwnProperty.call(override, valueKey))
+             return override[valueKey]
++        if (root.carriedKeys.includes(valueKey) && !root.isLockScope(outputName)) {
++            const carried = root.carriedValue(outputName, holder, valueKey)
++            if (carried !== undefined)
++                return carried
++        }
+         return root.baseValue(widgetKey, valueKey, fallback)
+     }
+ 
++    // A widget arriving on a display that has never placed it (another display just became the main
++    // one) goes to the same desktop page it has on a display that has: page 2 stays page 2.
++    readonly property var carriedKeys: ["workspacePage"]
++    function carriedValue(outputName, holder, key): var {
++        const here = root.recordKey(outputName)
++        const connected = Quickshell.screens.map(screen => String(screen?.name ?? ""))
++        let found = undefined
++        for (const record of root.records) {
++            const output = root._outputName(record?.output)
++            if (!output || output === here || root.isLockScope(output))
++                continue
++            const own = record?.widgets?.[holder]
++            if (!own || typeof own !== "object" || !Object.prototype.hasOwnProperty.call(own, key))
++                continue
++            // A display that is plugged in now speaks for the widget before one that isn't.
++            if (connected.includes(root.connectorFor(output)))
++                return own[key]
++            if (found === undefined)
++                found = own[key]
++        }
++        return found
++    }
++
+     // The main display (Displays → Main display; else the first screen), where desktop widgets live by
+     // default, as on HarmonyOS, Windows and macOS: other screens show just the wallpaper.
+     function mainOutputName(): string {
+@@ -227,6 +366,7 @@ Singleton {
+ 
+     function setValues(outputName, widgetKey, values): bool {
+         const output = root._outputName(outputName)
++        const recordOutput = root.recordKey(output)
+         const widget = root._widgetKey(widgetKey)
+         if (values?.enable === true && values.workspacePage === undefined
+                 && Config.workspacePageContents && CompositorService.isNiri && !root.isLockScope(output)
+@@ -234,18 +374,38 @@ Singleton {
+             const active = NiriService.allWorkspaces.find(ws => ws.output === output && ws.is_active)
+             if (active) values = Object.assign({}, values, { workspacePage: active.idx })
+         }
+-        const keys = values && typeof values === "object"
++        const allKeys = values && typeof values === "object"
+             ? Object.keys(values) : []
+-        if (!output || !widget || keys.length === 0)
++        if (!output || !widget || allKeys.length === 0)
+             return false
++        const keys = allKeys.filter(key => !root.isShared(widget, key))
++        const shared = allKeys.filter(key => root.isShared(widget, key) && values[key] !== undefined)
+ 
+         const list = root._normalizedRecords()
+-        let record = list.find(item => item.output === output)
++        let record = list.find(item => item.output === recordOutput)
++            ?? list.find(item => root._sameDisplay(item.output, recordOutput))
+         if (!record) {
+-            record = { output: output, widgets: ({}) }
++            record = { output: recordOutput, widgets: ({}) }
+             list.push(record)
+         }
+         let changed = false
++        // Shared content is written once, for every display, and each display's old copy goes.
++        const updates = ({})
++        for (const key of shared) {
++            if (root.baseValue(widget, key, undefined) !== values[key]) {
++                updates[root._basePath(widget) + "." + key] = values[key]
++                changed = true
++            }
++            for (const other of list) {
++                const own = other.widgets[widget]
++                if (own && Object.prototype.hasOwnProperty.call(own, key)) {
++                    const next = Object.assign({}, own)
++                    delete next[key]
++                    other.widgets[widget] = next
++                    changed = true
++                }
++            }
++        }
+         const holders = ({})
+         for (const key of keys) {
+             const holder = root._holder(output, widget, key)
+@@ -260,7 +420,8 @@ Singleton {
+             return false
+         for (const holder of Object.keys(holders))
+             record.widgets[holder] = holders[holder]
+-        Config.setNestedValue("background.widgets.outputOverrides", list)
++        updates["background.widgets.outputOverrides"] = list
++        Config.setNestedValues(updates)
+         return true
+     }
+ 
+@@ -285,10 +446,15 @@ Singleton {
+                 || !widgetValues || typeof widgetValues !== "object")
+             return false
+ 
++        // Until niri has named the displays, a layout could only be filed under the connector.
++        if (!root.identitiesReady)
++            return false
+         const list = root._normalizedRecords()
+-        let record = list.find(item => item.output === output)
++        const recordOutput = root.recordKey(output)
++        let record = list.find(item => item.output === recordOutput)
++            ?? list.find(item => root._sameDisplay(item.output, recordOutput))
+         if (!record) {
+-            record = { output: output, widgets: ({}) }
++            record = { output: recordOutput, widgets: ({}) }
+             list.push(record)
+         }
+         const leftWidth = Math.round(Number(record.width ?? 0))
+@@ -351,7 +517,8 @@ Singleton {
+         if (!output || !widget)
+             return false
+         const list = root._normalizedRecords()
+-        const index = list.findIndex(item => item.output === output)
++        const key = root.recordKey(output)
++        const index = list.findIndex(item => item.output === key || root._sameDisplay(item.output, key))
+         if (index < 0 || !list[index].widgets[widget])
+             return false
+         delete list[index].widgets[widget]
+@@ -368,7 +535,8 @@ Singleton {
+         if (!output || !widget || !Array.isArray(keys) || keys.length === 0)
+             return false
+         const list = root._normalizedRecords()
+-        const index = list.findIndex(item => item.output === output)
++        const key = root.recordKey(output)
++        const index = list.findIndex(item => item.output === key || root._sameDisplay(item.output, key))
+         if (index < 0 || !list[index].widgets[widget])
+             return false
+         const next = Object.assign({}, list[index].widgets[widget])
+@@ -440,7 +608,8 @@ Singleton {
+         if (!output)
+             return false
+         const list = root._normalizedRecords()
+-        const next = list.filter(item => item.output !== output)
++        const key = root.recordKey(output)
++        const next = list.filter(item => item.output !== key && !root._sameDisplay(item.output, key))
+         if (next.length === list.length)
+             return false
+         Config.setNestedValue("background.widgets.outputOverrides", next)
+@@ -463,7 +632,7 @@ Singleton {
+     }
+ 
+     function savedOutputNames(): list<string> {
+-        return root._normalizedRecords().map(record => record.output).filter(name => !root.isLockScope(name))
++        return root._normalizedRecords().map(record => root.connectorFor(record.output)).filter(name => !root.isLockScope(name))
+     }
+ 
+     function diagnostics(): string {
+diff --git a/services/NiriService.qml b/services/NiriService.qml
+index c2cf070..b296c5d 100644
+--- a/services/NiriService.qml
++++ b/services/NiriService.qml
+@@ -144,6 +144,7 @@ Singleton {
+                     const outputsData = JSON.parse(fetchOutputsCollector.text)
+                     outputs = outputsData
+                     console.info("NiriService: Loaded", Object.keys(outputsData).length, "outputs")
++                    root.followMainDisplay()
+                     updateDisplayScales()
+                     if (windows.length > 0) {
+                         windows = sortWindowsByLayout(windows)
+@@ -223,6 +224,95 @@ Singleton {
+         return twins.length > 1 ? `${model} (${connector})` : model
+     }
+ 
++    // hp-snap: a display's lasting name, "make model serial", the way niri's config can name it.
++    // Connector names such as "Unknown-1" change each time a display behind a USB-C dock is plugged in.
++    function displayId(name: string): string {
++        const out = root.outputs?.[String(name ?? "")]
++        if (!out)
++            return ""
++        const make = String(out.make ?? "").trim()
++        const model = String(out.model ?? "").trim()
++        const serial = String(out.serial ?? "").trim()
++        if ((!make || make === "Unknown") && (!model || model === "Unknown") && !serial)
++            return ""
++        return `${make || "Unknown"} ${model || "Unknown"} ${serial || "Unknown"}`
++    }
++    function outputForDisplayId(id: string): string {
++        if (!id)
++            return ""
++        return Object.keys(root.outputs ?? {}).find(name => root.displayId(name) === id) ?? ""
++    }
++    // A display that is connected and in use (one turned off has no place on the desktop).
++    function outputInUse(name: string): bool {
++        return Boolean(root.outputs?.[String(name ?? "")]?.logical)
++    }
++
++    // The main display is remembered as the monitor itself: wherever it is plugged in, it is the main
++    // one again; while it is away or turned off the first display stands in.
++    function setMainDisplay(name: string): void {
++        const connector = String(name ?? "")
++        Config.setNestedValues({
++            "display.primaryMonitor": connector,
++            "display.primaryMonitorId": connector ? root.displayId(connector) : ""
++        })
++    }
++    function followMainDisplay(): void {
++        if (!Config.ready || Object.keys(root.outputs ?? {}).length === 0)
++            return
++        const id = String(Config.options?.display?.primaryMonitorId ?? "")
++        const chosen = String(Config.options?.display?.primaryMonitor ?? "")
++        if (!id) {
++            // Chosen before displays were remembered by their own name: remember that one now.
++            const remembered = root.outputInUse(chosen) ? root.displayId(chosen) : ""
++            if (remembered)
++                Config.setNestedValue("display.primaryMonitorId", remembered)
++            return
++        }
++        const found = root.outputForDisplayId(id)
++        const next = root.outputInUse(found) ? found : ""
++        if (next !== chosen)
++            Config.setNestedValue("display.primaryMonitor", next)
++    }
++    Connections {
++        target: Config
++        function onReadyChanged(): void { root.followMainDisplay() }
++    }
++
++    // Use a connected display, or leave it dark and out of the desktop; kept when it is plugged in again.
++    property string outputPowerError: ""
++    readonly property bool outputPowerBusy: outputPowerProcess.running
++    function setOutputPower(name: string, on: bool): void {
++        const connector = String(name ?? "")
++        if (!connector || outputPowerProcess.running)
++            return
++        if (!on && Object.keys(root.outputs ?? {}).filter(other => other !== connector && root.outputInUse(other)).length === 0) {
++            root.outputPowerError = Translation.tr("At least one display has to stay on.")
++            return
++        }
++        root.outputPowerError = ""
++        outputPowerProcess.command = ["python3", Quickshell.shellPath("scripts/niri-config.py"), "set-output-power", connector, on ? "on" : "off"]
++        outputPowerProcess.running = true
++    }
++    Process {
++        id: outputPowerProcess
++        stdout: StdioCollector {
++            id: outputPowerResult
++            onStreamFinished: {
++                try {
++                    const parsed = JSON.parse(outputPowerResult.text)
++                    root.outputPowerError = parsed?.error ? String(parsed.error) : ""
++                } catch (e) {}
++            }
++        }
++        onExited: exitCode => {
++            if (exitCode !== 0 && !root.outputPowerError)
++                root.outputPowerError = Translation.tr("Could not change that display.")
++            outputPowerRefresh.restart()
++        }
++    }
++    // niri takes a moment to reload its config and light or darken the display.
++    Timer { id: outputPowerRefresh; interval: 400; onTriggered: root.fetchOutputs() }
++
+     function fetchOutputs() {
+         if (!CompositorService.isNiri)
+             return
+@@ -447,8 +537,9 @@ Singleton {
+         // when they name an output we don't know, or a known output has none left.
+         const workspaceOutputs = new Set((data.workspaces ?? []).map(ws => ws.output).filter(name => !!name))
+         const knownOutputs = Object.keys(root.outputs ?? {})
++        const litOutputs = knownOutputs.filter(name => root.outputs[name]?.logical)
+         if ([...workspaceOutputs].some(name => !knownOutputs.includes(name))
+-                || knownOutputs.some(name => !workspaceOutputs.has(name)))
++                || litOutputs.some(name => !workspaceOutputs.has(name)))
+             fetchOutputs()
+ 
+         const newWorkspaces = {}
+@@ -796,6 +887,7 @@ Singleton {
+     function handleOutputsChanged(data) {
+         const nextOutputs = data?.outputs ?? {}
+         outputs = nextOutputs
++        root.followMainDisplay()
+         updateDisplayScales()
+ 
+         const outputNames = Object.keys(nextOutputs)

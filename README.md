@@ -52,7 +52,7 @@ and native PAM prerequisites from the original Simon installation.
 ## Included features
 
 - HP-OS shell, touchscreen gestures and long press, with laptop on-screen keyboard off.
-- Sunrise/sunset appearance, matching COSMIC Files with network-share support,
+- Sunrise/sunset appearance, HP-OS Files as the one file manager (folders, Trash, "Show in folder", network shares),
   notification history, working volume steps, and Emacs theme switching.
 - Ghostty 1.4 with the N1X presentation fix, seven ArtCraft apps, Microsoft 365
   web launchers and document handlers, BlueBubbles and optional Relay clipboard.

@@ -1,0 +1,53 @@
+--- a/src/widgets/pastejob.cpp
++++ b/src/widgets/pastejob.cpp
+@@ -11,9 +11,13 @@
+ #include "kio_widgets_debug.h"
+ #include "paste.h"
+ 
++#include <QClipboard>
++#include <QGuiApplication>
+ #include <QMimeData>
+ #include <QTimer>
+ 
++#include <algorithm>
++
+ #include <KIO/CopyJob>
+ #include <KIO/FileUndoManager>
+ #include <KJobWidgets>
+@@ -67,12 +71,35 @@
+     KIO::Job *job = nullptr;
+     KIO::CopyJob *copyJob = nullptr;
+     if (m_mimeData->hasUrls()) {
+-        const QList<QUrl> urls = sanitizeUrls(KUrlMimeData::urlsFromMimeData(m_mimeData, KUrlMimeData::PreferLocalUrls));
++        QList<QUrl> urls = sanitizeUrls(KUrlMimeData::urlsFromMimeData(m_mimeData, KUrlMimeData::PreferLocalUrls));
++        // HP-OS: pasting files into the folder they are already in, as on Windows and macOS.
++        // A Cut is already where it is pasted, so it stays put (no "would overwrite itself"
++        // question); a Copy makes copies beside them, numbered ("Report (1).pdf").
++        const QUrl destDir = m_destDir.adjusted(QUrl::StripTrailingSlash);
++        const auto alreadyHere = [&destDir](const QUrl &url) {
++            return url.adjusted(QUrl::RemoveFilename | QUrl::StripTrailingSlash).matches(destDir, QUrl::StripTrailingSlash);
++        };
++        const bool anyHere = std::any_of(urls.cbegin(), urls.cend(), alreadyHere);
++        if (move && anyHere) {
++            const QList<QUrl> cut = urls;
++            urls.erase(std::remove_if(urls.begin(), urls.end(), alreadyHere), urls.end());
++            if (urls.isEmpty()) {
++                // As after any move, the clipboard keeps the files as a copy (no longer dimmed).
++                auto *mime = new QMimeData();
++                mime->setUrls(cut);
++                QGuiApplication::clipboard()->setMimeData(mime);
++                q->emitResult();
++                return;
++            }
++        }
+         if (!urls.isEmpty()) {
+             if (move) {
+                 copyJob = KIO::move(urls, m_destDir, m_flags);
+             } else {
+                 copyJob = KIO::copy(urls, m_destDir, m_flags);
++                if (anyHere) {
++                    copyJob->setAutoRename(true);
++                }
+             }
+             QObject::connect(copyJob, &KIO::CopyJob::copyingDone, q, [this](KIO::Job *job, const QUrl &src, const QUrl &dest) {
+                 slotCopyingDone(job, src, dest);

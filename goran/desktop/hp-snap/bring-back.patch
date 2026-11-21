@@ -1,0 +1,144 @@
+diff --git a/modules/background/desktopItems/DesktopItemDelegate.qml b/modules/background/desktopItems/DesktopItemDelegate.qml
+index f2816ba..b381fee 100644
+--- a/modules/background/desktopItems/DesktopItemDelegate.qml
++++ b/modules/background/desktopItems/DesktopItemDelegate.qml
+@@ -197,6 +197,9 @@ Item {
+             return
+         }
+         if (root.isLauncher && root.targetAvailable) {
++            const file = root._pathForProbe().split("/").pop()
++            const scanned = (DesktopFolder.entries ?? []).find(entry => String(entry.path) === root._pathForProbe())
++            if (AppSearch.bringBack([scanned?.windowClass, file])) return
+             ShellExec.execDetachedArgs(["gio", "launch", root._pathForProbe()], "Open desktop launcher")
+             return
+         }
+@@ -207,7 +210,7 @@ Item {
+         if (root.isApplication) {
+             const entry = AppSearch.lookupDesktopEntry(root.target)
+             if (entry)
+-                AppSearch.launchEntry(entry)
++                AppSearch.openApp(entry)
+         } else if (root.isFolder) {
+             ShellExec.openDirectory(root._pathForProbe(), "Open desktop folder")
+         } else {
+diff --git a/modules/hpos/launcher/HposApplicationCenter.qml b/modules/hpos/launcher/HposApplicationCenter.qml
+index 981d2d8..8a60e5f 100644
+--- a/modules/hpos/launcher/HposApplicationCenter.qml
++++ b/modules/hpos/launcher/HposApplicationCenter.qml
+@@ -169,10 +169,7 @@ PanelWindow {
+     function openEntry(entry, newWindow) {
+         if (!entry) return
+         if (entry.isFolder) { openFolder = entry.name; search.clear(); grid.currentIndex = 0; grid.positionViewAtBeginning(); return }
+-        const wanted = String(entry.id).replace(/\.desktop$/, "").toLowerCase()
+-        const existing = NiriService.windows.find(win => String(AppSearch.lookupDesktopEntry(win.app_id)?.id ?? win.app_id).replace(/\.desktop$/, "").toLowerCase() === wanted)
+-        if (existing && !newWindow) NiriService.focusWindow(existing.id)
+-        else if (!AppSearch.launchEntry(entry)) return
++        if (newWindow ? !AppSearch.launchEntry(entry) : !AppSearch.openApp(entry)) return
+         GlobalStates.searchOpen = false
+     }
+     Item {
+diff --git a/modules/hpos/launcher/HposStartState.qml b/modules/hpos/launcher/HposStartState.qml
+index 8083ae5..83a4c89 100644
+--- a/modules/hpos/launcher/HposStartState.qml
++++ b/modules/hpos/launcher/HposStartState.qml
+@@ -40,10 +40,7 @@ Singleton {
+     function refresh() { if (!listing.running) listing.running = true }
+     function openApp(entry) {
+         if (!entry) return
+-        const wanted = String(entry.id).replace(/\.desktop$/, "").toLowerCase()
+-        const existing = NiriService.windows.find(win => String(AppSearch.lookupDesktopEntry(win.app_id)?.id ?? win.app_id).replace(/\.desktop$/, "").toLowerCase() === wanted)
+-        if (existing) NiriService.focusWindow(existing.id)
+-        else if (!AppSearch.launchEntry(entry)) return
++        if (!AppSearch.openApp(entry)) return
+         opened = false
+     }
+     function openFile(url) { ShellExec.execDetachedArgs(["xdg-open", url]); opened = false }
+diff --git a/modules/iris/palette/IrisPalette.qml b/modules/iris/palette/IrisPalette.qml
+index 648fa63..7b66612 100644
+--- a/modules/iris/palette/IrisPalette.qml
++++ b/modules/iris/palette/IrisPalette.qml
+@@ -170,10 +170,9 @@ Item {
+                 running: windows.length > 0,
+                 verb: windows.length > 0 ? Translation.tr("Switch to") : Translation.tr("Open"),
+                 execute: () => {
++                    if (AppSearch.bringBack([app.appId, entry?.id, entry?.startupClass])) return
+                     const focused = windows.find(window => window.activated) ?? windows[0]
+-                    if (focused && CompositorService.isNiri && focused.niriWindowId !== undefined)
+-                        NiriService.focusWindow(focused.niriWindowId)
+-                    else if (focused) focused.activate()
++                    if (focused) focused.activate()
+                     else if (entry) AppSearch.launchEntry(entry)
+                 }
+             }
+diff --git a/scripts/hp-snap/desktop_files.py b/scripts/hp-snap/desktop_files.py
+index 3eb9659..291a9c3 100644
+--- a/scripts/hp-snap/desktop_files.py
++++ b/scripts/hp-snap/desktop_files.py
+@@ -559,7 +559,8 @@ def scan():
+         if name.endswith(".desktop") and os.path.isfile(path):
+             fields = read_entry(path)
+             entry.update(kind="file", launcher=True, label=fields.get("Name") or name[:-8],
+-                         icon=fields.get("Icon", "application-x-executable"))
++                         icon=fields.get("Icon", "application-x-executable"),
++                         windowClass=fields.get("StartupWMClass", ""))
+             if fields.get("Type") == "Link" and fields.get("URL"):
+                 entry.update(link=fields["URL"], icon=fields.get("Icon", "text-html"))
+         elif os.path.isdir(path):
+diff --git a/services/AppSearch.qml b/services/AppSearch.qml
+index d296db2..6fab516 100644
+--- a/services/AppSearch.qml
++++ b/services/AppSearch.qml
+@@ -336,6 +336,40 @@ Singleton {
+         }
+     }
+ 
++    // HP-OS: opening an app that's already open brings its window back, a minimized one restored, instead of
++    // starting another copy (like the Dock, and like a Mac). keys: desktop ids and window classes of the app.
++    function bringBack(keys): bool {
++        if (!CompositorService.isNiri) return false
++        const stem = key => String(key ?? "").replace(/\.desktop$/i, "").trim().toLowerCase()
++        const wanted = (keys ?? []).map(stem).filter(key => key.length > 0)
++        if (wanted.length === 0) return false
++        const matches = (NiriService.windows ?? []).filter(win => {
++            if (wanted.includes(stem(win.app_id))) return true
++            const id = stem(root.lookupDesktopEntry(String(win.app_id ?? ""))?.id)
++            return id.length > 0 && wanted.includes(id)
++        })
++        if (matches.length === 0) return false
++        const stashed = matches.filter(win => MinimizedWindows.isMinimized(win.id))
++        const shown = matches.filter(win => !MinimizedWindows.isMinimized(win.id))
++        if (shown.length > 0) {
++            const latest = shown.reduce((a, b) => (Number(b.focus_timestamp?.secs ?? 0) * 1e9 + Number(b.focus_timestamp?.nanos ?? 0))
++                > (Number(a.focus_timestamp?.secs ?? 0) * 1e9 + Number(a.focus_timestamp?.nanos ?? 0)) ? b : a)
++            NiriService.focusWindow(latest.id, true)
++        } else {
++            const order = MinimizedWindows.minimizedIds
++            MinimizedWindows.restore(stashed.reduce((a, b) => order.indexOf(b.id) > order.indexOf(a.id) ? b : a).id)
++        }
++        return true
++    }
++
++    // Open from the desktop, search or the app grid: the open window if there is one, else a new one.
++    function openApp(entry): bool {
++        if (!entry) return false
++        const raw = entry.originalEntry ?? entry
++        if (root.bringBack([entry.id, raw?.id, raw?.startupClass])) return true
++        return root.launchEntry(entry)
++    }
++
+     function launchEntry(entry): bool {
+         if (!entry) return false
+ 
+diff --git a/services/deferred/LauncherSearch.qml b/services/deferred/LauncherSearch.qml
+index 52ae0b4..7876511 100644
+--- a/services/deferred/LauncherSearch.qml
++++ b/services/deferred/LauncherSearch.qml
+@@ -222,7 +222,7 @@ Singleton {
+                 comment: entry.comment ?? "",
+                 runInTerminal: entry.runInTerminal ?? false,
+                 genericName: entry.genericName ?? "",
+-                execute: () => { AppSearch.launchEntry(entry) }
++                execute: () => { AppSearch.openApp(entry) }
+             }))
+         }
+         result = result.concat(appResults)

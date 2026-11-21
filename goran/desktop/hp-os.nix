@@ -8,9 +8,32 @@ let
     sed 's#/usr/lib/aarch64-linux-gnu#/usr/lib/${ubuntuLibDir}#' ${./native-pam-bridge.py} > "$out"
   '';
   hpPkgs =hp-os.inputs.nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system};
+  # Files runs with its own settings folder and Qt theme (hp-os-files). This KIO
+  # starts the applications Files opens with the environment Files was started
+  # from, so they keep the user's own settings and sign-ins, and pastes files into
+  # the folder they are already in as Windows and macOS do (a Cut stays put, a Copy
+  # is numbered beside them). Only Files loads it.
+  filesKio = hpPkgs.kdePackages.kio.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [ ./hp-snap/files-launch-env.patch ./hp-snap/files-paste-in-place.patch ];
+  });
   # Files with a glass slot showing where a dropped item will land.
   filesWithDropSlot = hpPkgs.kdePackages.dolphin.overrideAttrs (old: {
-    patches = (old.patches or [ ]) ++ [ ./hp-snap/files-drop-slot.patch ];
+    # files-new-window: "Open in New Window", "Show in folder" and a detached tab
+    # start HP-OS Files (hp-os-files) rather than a bare "dolphin" off PATH.
+    patches = (old.patches or [ ]) ++ [ ./hp-snap/files-drop-slot.patch ./hp-snap/files-new-window.patch ];
+    nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ hpPkgs.patchelf ];
+    # Load the KIO above. Its libraries are the same build with one change, so
+    # every library Files loads shares the copy the program itself loads first.
+    postFixup = (old.postFixup or "") + ''
+      patched=0
+      for elf in "$out"/bin/.dolphin-wrapped "$out"/bin/dolphin "$out"/lib/libdolphinprivate.so.*; do
+        [ -f "$elf" ] && [ ! -L "$elf" ] || continue
+        patchelf --print-needed "$elf" 2>/dev/null | grep -qx 'libKF6KIOGui.so.6' || continue
+        patchelf --set-rpath "${filesKio}/lib:$(patchelf --print-rpath "$elf")" "$elf"
+        patched=$((patched + 1))
+      done
+      [ "$patched" -ge 2 ] || { echo "Files: expected to point Dolphin at the HP-OS KIO" >&2; exit 1; }
+    '';
   });
   originalQs = hpPkgs.quickshell;
   originalShell = hp-os.packages.${pkgs.stdenv.hostPlatform.system}.default;
@@ -55,7 +78,6 @@ PYWRAP
     passthru = old.passthru // { niri = sessionNiri; touchSupport = globalTouchSupport; };
     postFixup = (old.postFixup or "") + ''
       ${pkgs.python3}/bin/python3 ${./hp-os-battery.py} "$out/share/hp-os/packaging/default-config.json"
-      ${pkgs.python3}/bin/python3 ${./cosmic-files-default.py} "$out/share/hp-os/packaging/default-config.json"
       for touchTool in touch-support hp-os-keyboard; do
         ln -sfn ${globalTouchSupport}/bin/$touchTool "$out/bin/$touchTool"
       done
@@ -72,7 +94,7 @@ PYWRAP
       ${pkgs.python3}/bin/python3 ${./hp-snap/launcher.py} \
         "$out/bin/.hp-os-wrapped" "$out/bin/hp-os" ${snap.xwaylandSatellite}
       ${pkgs.bash}/bin/bash ${./hp-snap/fix-icons.sh} \
-        "$out/share/hp-os/packaging/files/data/icons" ${./hp-snap/icons/trash.svg}
+        "$out/share/hp-os/packaging/files/data/icons" ${./hp-snap/icons/trash.svg} ${./hp-snap/icons/trash-full.svg}
       ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} \
         ${./hp-snap/defaults.json} "$out/share/hp-os/packaging/default-config.json"
       ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} \
@@ -171,7 +193,7 @@ export QT_WAYLAND_DECORATION="''${QT_WAYLAND_DECORATION:-adwaita}"'
     exec ${shell}/bin/hp-os session "$@"
   '';
 in {
-  imports = [ ./upscayl/home.nix ./wallpapers/home.nix hp-os.homeManagerModules.default ./hp-os-appearance-schedule.nix ./hp-snap/home.nix ];
+  imports = [ ./upscayl/home.nix ./wallpapers/home.nix hp-os.homeManagerModules.default ./hp-os-appearance-schedule.nix ./hp-snap/home.nix ./hp-os-default-apps.nix ];
   options.programs.goran-hp-os.enable = lib.mkEnableOption "the additional HP-OS login session";
   options.programs.goran-hp-os.hpSnap.enable = lib.mkEnableOption
     "hp-snap's patched niri, xwayland-satellite and shell (goran/desktop/hp-snap)" // { default = true; };
@@ -207,12 +229,30 @@ in {
     '';
     home.activation.hpOsDesktopControls = lib.hm.dag.entryAfter [ "linkGeneration" "hposNiriBindings" ] ''
       run ${pkgs.python3}/bin/python3 ${./hp-os-battery.py} "$HOME/.config/hp-os/config.json"
+      run ${pkgs.python3}/bin/python3 ${./files-dock-pin.py} "$HOME/.config/hp-os/config.json"
     '';
     home.packages = [ fonts launcher ];
     # Keep launcher discovery current during a preserved session whose
     # XDG_DATA_DIRS still includes the previous HP-OS store generation.
     xdg.dataFile."applications/org.kde.dolphin.desktop".source =
       "${shell}/share/hp-os/applications/org.kde.dolphin.desktop";
+    # Files is the one file manager: folders, the Dock's Trash, and "Show in
+    # folder" from other apps (org.freedesktop.FileManager1, which otherwise
+    # starts the system's Nautilus or an unthemed Dolphin) all open in it.
+    xdg.mimeApps.defaultApplications."inode/directory" = [ "org.kde.dolphin.desktop" ];
+    xdg.dataFile."applications/hp-os-trash.desktop".source =
+      "${shell}/share/applications/hp-os-trash.desktop";
+    xdg.dataFile."dbus-1/services/org.freedesktop.FileManager1.service".text = ''
+      [D-BUS Service]
+      Name=org.freedesktop.FileManager1
+      Exec=${shell}/bin/hp-os-files --daemon
+    '';
+    # An unmanaged Trash launcher from an earlier build pointed at a Files without
+    # today's changes. Keep it, set aside, so the managed one above can replace it.
+    home.activation.hpOsFilesStaleTrash = lib.hm.dag.entryBefore [ "checkLinkTargets" ] ''
+      run ${pkgs.python3}/bin/python3 ${./hp-snap/files-stale-launchers.py} \
+        "${config.xdg.dataHome}/applications" "${config.xdg.stateHome}/hp-os/files-migration"
+    '';
     # Files: right-click a picture > Set as Wallpaper.
     xdg.dataFile."kio/servicemenus/hp-os-set-wallpaper.desktop" = lib.mkIf useSnap {
       executable = true;

@@ -145,5 +145,58 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
 
+    def test_record_adds_opened_files_where_gtk_keeps_them(self):
+        target = self.home / 'Desktop' / 'Report (1) & notes.pdf'
+        target.parent.mkdir()
+        target.write_bytes(b'%PDF-1.4')
+        gtk = (self.data / 'recently-used.xbel')
+        gtk.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<xbel version="1.0"\n'
+                       '      xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks"\n'
+                       '      xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info"\n>\n'
+                       '  <bookmark href="file:///elsewhere/kept.txt" added="2026-11-01T04:47:31.156340Z" '
+                       'modified="2026-11-01T04:47:31.156344Z" visited="2026-11-01T04:47:31.156342Z">\n'
+                       '    <info><metadata owner="http://freedesktop.org"><mime:mime-type type="text/plain"/>'
+                       '<bookmark:applications><bookmark:application name="Text Editor" exec="&apos;gnome-text-editor %u&apos;" '
+                       'modified="2026-11-01T04:47:31.156345Z" count="2"/></bookmark:applications></metadata></info>\n'
+                       '  </bookmark>\n</xbel>\n')
+        self.run_cli('record', str(target))
+        self.run_cli('record', str(target), str(self.home / 'missing.txt'))
+        text = gtk.read_text()
+        self.assertIn('file:///elsewhere/kept.txt', text)                  # the list's other files stay
+        self.assertIn('href="file://' + str(target.parent) + '/Report%20(1)%20&amp;%20notes.pdf"', text)
+        self.assertNotIn('missing.txt', text)
+        self.assertEqual(oct(gtk.stat().st_mode & 0o777), '0o600')
+        files = self.listing()['files']
+        self.assertEqual(files[0]['path'], str(target))
+        self.assertEqual(files[0]['mime'], 'application/pdf')
+        try:
+            import gi
+            from gi.repository import GLib
+        except ImportError:
+            gi = None
+        if gi is None:
+            return
+        bookmarks = GLib.BookmarkFile()
+        bookmarks.load_from_file(str(gtk))                                   # GTK's own parser reads it
+        uri = 'file://' + str(target.parent) + '/Report%20(1)%20&%20notes.pdf'
+        self.assertEqual(bookmarks.get_mime_type(uri), 'application/pdf')
+        self.assertEqual(bookmarks.get_application_info(uri, 'HP-OS')[2], 2)  # opened twice
+        self.assertEqual(bookmarks.get_application_info('file:///elsewhere/kept.txt', 'Text Editor')[2], 2)
+
+    def test_record_never_rewrites_a_list_it_cannot_read(self):
+        target = self.home / 'a.txt'
+        target.write_text('a')
+        broken = self.data / 'recently-used.xbel'
+        broken.write_text('<xbel version="1.0"><bookmark')
+        self.assertNotEqual(self.run_cli('record', str(target), success=False).returncode, 0)
+        self.assertEqual(broken.read_text(), '<xbel version="1.0"><bookmark')
+
+    def test_record_starts_a_list_when_there_is_none(self):
+        target = self.home / 'a.txt'
+        target.write_text('a')
+        self.run_cli('record', str(target))
+        self.assertEqual(self.listing()['files'][0]['path'], str(target))
+
+
 if __name__ == '__main__':
     unittest.main()

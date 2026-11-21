@@ -150,7 +150,7 @@ inactiveBlend=239,240,241
 inactiveForeground=112,125,138
 
 [Icons]
-Theme=HP-OS
+Theme=HP-OS-Files
 
 [Toolbar style]
 ToolButtonStyle=IconOnly

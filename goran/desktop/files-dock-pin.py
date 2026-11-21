@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Replace only the Files dock pin, retaining the user's other HP-OS settings."""
+"""Point a COSMIC Files dock pin at HP-OS Files, retaining the user's other HP-OS settings.
+
+HP-OS Files (Dolphin) is the one file manager. Accounts that pinned COSMIC Files
+get HP-OS Files in the same place; nothing else in the dock changes.
+"""
 import json
 import os
 from pathlib import Path
@@ -13,18 +17,16 @@ def update(path):
     config = json.loads(path.read_text())
     dock = config.setdefault('dock', {})
     old = dock.get('pinnedApps', [])
-    files = 'com.system76.CosmicFiles'
+    files = 'org.kde.dolphin'
     pins = []
     for app in old:
-        app = files if app in ('org.kde.dolphin', 'org.kde.dolphin.desktop') else app
+        app = files if app in ('com.system76.CosmicFiles', 'com.system76.CosmicFiles.desktop') else app
         if app not in pins:
             pins.append(app)
-    if files not in pins:
-        pins.insert(0, files)
     if pins == old:
         return False
     dock['pinnedApps'] = pins
-    fd, temporary = tempfile.mkstemp(prefix='.cosmic-files-', dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix='.files-dock-pin-', dir=path.parent)
     try:
         os.fchmod(fd, path.stat().st_mode & 0o777)
         with os.fdopen(fd, 'w') as stream:

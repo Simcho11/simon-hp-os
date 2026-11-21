@@ -1,0 +1,72 @@
+--- a/src/gui/kprocessrunner.cpp
++++ b/src/gui/kprocessrunner.cpp
+@@ -41,6 +41,8 @@
+ #include <QDir>
+ #include <QFileInfo>
+ #include <QGuiApplication>
++#include <QJsonDocument>
++#include <QJsonObject>
+ #include <QProcess>
+ #include <QStandardPaths>
+ #include <QString>
+@@ -248,8 +250,60 @@
+     init(KService::Ptr(), QString{}, execName /*user-visible name*/, asn);
+ }
+ 
++// HP-OS: Files (Dolphin) runs with its own settings folder, Qt plugins and
++// theme. Applications it opens must not inherit those, or they would start
++// with separate settings and sign-ins. hp-os-files saves the environment Files
++// was started with in HP_OS_FILES_PARENT_ENV; start applications from it,
++// keeping anything KIO or the caller changed for this launch.
++static void hposUseParentEnvironment(KProcess &process)
++{
++    static const QJsonObject parent = [] {
++        const QByteArray saved = qgetenv("HP_OS_FILES_PARENT_ENV");
++        if (saved.isEmpty()) {
++            return QJsonObject();
++        }
++        const QJsonDocument document = QJsonDocument::fromJson(saved);
++        if (!document.isObject()) {
++            qCWarning(KIO_GUI) << "HP_OS_FILES_PARENT_ENV is not a JSON object; applications keep the inherited environment";
++            return QJsonObject();
++        }
++        return document.object();
++    }();
++    if (parent.isEmpty()) {
++        return;
++    }
++    const QProcessEnvironment current = QProcessEnvironment::systemEnvironment();
++    QProcessEnvironment requested = process.processEnvironment();
++    if (requested.isEmpty()) {
++        requested = current;
++    }
++    QProcessEnvironment result;
++    for (auto it = parent.constBegin(); it != parent.constEnd(); ++it) {
++        if (it.value().isString()) {
++            result.insert(it.key(), it.value().toString());
++        }
++    }
++    const QStringList requestedKeys = requested.keys();
++    for (const QString &key : requestedKeys) {
++        if (!current.contains(key) || current.value(key) != requested.value(key)) {
++            result.insert(key, requested.value(key));
++        }
++    }
++    const QStringList currentKeys = current.keys();
++    for (const QString &key : currentKeys) {
++        if (!requested.contains(key)) {
++            result.remove(key);
++        }
++    }
++    result.remove(QStringLiteral("HP_OS_FILES_PARENT_ENV"));
++    if (!result.isEmpty()) {
++        process.setProcessEnvironment(result);
++    }
++}
++
+ void KProcessRunner::init(const KService::Ptr &service, const QString &serviceEntryPath, const QString &userVisibleName, const QByteArray &asn)
+ {
++    hposUseParentEnvironment(*m_process);
+     m_serviceEntryPath = serviceEntryPath;
+     if (service && !serviceEntryPath.isEmpty() && !KDesktopFile::isAuthorizedDesktopFile(serviceEntryPath)) {
+         qCWarning(KIO_GUI) << "No authorization to execute" << serviceEntryPath;

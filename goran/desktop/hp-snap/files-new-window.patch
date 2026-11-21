@@ -1,0 +1,69 @@
+--- a/src/global.h
++++ b/src/global.h
+@@ -32,6 +32,13 @@
+ void openNewWindow(const QList<QUrl> &urls = {}, QWidget *window = nullptr, const OpenNewWindowFlags &flags = OpenNewWindowFlag::None);
+ 
+ /**
++ * HP-OS: the program that starts another Files window. hp-os-files sets
++ * HP_OS_FILES_LAUNCHER to itself so new windows get the HP-OS Files profile
++ * and theme; "dolphin" is not on HP-OS's PATH.
++ */
++QString filesProgram();
++
++/**
+  * Attaches URLs to an existing Dolphin instance if possible.
+  * If @p preferredService is a valid dbus service, it will be tried first.
+  * @p preferredService needs to support the org.kde.dolphin.MainWindow dbus interface with the /dolphin/Dolphin_1 path.
+--- a/src/global.cpp
++++ b/src/global.cpp
+@@ -15,9 +15,11 @@
+ #include <KDialogJobUiDelegate>
+ #include <KIO/ApplicationLauncherJob>
+ #include <KService>
++#include <KShell>
+ #include <KWindowSystem>
+ 
+ #include <QApplication>
++#include <QFileInfo>
+ 
+ QList<QUrl> Dolphin::validateUris(const QStringList &uriList)
+ {
+@@ -39,9 +41,18 @@
+     return QUrl::fromUserInput(GeneralSettings::homeUrl(), QString(), QUrl::AssumeLocalFile);
+ }
+ 
++QString Dolphin::filesProgram()
++{
++    const QString launcher = qEnvironmentVariable("HP_OS_FILES_LAUNCHER");
++    if (!launcher.isEmpty() && QFileInfo(launcher).isExecutable()) {
++        return launcher;
++    }
++    return QStringLiteral("dolphin");
++}
++
+ void Dolphin::openNewWindow(const QList<QUrl> &urls, QWidget *window, const OpenNewWindowFlags &flags)
+ {
+-    QString command = QStringLiteral("dolphin --new-window");
++    QString command = KShell::quoteArg(filesProgram()) + QStringLiteral(" --new-window");
+ 
+     if (flags.testFlag(OpenNewWindowFlag::Select)) {
+         command.append(QLatin1String(" --select"));
+--- a/src/dolphintabwidget.cpp
++++ b/src/dolphintabwidget.cpp
+@@ -9,6 +9,7 @@
+ #include "dolphin_generalsettings.h"
+ #include "dolphintabbar.h"
+ #include "dolphinviewcontainer.h"
++#include "global.h"
+ #include "views/draganddrophelper.h"
+ 
+ #include <KAcceleratorManager>
+@@ -407,7 +408,7 @@
+     }
+     args << QStringLiteral("--new-window");
+ 
+-    KIO::CommandLauncherJob *job = new KIO::CommandLauncherJob("dolphin", args, this);
++    KIO::CommandLauncherJob *job = new KIO::CommandLauncherJob(Dolphin::filesProgram(), args, this);
+     job->setDesktopName(QStringLiteral("org.kde.dolphin"));
+     job->start();
+ 
