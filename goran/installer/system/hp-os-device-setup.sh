@@ -18,11 +18,12 @@ state=/var/lib/hp-os
 if [[ "${1:-}" == --undo ]]; then
     systemctl disable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-factory-wipe.service \
         hp-os-update.socket hp-os-update-check.timer hp-os-update-settle.service hp-os-login-wallpaper.socket \
-        hp-os-recovery.socket 2>/dev/null || true
+        hp-os-recovery.socket hp-os-app-install.socket 2>/dev/null || true
     rm -f "$units"/hp-os-update.socket "$units"/hp-os-update@.service "$units"/hp-os-update-job.service \
           "$units"/hp-os-update-check.service "$units"/hp-os-update-check.timer "$units"/hp-os-update-settle.service \
           "$units"/hp-os-login-wallpaper.socket "$units"/hp-os-login-wallpaper@.service \
-          "$units"/hp-os-recovery.socket "$units"/hp-os-recovery@.service
+          "$units"/hp-os-recovery.socket "$units"/hp-os-recovery@.service \
+          "$units"/hp-os-app-install.socket "$units"/hp-os-app-install@.service "$units"/hp-os-app-install-job@.service
     rm -f "$units"/hp-os-factory-reset.socket "$units"/hp-os-factory-reset@.service "$units"/hp-os-first-setup.socket \
           "$units"/hp-os-first-setup@.service "$units"/hp-os-factory-wipe.service "$state/factory-reset-request"
     rm -rf /opt/hp-os/device
@@ -54,6 +55,8 @@ install -m 755 -o root -g root "$here/hp-os-login-wallpaper.py" /opt/hp-os/devic
 install -d -m 755 "$state/login-wallpapers"
 /usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-recovery.py"
 install -m 755 -o root -g root "$here/hp-os-recovery.py" /opt/hp-os/device/hp-os-recovery
+/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-app-install.py"
+install -m 755 -o root -g root "$here/hp-os-app-install.py" /opt/hp-os/device/hp-os-app-install
 
 # Downloads and builds run as this account, which can't touch anyone's files.
 id hp-os-updater >/dev/null 2>&1 || useradd --system --home-dir "$state/update/home" --shell /usr/sbin/nologin hp-os-updater
@@ -243,9 +246,44 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
+# App Installer: an app downloaded as a .deb file, installed with an administrator's password.
+cat > "$units/hp-os-app-install.socket" <<UNIT
+[Unit]
+Description=HP-OS App Installer requests
+
+[Socket]
+ListenStream=/run/hp-os/app-install.sock
+SocketMode=0666
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+UNIT
+cat > "$units/hp-os-app-install@.service" <<UNIT
+[Unit]
+Description=HP-OS App Installer request
+
+[Service]
+ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-app-install request
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+UNIT
+# Runs on its own, so closing the window never stops an install halfway.
+cat > "$units/hp-os-app-install-job@.service" <<UNIT
+[Unit]
+Description=Install an app for HP-OS App Installer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-app-install job %i
+TimeoutStartSec=3600
+UNIT
 systemctl daemon-reload
 systemctl enable --now hp-os-factory-reset.socket hp-os-first-setup.socket hp-os-update.socket hp-os-update-check.timer \
-    hp-os-login-wallpaper.socket hp-os-recovery.socket >/dev/null
+    hp-os-login-wallpaper.socket hp-os-recovery.socket hp-os-app-install.socket >/dev/null
 systemctl enable hp-os-factory-wipe.service hp-os-update-settle.service >/dev/null
 
 # Laptops made with the USB installer show the HP logo early in startup.

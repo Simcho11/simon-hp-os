@@ -22,7 +22,7 @@ niri=/opt/hp-os/niri-patch/result-hpos/bin/niri
 if [[ "${1:-}" == --undo ]]; then
     "$here/hp-os-settings-access.sh" --undo
     "$here/hp-os-device-setup.sh" --undo
-    rm -f "$launcher"
+    rm -f "$launcher" /usr/share/applications/hp-os-app-installer.desktop
     update-desktop-database -q /usr/share/applications || true
     "$here/hp-os-login-theme.sh" --undo-last
     [[ ! -f "$greeter_backup" ]] || cp -a "$greeter_backup" "$greeter"
@@ -55,6 +55,19 @@ NoDisplay=true
 Terminal=false
 EOF
 chmod 644 "$launcher"
+# App Installer: what a downloaded app's .deb file opens in.
+cat > /usr/share/applications/hp-os-app-installer.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=App Installer
+Comment=Install an app you downloaded
+Icon=system-software-install
+Exec=$profile/bin/hp-os-app-installer %f
+MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-debian-package;
+NoDisplay=true
+Terminal=false
+EOF
+chmod 644 /usr/share/applications/hp-os-app-installer.desktop
 update-desktop-database -q /usr/share/applications
 
 # Brightness, touchpad feedback and AirDrop for every account. Before the accounts are updated below,

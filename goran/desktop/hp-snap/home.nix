@@ -34,6 +34,13 @@ let
   '';
 in {
   config = lib.mkIf enabled (lib.mkMerge [
+  {
+    # A downloaded app's .deb file opens in App Installer (the system's launcher for it, from hp-os-add-user.sh),
+    # not in Archive Manager, which only showed what's inside. Low priority: an account's own choice wins.
+    xdg.mimeApps.defaultApplications = lib.genAttrs
+      [ "application/vnd.debian.binary-package" "application/x-deb" "application/x-debian-package" ]
+      (_: lib.mkOverride 900 [ "hp-os-app-installer.desktop" ]);
+  }
   (lib.mkIf config.programs.goran-hp-os.hpSnap.manageHouseDefaults {
     # The niri settings hp-snap's shell relies on (from Simon's config.d/50-startup.kdl, without
     # his personal entries). Without the layer rule, the Applications view's blur never clears.

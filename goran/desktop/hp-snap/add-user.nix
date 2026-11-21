@@ -74,6 +74,18 @@ pkgs.runCommand "hp-os-add-user" { } ''
   sed -i 's/^  //' "$out/bin/hp-os-welcome"
   chmod +x "$out/bin/hp-os-welcome"
 
+  # App Installer: opening a downloaded .deb file (HP-OS's launcher for that file type starts this with its path).
+  mkdir -p "$app/app-installer"
+  cp ${./add-user/app-installer.qml} "$app/app-installer/shell.qml"
+  cp ${./add-user/app-install-client.py} "$app/app-installer/app-install-client.py"
+  cat > "$out/bin/hp-os-app-installer" <<EOF
+  #!/bin/sh
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic HP_OS_INSTALL_FILE="\''${1:-}"
+  exec ${quickshell}/bin/quickshell -n -p "$app/app-installer/shell.qml"
+  EOF
+  sed -i 's/^  //' "$out/bin/hp-os-app-installer"
+  chmod +x "$out/bin/hp-os-app-installer"
+
   # Settings > General > Software Update.
   cat > "$out/bin/hp-os-software-update" <<EOF
   #!/bin/sh
