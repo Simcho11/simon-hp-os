@@ -1,6 +1,7 @@
 {
   description = "Simon HP-OS desktop for Ubuntu 26.04 ARM64";
   inputs = {
+    debug-tools.url = "github:jonathanwilner/simon-hp-os/5f7cc2aeeefbf921368ef4edec666cde064c4761?dir=flakes/debug-tools";
     owly = { url = "github:t4t5/owly/6f2e8ea99aed0687558d78a1dd49154ab3a5fa76"; inputs.nixpkgs.follows = "nixpkgs"; };
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     home-manager = { url = "github:nix-community/home-manager"; inputs.nixpkgs.follows = "nixpkgs"; };
@@ -11,7 +12,7 @@
     dms-plugin-registry = { url = "github:AvengeMedia/dms-plugin-registry/bd0adca992b502178e70cc015f2a34f2b7031186"; inputs.nixpkgs.follows = "nixpkgs"; };
     xwayland-satellite = { url = "github:Supreeeme/xwayland-satellite/8d135d3b2854b30fd01ea6cd6c27e523dd50a839"; inputs.nixpkgs.follows = "nixpkgs"; };
   };
-  outputs = { self, owly, nixpkgs, home-manager, hp-os, codex-fleet, ghostty-upstream, dank-material-shell, dms-plugin-registry, xwayland-satellite, ... }:
+  outputs = { self, debug-tools, owly, nixpkgs, home-manager, hp-os, codex-fleet, ghostty-upstream, dank-material-shell, dms-plugin-registry, xwayland-satellite, ... }:
     let
       system = "aarch64-linux";
       ghosttyCpuPresentation = ghostty-upstream.packages.${system}.default.overrideAttrs (old: {
@@ -77,8 +78,9 @@
         system = "x86_64-linux";
         modules = [ self.nixosModules.branding { programs.hp-os-branding.enable = true; } (import ./tests/desktop-vm/configuration.nix { inherit hp-os home-manager owly; }) ];
       };
+      homeModules.debugTools = debug-tools.homeModules.default;
       homeModules.fleetApps = { pkgs, lib, ... }: {
-        imports = [ ./fleet/home.nix ];
+        imports = [ ./fleet/home.nix self.homeModules.debugTools ];
         _module.args.owlySource = owly;
         programs.hp-os-fleet.release.revision = self.rev or "unknown";
         programs.hp-os-fleet.ghostty.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.ghostty;
@@ -91,6 +93,7 @@
         _module.args.snapdragonHpOsFonts = pkgs.callPackage (hp-os + "/packaging/fonts") { };
         _module.args.snapdragonDms = dank-material-shell.packages.${pkgs.stdenv.hostPlatform.system}.default;
         programs.hp-os-snapdragon.enable = true;
+        programs.fleet-debug-tools.enable = true;
         # Goran's N1X CPU presentation workaround is specific to its NVIDIA GPU.
         programs.hp-os-fleet.ghostty.package = ghostty-upstream.packages.${pkgs.stdenv.hostPlatform.system}.default;
       };
@@ -161,7 +164,11 @@
         };
         modules = [
           ./fleet/home.nix
-          { programs.hp-os-fleet.release.revision = self.rev or "unknown"; }
+          self.homeModules.debugTools
+          {
+            programs.hp-os-fleet.release.revision = self.rev or "unknown";
+            programs.fleet-debug-tools.enable = true;
+          }
           ./goran/installer/simon-home.nix
           ./goran/remote-access/simon.nix
           ./goran/installer/simon-apps.nix

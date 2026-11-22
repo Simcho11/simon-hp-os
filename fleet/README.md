@@ -12,6 +12,14 @@ Simon can merge public main with `bash goran/installer/update-desktop.sh`. His c
 
 Upscayl updates are managed by Home Manager. On Ubuntu with AppArmor, activation installs a policy for the exact pinned Electron executable using passwordless sudo. This allows its user-namespace sandbox without disabling the sandbox. Linux hosts without that Ubuntu AppArmor tool path skip this activation step.
 
+## Debugging tools
+
+The shared fleet module imports the pinned [debugging tools flake](https://github.com/jonathanwilner/simon-hp-os/tree/5f7cc2aeeefbf921368ef4edec666cde064c4761/flakes/debug-tools).
+Simon and Ubuntu Snapdragon enable the tools in their profiles. Other Home
+Manager consumers set `programs.fleet-debug-tools.enable = true;`. Set
+`programs.fleet-debug-tools.exclude` to keep a host-specific package for an
+individual tool.
+
 ## Media keys
 
 `media-keys.nix` installs `hp-os-media-key` with pinned WirePlumber and playerctl

@@ -79,6 +79,27 @@
         "type": "github"
       }
     },
+    "debug-tools": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "dir": "flakes/debug-tools",
+        "lastModified": 1795366306,
+        "narHash": "sha256-vf4R/W6tnHuM0V3i+rbdZ6JgKIyMY0og6i2SLYv3s6k=",
+        "owner": "jonathanwilner",
+        "repo": "simon-hp-os",
+        "rev": "5f7cc2aeeefbf921368ef4edec666cde064c4761",
+        "type": "github"
+      },
+      "original": {
+        "dir": "flakes/debug-tools",
+        "owner": "jonathanwilner",
+        "repo": "simon-hp-os",
+        "rev": "5f7cc2aeeefbf921368ef4edec666cde064c4761",
+        "type": "github"
+      }
+    },
     "dms-plugin-registry": {
       "inputs": {
         "nixpkgs": [
@@ -175,7 +196,7 @@
       "inputs": {
         "flake-compat": "flake-compat_2",
         "home-manager": "home-manager",
-        "nixpkgs": "nixpkgs",
+        "nixpkgs": "nixpkgs_2",
         "systems": "systems_2",
         "zig": "zig",
         "zon2nix": "zon2nix"
@@ -239,7 +260,7 @@
     "hp-os": {
       "inputs": {
         "inir": "inir",
-        "nixpkgs": "nixpkgs_2"
+        "nixpkgs": "nixpkgs_3"
       },
       "locked": {
         "path": "./vendor/HP-OSShell",
@@ -270,6 +291,22 @@
     },
     "nixpkgs": {
       "locked": {
+        "lastModified": 1795249095,
+        "narHash": "sha256-8JDgyVvWUZg5m9hNlL8Ge9aT647ng3Ukc8NPMiKNTPQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "93a9ed0a866099a230ed5146a5bb7d16fd5c9b14",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
+      "locked": {
         "lastModified": 1790981744,
         "narHash": "sha256-NkNW1Y9AiuKO0HfeTnY555OJTYq9MQE3+Wz4kfBp/fI=",
         "rev": "55ba7f49ef2962b42cbd126522b7df5f95037679",
@@ -281,7 +318,7 @@
         "url": "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst"
       }
     },
-    "nixpkgs_2": {
+    "nixpkgs_3": {
       "locked": {
         "lastModified": 1792502884,
         "narHash": "sha256-IoNisKcGbUjdd45qCqywGMCYmZ5EnkxezvLII0FWwNA=",
@@ -297,7 +334,7 @@
         "type": "github"
       }
     },
-    "nixpkgs_3": {
+    "nixpkgs_4": {
       "locked": {
         "lastModified": 1790570722,
         "narHash": "sha256-Avcz96Q+8OkfUIUXipBBVsQn19L622BtKP7mk6M+uls=",
@@ -338,11 +375,12 @@
       "inputs": {
         "codex-fleet": "codex-fleet",
         "dank-material-shell": "dank-material-shell",
+        "debug-tools": "debug-tools",
         "dms-plugin-registry": "dms-plugin-registry",
         "ghostty-upstream": "ghostty-upstream",
         "home-manager": "home-manager_2",
         "hp-os": "hp-os",
-        "nixpkgs": "nixpkgs_3",
+        "nixpkgs": "nixpkgs_4",
         "owly": "owly",
         "xwayland-satellite": "xwayland-satellite"
       }
