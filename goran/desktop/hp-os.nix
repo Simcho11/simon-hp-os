@@ -86,8 +86,8 @@ PYWRAP
       substituteInPlace "$out/bin/hp-os" "$out/bin/hp-os-toggle-floating-all" \
         --replace-fail '${originalShell.niri}' '${sessionNiri}'
       substituteInPlace "$out/bin/.hp-os-wrapped" \
-        --replace-fail 'exec qs -n -p "$runtime" "$@"' \
-        'exec ${nativePamRun} -n -p "$runtime" "$@"'
+        --replace-fail 'shell_command=(qs)' \
+        'shell_command=(${nativePamRun})'
     '' + lib.optionalString useSnap ''
       substituteInPlace "$out/bin/.hp-os-wrapped" \
         --replace-fail '${originalShell.shell}' '${snap.runtime}'
@@ -119,11 +119,11 @@ export QT_WAYLAND_DECORATION="''${QT_WAYLAND_DECORATION:-adwaita}"'
       # SDDM can create config.json before the shell starts. Apply each migration
       # after first-login seeding and before Quickshell reads that configuration.
       substituteInPlace "$out/bin/.hp-os-wrapped" \
-        --replace-fail '    python3 "$packaging/write-version.py" "$config"' \
-        '    ${lib.optionalString cfg.hpSnap.manageHouseDefaults "python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/defaults.json} \"$config/config.json\" \"$INIR_STATE_DIR/hp-snap-defaults-v4\""}
-    ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/glass-and-tray.json} "$config/config.json" "$INIR_STATE_DIR/hp-snap-glass-tray-v2"
-    ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/window-space.json} "$config/config.json" "$INIR_STATE_DIR/hp-snap-window-space-v1"
-    python3 "$packaging/write-version.py" "$config"'
+        --replace-fail '  python3 "$packaging/write-version.py" "$config"' \
+        '  ${lib.optionalString cfg.hpSnap.manageHouseDefaults "python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/defaults.json} \"$config/config.json\" \"$INIR_STATE_DIR/hp-snap-defaults-v4\""}
+  ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/glass-and-tray.json} "$config/config.json" "$INIR_STATE_DIR/hp-snap-glass-tray-v2"
+  ${pkgs.python3}/bin/python3 ${./hp-snap/apply-defaults.py} ${./hp-snap/window-space.json} "$config/config.json" "$INIR_STATE_DIR/hp-snap-window-space-v1"
+  python3 "$packaging/write-version.py" "$config"'
       substituteInPlace "$out/bin/hp-os-files" \
         --replace-fail 'env["QT_PLUGIN_PATH"] = "' 'env["QT_PLUGIN_PATH"] = "${hpPkgs.qt6.qtwayland}/${hpPkgs.qt6.qtbase.qtPluginPrefix}:'
       # Files shows a glass slot where a dropped item will land.
@@ -184,8 +184,24 @@ export QT_WAYLAND_DECORATION="''${QT_WAYLAND_DECORATION:-adwaita}"'
     ${lib.optionalString useSnap (builtins.readFile ./hp-snap/login-backdrop.py)}
     include = 'include "config.d/61-goran-ime.kdl"'
     write(root/'config.d/61-goran-ime.kdl', ${builtins.toJSON (if keyboardEnabled then "// HP-OS controller owns this session's input-method seat.\n" else "// Private HP-OS bus only; never replace another session's IME.\nspawn-at-startup \"${pkgs.fcitx5}/bin/fcitx5\" \"-D\"\n")})
+    # The touchscreen belongs to the laptop's own screen, whose name differs between laptops
+    # (eDP-1, eDP-2, LVDS-1, DSI-1...). A connected one first; eDP-1 if there is none.
+    import re
+    panels = []
+    try:
+        connectors = sorted(os.listdir('/sys/class/drm'))
+    except OSError:
+        connectors = []
+    for name in connectors:
+        if re.fullmatch(r'card\d+-(eDP|LVDS|DSI)-\d+', name):
+            try:
+                connected = pathlib.Path('/sys/class/drm', name, 'status').read_text().strip() == 'connected'
+            except OSError:
+                connected = False
+            panels.append((not connected, name.split('-', 1)[1]))
+    panel = min(panels)[1] if panels else 'eDP-1'
     with (root/'config.d/61-goran-ime.kdl').open('a') as stream:
-        stream.write('input { touch { map-to-output "eDP-1"; }; }\n')
+        stream.write('input { touch { map-to-output "' + panel + '"; }; }\n')
     if include not in (line.strip() for line in text.splitlines()):
         write(main, text.rstrip()+'\n'+include+'\n')
     PY
@@ -201,6 +217,12 @@ in {
     type = lib.types.bool;
     default = true;
     description = "Install the starter dock, wallpaper, icon layout and Niri rules into existing homes.";
+  };
+  # Simon's own account is the one that keeps its own Niri rules instead of the house defaults.
+  options.programs.goran-hp-os.personalShortcuts = lib.mkOption {
+    type = lib.types.bool;
+    default = !cfg.hpSnap.manageHouseDefaults;
+    description = "Keep Simon's launcher, DMS and remote-control shortcuts (niri.nix). Standard accounts get only shortcuts that work in HP-OS.";
   };
   config = lib.mkIf cfg.enable {
     programs.hp-os = {

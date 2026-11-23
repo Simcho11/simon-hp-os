@@ -2,6 +2,9 @@
   description = "Simon HP-OS desktop for Ubuntu 26.04 ARM64";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Chrome only: what people browse with and run Microsoft 365 in, so it gets security fixes without waiting for the
+    # rest of the system. `nix flake update nixpkgs-chrome` brings the newest Chrome and changes nothing else.
+    nixpkgs-chrome.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     home-manager = { url = "github:nix-community/home-manager"; inputs.nixpkgs.follows = "nixpkgs"; };
     hp-os.url = "path:./vendor/HP-OSShell";
     codex-fleet = { url = "path:./vendor/codex-fleet"; inputs.nixpkgs.follows = "nixpkgs"; };
@@ -10,7 +13,7 @@
     dms-plugin-registry = { url = "github:AvengeMedia/dms-plugin-registry/bd0adca992b502178e70cc015f2a34f2b7031186"; inputs.nixpkgs.follows = "nixpkgs"; };
     xwayland-satellite = { url = "github:Supreeeme/xwayland-satellite/8d135d3b2854b30fd01ea6cd6c27e523dd50a839"; inputs.nixpkgs.follows = "nixpkgs"; };
   };
-  outputs = { self, nixpkgs, home-manager, hp-os, codex-fleet, ghostty-upstream, dank-material-shell, dms-plugin-registry, xwayland-satellite, ... }:
+  outputs = { self, nixpkgs, nixpkgs-chrome, home-manager, hp-os, codex-fleet, ghostty-upstream, dank-material-shell, dms-plugin-registry, xwayland-satellite, ... }:
     let
       system = "aarch64-linux";
       x86System = "x86_64-linux";
@@ -22,6 +25,9 @@
         config = { allowUnfree = true; nvidia.acceptLicense = true; };
         overlays = [
           (final: prev: { cloudflared = final.callPackage ./pkgs/cloudflared-release.nix { }; })
+          (final: prev: {
+            google-chrome = (import nixpkgs-chrome { system = targetSystem; config.allowUnfree = true; }).google-chrome;
+          })
           codex-fleet.overlays.default
         ] ++ nixpkgs.lib.optional (targetSystem == system)
           # Ghostty's rendering workaround is only for the ARM OmniBook's NVIDIA N1X.

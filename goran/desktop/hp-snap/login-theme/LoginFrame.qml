@@ -254,13 +254,15 @@ LoginSurface {
                 anchors.leftMargin: entry.x
                 width: parent.width - entry.x
                 visible: root.core.showHint && (!root.core.failed || root.core.offerRecovery)
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
                 elide: Text.ElideRight
                 text: root.core.hint
                 color: root.core.hintIsWarning ? root.wrong : root.inkSoft
-                font.underline: root.core.offerRecovery
+                font.underline: root.core.hintOpensRecovery
                 MouseArea {
                     anchors.fill: parent
-                    enabled: root.core.offerRecovery
+                    enabled: root.core.hintOpensRecovery
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.core.openRecovery()
                 }

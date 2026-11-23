@@ -23,25 +23,46 @@ def enable(path):
     marker = marker_for(path)
     if marker and marker.exists():
         return
-    _apply(path)
+    # A config.json that can't be read as HP-OS settings is left as it is and not marked, so the
+    # defaults go in on a later run once it is whole again.
+    if not _apply(path):
+        return
     if marker:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("applied\n")
 
 
+def _skip(path, reason):
+    # This runs in every Home Manager update: a damaged config.json must not stop the rest of it.
+    print(f"hp-os-battery: left {path} as it is ({reason})", file=sys.stderr)
+    return False
+
+
 def _apply(path):
-    data = json.loads(path.read_text())
-    bar = data.setdefault("iris", {}).setdefault("bar", {})
+    """Returns False when the file was left alone because it isn't usable HP-OS settings."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError) as error:
+        return _skip(path, error)
+    if not isinstance(data, dict):
+        return _skip(path, "not a JSON object")
+    iris = data.setdefault("iris", {})
+    bar = iris.setdefault("bar", {}) if isinstance(iris, dict) else None
+    if not isinstance(bar, dict):
+        return _skip(path, "iris.bar is not an object")
     pieces = bar.get("pieces", ["sound"])
     if not isinstance(pieces, list):
-        raise ValueError(f"Expected iris.bar.pieces array in {path}")
+        return _skip(path, "iris.bar.pieces is not a list")
     before = json.dumps(data, sort_keys=True)
     bar["pieces"] = pieces + [piece for piece in ("battery", "notifications") if piece not in pieces]
-    protection = data.setdefault("audio", {}).setdefault("protection", {})
+    audio = data.setdefault("audio", {})
+    protection = audio.setdefault("protection", {}) if isinstance(audio, dict) else None
+    if not isinstance(protection, dict):
+        return _skip(path, "audio.protection is not an object")
     if protection.get("maxAllowedIncrease", 10) == 10:
         protection["maxAllowedIncrease"] = 11
     if json.dumps(data, sort_keys=True) == before:
-        return
+        return True
     fd, temporary = tempfile.mkstemp(prefix=".battery-", dir=path.parent)
     try:
         os.fchmod(fd, stat.S_IMODE(path.stat().st_mode))
@@ -52,6 +73,7 @@ def _apply(path):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    return True
 
 
 if __name__ == "__main__":

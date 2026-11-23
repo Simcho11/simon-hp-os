@@ -260,7 +260,7 @@ diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
 index 53c0606..cb92cdc 100644
 --- a/src/layout/monitor.rs
 +++ b/src/layout/monitor.rs
-@@ -367,6 +367,41 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -367,6 +367,42 @@ impl<W: LayoutElement> Monitor<W> {
          &self.output_name
      }
  
@@ -295,14 +295,15 @@ index 53c0606..cb92cdc 100644
 +            }
 +            previous = Some((idx, rank));
 +        }
-+        let (last, rank) = previous.unwrap();
++        // Only the hidden minimize workspace left: nothing visible to measure against, keep the plain index.
++        let Some((last, rank)) = previous else { return index };
 +        rank + index - last
 +    }
 +
      pub fn active_workspace_idx(&self) -> usize {
          self.active_workspace_idx
      }
-@@ -439,6 +474,10 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -439,6 +475,10 @@ impl<W: LayoutElement> Monitor<W> {
          idx: usize,
          config: Option<niri_config::Animation>,
      ) {
@@ -313,7 +314,7 @@ index 53c0606..cb92cdc 100644
          // FIXME: also compute and use current velocity.
          let current_idx = self.workspace_render_idx();
  
-@@ -785,7 +824,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -785,7 +825,7 @@ impl<W: LayoutElement> Monitor<W> {
      pub fn move_to_workspace_up(&mut self, focus: bool) {
          let source_workspace_idx = self.active_workspace_idx;
  
@@ -322,7 +323,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == source_workspace_idx {
              return;
          }
-@@ -819,7 +858,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -819,7 +859,7 @@ impl<W: LayoutElement> Monitor<W> {
      pub fn move_to_workspace_down(&mut self, focus: bool) {
          let source_workspace_idx = self.active_workspace_idx;
  
@@ -331,7 +332,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == source_workspace_idx {
              return;
          }
-@@ -910,7 +949,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -910,7 +950,7 @@ impl<W: LayoutElement> Monitor<W> {
      pub fn move_column_to_workspace_up(&mut self, activate: bool) {
          let source_workspace_idx = self.active_workspace_idx;
  
@@ -340,7 +341,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == source_workspace_idx {
              return;
          }
-@@ -931,7 +970,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -931,7 +971,7 @@ impl<W: LayoutElement> Monitor<W> {
      pub fn move_column_to_workspace_down(&mut self, activate: bool) {
          let source_workspace_idx = self.active_workspace_idx;
  
@@ -349,7 +350,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == source_workspace_idx {
              return;
          }
-@@ -980,10 +1019,9 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -980,10 +1020,9 @@ impl<W: LayoutElement> Monitor<W> {
              // During a DnD scroll, select the prev apparent workspace.
              Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
                  let current = gesture.current_idx;
@@ -362,7 +363,7 @@ index 53c0606..cb92cdc 100644
          };
  
          self.activate_workspace(new_idx);
-@@ -994,10 +1032,9 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -994,10 +1033,9 @@ impl<W: LayoutElement> Monitor<W> {
              // During a DnD scroll, select the next apparent workspace.
              Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
                  let current = gesture.current_idx;
@@ -375,7 +376,7 @@ index 53c0606..cb92cdc 100644
          };
  
          self.activate_workspace(new_idx);
-@@ -1240,7 +1277,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1240,7 +1278,7 @@ impl<W: LayoutElement> Monitor<W> {
      }
  
      pub fn move_workspace_down(&mut self) {
@@ -384,7 +385,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == self.active_workspace_idx {
              return;
          }
-@@ -1266,7 +1303,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1266,7 +1304,7 @@ impl<W: LayoutElement> Monitor<W> {
      }
  
      pub fn move_workspace_up(&mut self) {
@@ -393,7 +394,7 @@ index 53c0606..cb92cdc 100644
          if new_idx == self.active_workspace_idx {
              return;
          }
-@@ -1471,7 +1508,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1471,7 +1509,7 @@ impl<W: LayoutElement> Monitor<W> {
          }
      }
  
@@ -402,7 +403,7 @@ index 53c0606..cb92cdc 100644
          let scale = self.scale.fractional_scale();
          let zoom = self.overview_zoom();
  
-@@ -1484,12 +1521,14 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1484,12 +1522,14 @@ impl<W: LayoutElement> Monitor<W> {
              .to_physical_precise_round(scale)
              .to_logical(scale);
  
@@ -420,7 +421,7 @@ index 53c0606..cb92cdc 100644
              let loc = Point::from((0., y)) + static_offset;
  
              // Even though all components that go into loc are rounded to physical pixels, the
-@@ -1510,7 +1549,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1510,7 +1550,7 @@ impl<W: LayoutElement> Monitor<W> {
          let geo = self.workspaces_render_geo();
          zip(self.workspaces.iter(), geo)
              // Cull out workspaces outside the output.
@@ -429,7 +430,7 @@ index 53c0606..cb92cdc 100644
      }
  
      pub fn workspaces_with_render_geo_idx(
-@@ -1521,7 +1560,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1521,7 +1561,7 @@ impl<W: LayoutElement> Monitor<W> {
          let geo = self.workspaces_render_geo();
          zip(self.workspaces.iter().enumerate(), geo)
              // Cull out workspaces outside the output.
@@ -438,7 +439,7 @@ index 53c0606..cb92cdc 100644
      }
  
      pub fn workspaces_with_render_geo_mut(
-@@ -1530,10 +1569,10 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -1530,10 +1570,10 @@ impl<W: LayoutElement> Monitor<W> {
      ) -> impl Iterator<Item = (&mut Workspace<W>, Rectangle<f64, Logical>)> {
          let output_geo = Rectangle::from_size(self.view_size);
  
@@ -451,7 +452,7 @@ index 53c0606..cb92cdc 100644
      }
  
      pub fn workspace_under(
-@@ -2006,6 +2045,13 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -2006,6 +2046,13 @@ impl<W: LayoutElement> Monitor<W> {
          let new_idx = new_idx.round() as usize;
  
          velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
@@ -465,7 +466,7 @@ index 53c0606..cb92cdc 100644
  
          if self.active_workspace_idx != new_idx {
              self.previous_workspace_id = Some(self.workspaces[self.active_workspace_idx].id());
-@@ -2014,7 +2060,7 @@ impl<W: LayoutElement> Monitor<W> {
+@@ -2014,7 +2061,7 @@ impl<W: LayoutElement> Monitor<W> {
          self.active_workspace_idx = new_idx;
          self.workspace_switch = Some(WorkspaceSwitch::Animation(Animation::new(
              self.clock.clone(),

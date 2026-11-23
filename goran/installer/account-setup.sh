@@ -23,6 +23,32 @@ if [[ ${1:-} != --apply ]] && ready; then
     exit 0
 fi
 
+# How this attempt went, in $dir/outcome, for the sign-in (hp-os-login-session): "running" while it runs (left as is if
+# it was stopped), then "ok" or "failed REASON", REASON telling the login screen what to say: storage (the disk is
+# full), network (something had to be downloaded and couldn't be) or other. Never what fails the setup itself.
+log_start=$(stat -c %s "$dir/setup.log" 2>/dev/null || echo 0)
+record_outcome() {
+    local status=$? reason=other free recent
+    set +e
+    trap - EXIT
+    if (( status == 0 )); then
+        { printf 'ok\n' > "$dir/outcome.new" && mv -fT "$dir/outcome.new" "$dir/outcome"; } 2>/dev/null
+        exit 0
+    fi
+    # What this attempt wrote to the log (with a progress bar its output goes there; otherwise to the journal).
+    recent=$(tail -c +"$((log_start + 1))" "$dir/setup.log" 2>/dev/null | tail -c 65536)
+    free=$(df -Pk /nix/store "$HOME" 2>/dev/null | awk 'NR > 1 && (least == "" || $4 < least) { least = $4 } END { print least + 0 }')
+    if [[ "$recent" == *"No space left on device"* ]] || (( ${free:-0} > 0 && free < 1048576 )); then
+        reason=storage
+    elif grep -Eqi 'unable to download|could not resolve|resolve host|network is unreachable|connection timed out|connection refused|temporary failure in name resolution' <<< "$recent"; then
+        reason=network
+    fi
+    { printf 'failed %s\n' "$reason" > "$dir/outcome.new" && mv -fT "$dir/outcome.new" "$dir/outcome"; } 2>/dev/null
+    exit "$status"
+}
+{ printf 'running\n' > "$dir/outcome.new" && mv -fT "$dir/outcome.new" "$dir/outcome"; } 2>/dev/null || true
+trap record_outcome EXIT
+
 # With HP_OS_SETUP_PROGRESS=1, stdout carries "HP-OS-PROGRESS <percent>" lines for a progress bar.
 report() {
     if [[ ${HP_OS_SETUP_PROGRESS:-} == 1 ]]; then printf 'HP-OS-PROGRESS %d\n' "$1"; fi

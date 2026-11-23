@@ -1,0 +1,490 @@
+# HP-OS shell changes (stability). Applied by default.nix only once it holds a diff.
+diff --git a/GlobalStates.qml b/GlobalStates.qml
+index 3fa0551..504bf13 100644
+--- a/GlobalStates.qml
++++ b/GlobalStates.qml
+@@ -220,6 +220,10 @@ Singleton {
+         regionSelectorOpen = true
+     }
+ 
++    // hp-snap: image search sends the picked part of the screen to public file hosts, so it is
++    // only offered when it has been turned on (search.imageSearch.enable).
++    readonly property bool regionImageSearchEnabled: Config.options?.search?.imageSearch?.enable ?? false
++
+     // The unified snip menu may restore the last toolbar choice. Raw ordinals
+     // mirror RegionSelection's enums: action 0 Shot, 1 Edit, 2 Search, 3 OCR
+     // (record is never restored); mode 0 rectangle, 1 circle.
+@@ -229,7 +233,8 @@ Singleton {
+         if (Config.options?.regionSelector?.rememberSnipChoice ?? true) {
+             const savedAction = Config.options?.regionSelector?.lastAction ?? 0
+             const savedMode = Config.options?.regionSelector?.lastMode ?? 0
+-            if (savedAction >= 0 && savedAction <= 3) action = savedAction
++            // A Search remembered from before image search was turned off opens as a plain Shot.
++            if (savedAction >= 0 && savedAction <= 3 && (savedAction !== 2 || root.regionImageSearchEnabled)) action = savedAction
+             if (savedMode === 1) mode = savedMode
+         }
+         regionSelectorAction = action
+diff --git a/defaults/config.json b/defaults/config.json
+index 716000c..241749c 100644
+--- a/defaults/config.json
++++ b/defaults/config.json
+@@ -1853,6 +1853,7 @@
+             "quora.com"
+         ],
+         "imageSearch": {
++            "enable": false,
+             "imageSearchEngineBaseUrl": "https://yandex.com/images/search?rpt=imageview&url=",
+             "fileUploadApiEndpoint": "https://0x0.st",
+             "fileUploadApiFallback": "https://litterbox.catbox.moe/resources/internals/api.php",
+diff --git a/modules/common/Config.qml b/modules/common/Config.qml
+index d1c0e79..4c32ba3 100644
+--- a/modules/common/Config.qml
++++ b/modules/common/Config.qml
+@@ -3431,6 +3431,9 @@ Singleton {
+                     property string webSearch: "?"
+                 }
+                 property JsonObject imageSearch: JsonObject {
++                    // hp-snap: image search uploads the picked part of the screen to public file
++                    // hosts (catbox.moe, 0x0.st) for anyone with the link to see. Off unless turned on.
++                    property bool enable: false
+                     property string imageSearchEngineBaseUrl: "https://yandex.com/images/search?rpt=imageview&url="
+                     property string fileUploadApiEndpoint: "https://0x0.st"
+                     property string fileUploadApiFallback: "https://litterbox.catbox.moe/resources/internals/api.php"
+diff --git a/modules/iris/regionSelector/IrisOptionsToolbar.qml b/modules/iris/regionSelector/IrisOptionsToolbar.qml
+index 3aa44fd..a5f0d4f 100644
+--- a/modules/iris/regionSelector/IrisOptionsToolbar.qml
++++ b/modules/iris/regionSelector/IrisOptionsToolbar.qml
+@@ -26,11 +26,13 @@ IrisSurface {
+         { action: RegionSelection.SnipAction.CharRecognition, icon: "document_scanner", name: Translation.tr("OCR") },
+         { action: RegionSelection.SnipAction.Search, icon: "image_search", name: Translation.tr("Search") },
+         { action: RegionSelection.SnipAction.Record, icon: "videocam", name: Translation.tr("Record") }
+-    ]
++    ].filter(entry => entry.action !== RegionSelection.SnipAction.Search || GlobalStates.regionImageSearchEnabled)  // hp-snap: Search only when turned on
+     readonly property int actionIndex: {
+         for (let i = 0; i < root.actionList.length; i++)
+             if (root.actionList[i].action === root.action) return i
+-        return root.action === RegionSelection.SnipAction.RecordWithSound ? 4 : 0
++        // Recording with sound shows on Record, wherever Record is (Search may be left out).
++        return root.action === RegionSelection.SnipAction.RecordWithSound
++            ? Math.max(0, root.actionList.findIndex(entry => entry.action === RegionSelection.SnipAction.Record)) : 0
+     }
+ 
+     function persistSnipChoice(): void {
+diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
+index e00eadc..e7ce60d 100644
+--- a/modules/iris/settings/IrisOptions.qml
++++ b/modules/iris/settings/IrisOptions.qml
+@@ -1154,7 +1154,7 @@ QtObject {
+         { id: "orbit", cluster: 2, title: "Orbit", subtitle: "Every workspace and window, and the way to any of them", icon: "workspaces", get tint() { return IrisStyle.identity.indigo }, tip: "Type to light up where a window is; ↵ takes you to it. Bind inir orbit toggle." },
+         { id: "notifications", cluster: 2, title: "Notifications", subtitle: "Banners, quiet hours and Do Not Disturb", icon: "notifications", get tint() { return IrisStyle.identity.red }, tip: "Hover a banner to keep it; swipe it away to dismiss." },
+         { id: "sound", cluster: 2, title: "Sound & Feedback", subtitle: "Volume, alert sounds and what the OSD shows", icon: "volume_up", get tint() { return IrisStyle.identity.pink }, tip: "Scroll on the Island for volume; Ctrl for the microphone." },
+-        { id: "capture", cluster: 2, title: "Screenshots & Recording", subtitle: "Snip, annotate, read Japanese and record", icon: "screenshot_region", get tint() { return IrisStyle.identity.orange }, tip: "Super+Shift+S snips; the toolbar switches to text, search or recording." },
++        { id: "capture", cluster: 2, title: "Screenshots & Recording", subtitle: "Snip, annotate, read Japanese and record", icon: "screenshot_region", get tint() { return IrisStyle.identity.orange }, tip: "Super+Shift+S snips; the toolbar switches to text or recording." },
+         { id: "display", cluster: 3, title: "Displays", subtitle: "Arrange monitors, resolution, scale and night light", icon: "brightness_6", get tint() { return IrisStyle.identity.blue }, tip: "Shift and scroll on the Island for brightness." },
+         { id: "keyboard", cluster: 3, title: "Keyboard & Mouse", subtitle: "Layouts, repeat, pointer speed and cursor", icon: "keyboard", get tint() { return IrisStyle.identity.gray }, tip: "Your shortcuts are in General, Keyboard shortcuts." },
+         { id: "battery", cluster: 3, title: "Battery", subtitle: "Warnings, suspend and charge limit", icon: "battery_full", get tint() { return IrisStyle.identity.green }, tip: "Only matters on a machine with a battery." },
+diff --git a/modules/overview/SearchBar.qml b/modules/overview/SearchBar.qml
+index 9b1f051..b21c5ce 100644
+--- a/modules/overview/SearchBar.qml
++++ b/modules/overview/SearchBar.qml
+@@ -124,6 +124,8 @@ RowLayout {
+     IconToolbarButton {
+         Layout.topMargin: 4
+         Layout.bottomMargin: 4
++        // hp-snap: image search uploads the region to public hosts; only when turned on.
++        visible: GlobalStates.regionImageSearchEnabled
+         onClicked: {
+             GlobalStates.overviewOpen = false;
+             // Use IPC to trigger region search (works for both Hyprland and Niri)
+diff --git a/modules/regionSelector/OptionsToolbar.qml b/modules/regionSelector/OptionsToolbar.qml
+index 281d552..580a87d 100644
+--- a/modules/regionSelector/OptionsToolbar.qml
++++ b/modules/regionSelector/OptionsToolbar.qml
+@@ -32,7 +32,7 @@ Toolbar {
+         { "action": RegionSelection.SnipAction.CharRecognition, "icon": "document_scanner", "name": Translation.tr("OCR") },
+         { "action": RegionSelection.SnipAction.Search,          "icon": "image_search",     "name": Translation.tr("Search") },
+         { "action": RegionSelection.SnipAction.Record,          "icon": "videocam",         "name": Translation.tr("Record") }
+-    ]
++    ].filter(entry => entry.action !== RegionSelection.SnipAction.Search || GlobalStates.regionImageSearchEnabled)  // hp-snap: Search only when turned on
+     function indexForAction(a) {
+         for (let i = 0; i < root.actionList.length; i++)
+             if (root.actionList[i].action === a) return i;
+diff --git a/modules/regionSelector/RegionSelection.qml b/modules/regionSelector/RegionSelection.qml
+index d411402..ecee752 100644
+--- a/modules/regionSelector/RegionSelection.qml
++++ b/modules/regionSelector/RegionSelection.qml
+@@ -398,6 +398,11 @@ PanelWindow {
+                 snipProc.command = ["bash", "-c", `${cropToStdout} | ${annotationCommand} && ${cleanup}`]
+                 break;
+             case RegionSelection.SnipAction.Search:
++                // hp-snap: never uploads anything unless image search was turned on.
++                if (!GlobalStates.regionImageSearchEnabled) {
++                    root.dismiss();
++                    return;
++                }
+                 snipProc.command = ["bash", "-c", `${cropInPlace} && uploaded_url="$(${uploadAndGetUrl(root.screenshotPath)})"; if [[ -n "$uploaded_url" && "$uploaded_url" == http* ]]; then xdg-open "${root.effectiveImageSearchEngineBaseUrl}$uploaded_url"; else notify-send "Image search failed" "Could not upload the image for reverse search" -a "Image Search" -i image; fi; ${cleanup}`]
+                 break;
+             case RegionSelection.SnipAction.CharRecognition: {
+diff --git a/modules/regionSelector/RegionSelectorRouter.qml b/modules/regionSelector/RegionSelectorRouter.qml
+index c9434f6..7a33f57 100644
+--- a/modules/regionSelector/RegionSelectorRouter.qml
++++ b/modules/regionSelector/RegionSelectorRouter.qml
+@@ -20,6 +20,9 @@ Scope {
+     // menu is the only entry point allowed to restore a previous toolbar choice.
+     function screenshot(): void { GlobalStates.openRegionScreenshot() }
+     function search(): void {
++        // hp-snap: off unless image search was turned on (it uploads the region to public hosts).
++        if (!GlobalStates.regionImageSearchEnabled)
++            return
+         open(RegionSelection.SnipAction.Search,
+             (Config.options?.search?.imageSearch?.useCircleSelection ?? false)
+                 ? RegionSelection.SelectionMode.Circle : RegionSelection.SelectionMode.RectCorners)
+diff --git a/modules/settings/DisplayArrangement.qml b/modules/settings/DisplayArrangement.qml
+index 9a17e1e..26f7ffc 100644
+--- a/modules/settings/DisplayArrangement.qml
++++ b/modules/settings/DisplayArrangement.qml
+@@ -932,7 +932,8 @@ ColumnLayout {
+                 }
+             }
+             // hp-snap: a display can stay plugged in and still be left out: dark, with nothing on it,
+-            // until it is turned back on here. That is kept when it is plugged in again.
++            // until it is turned back on here. That is kept when it is plugged in again; the laptop's own
++            // screen only goes dark for now, so it can't leave the laptop dark once the other one is gone.
+             ColumnLayout {
+                 id: usedDisplays
+                 Layout.fillWidth: true
+@@ -949,7 +950,7 @@ ColumnLayout {
+                 }
+                 IrisText {
+                     Layout.fillWidth: true
+-                    text: Translation.tr("A display that's off stays dark and holds nothing, even while it's plugged in.")
++                    text: Translation.tr("A display that's off stays dark and holds nothing, even while it's plugged in. The laptop's own screen stays off only until you restart, or until it's the only display left.")
+                     role: IrisText.Meta
+                     wrapMode: Text.WordWrap
+                 }
+@@ -978,7 +979,7 @@ ColumnLayout {
+                             }
+                             IrisText {
+                                 Layout.fillWidth: true
+-                                text: !displayRow.on ? Translation.tr("Off")
++                                text: !displayRow.on ? (NiriService.isBuiltinScreen(displayRow.modelData) ? Translation.tr("Off for now") : Translation.tr("Off"))
+                                     : displayRow.modelData === root.primaryScreenName() ? Translation.tr("Main display")
+                                     : displayRow.lastOn ? Translation.tr("The only display in use") : ""
+                                 visible: text.length > 0
+diff --git a/modules/settings/ToolsConfig.qml b/modules/settings/ToolsConfig.qml
+index 7eb20a6..377eb01 100644
+--- a/modules/settings/ToolsConfig.qml
++++ b/modules/settings/ToolsConfig.qml
+@@ -1254,6 +1254,7 @@ ContentPage {
+ 
+             ContentSubsection {
+                 title: Translation.tr("Google Lens")
++                visible: Config.options?.search?.imageSearch?.enable ?? false  // hp-snap: off unless turned on
+ 
+                 ConfigSelectionArray {
+                     currentValue: (Config.options?.search?.imageSearch?.useCircleSelection ?? false) ? "circle" : "rectangles"
+diff --git a/modules/sidebarRight/CompactSidebarRightContent.qml b/modules/sidebarRight/CompactSidebarRightContent.qml
+index b73068c..03c3d68 100644
+--- a/modules/sidebarRight/CompactSidebarRightContent.qml
++++ b/modules/sidebarRight/CompactSidebarRightContent.qml
+@@ -2134,6 +2134,8 @@ Item {
+ 
+             QuickActionButton {
+                 Layout.fillWidth: true
++                // hp-snap: image search uploads the region to public hosts; only when turned on.
++                visible: GlobalStates.regionImageSearchEnabled
+                 icon: "travel_explore"
+                 label: Translation.tr("Search")
+                 onClicked: {
+diff --git a/modules/waffle/regionSelector/WOptionsToolbar.qml b/modules/waffle/regionSelector/WOptionsToolbar.qml
+index 5f39392..5d0d26b 100644
+--- a/modules/waffle/regionSelector/WOptionsToolbar.qml
++++ b/modules/waffle/regionSelector/WOptionsToolbar.qml
+@@ -44,7 +44,7 @@ WPane {
+         { "action": RegionSelection.SnipAction.CharRecognition, "icon": "text-font",    "name": Translation.tr("Recognize text") },
+         { "action": RegionSelection.SnipAction.Search,          "icon": "globe-search", "name": Translation.tr("Visual search") },
+         { "action": RegionSelection.SnipAction.Record,          "icon": "record",       "name": Translation.tr("Record") }
+-    ]
++    ].filter(entry => entry.action !== RegionSelection.SnipAction.Search || (Config.options?.search?.imageSearch?.enable ?? false))  // hp-snap: Search only when turned on
+ 
+     contentItem: Item {
+         implicitWidth: rowLayout.implicitWidth + 12
+diff --git a/scripts/niri-config.py b/scripts/niri-config.py
+index ce8b0d8..b05e668 100755
+--- a/scripts/niri-config.py
++++ b/scripts/niri-config.py
+@@ -12,6 +12,8 @@ Commands:
+   persist-output NAME  Write one output config to KDL config.d/15-outputs.kdl
+   persist-layout JSON  Persist all connected output positions atomically
+   set-output-power NAME on|off  Use a connected display or leave it dark, kept across reconnects
++                       (the laptop's own screen only goes dark for now)
++  keep-builtin-on      Make sure the laptop's own screen can't be left dark
+   get-input            Read current input config from KDL
+   get-hot-corners      Read effective Niri overview hot corners
+   get-layout           Read current layout config from KDL
+@@ -464,7 +466,49 @@ def output_display_id(out):
+ 
+ 
+ def _remove_flag_line(block_content, flag):
+-    return re.sub(rf"(?m)^[ \t]*{re.escape(flag)}[ \t]*(//[^\n]*)?\n?", "", block_content)
++    """Take out the block's own `flag` lines; one inside a nested block (an output's
++    `hot-corners { off }`) belongs to that block and stays."""
++    kept = []
++    depth = 0
++    for line in block_content.splitlines(keepends=True):
++        code = _strip_kdl_line_comments(line)
++        if depth > 0 or code.strip() not in (flag, flag + ";"):
++            kept.append(line)
++        depth = max(0, depth + code.count("{") - code.count("}"))
++    return "".join(kept)
++
++
++def is_builtin_panel(output_name):
++    """The laptop's own screen: niri tells it apart by its connector (eDP, LVDS or DSI)."""
++    return re.match(r"(eDP-|LVDS|DSI-)", str(output_name or "")) is not None
++
++
++def _drop_builtin_off(content, outputs):
++    """Take `off` out of every output block that names a connected laptop screen.
++
++    Earlier versions kept the laptop's screen off whenever it started; with the other display
++    unplugged that left the laptop dark, with no way to see anything to turn it back on.
++    """
++    for name, out in outputs.items():
++        if not is_builtin_panel(name):
++            continue
++        key = output_display_id(out if isinstance(out, dict) else {}) or name
++        for block_name in dict.fromkeys([key, name]):
++            # niri uses the first matching block: if that one only kept the screen dark and goes,
++            # the next one takes its place and is looked at in turn.
++            while True:
++                bounds = _find_output_block_bounds(content, block_name)
++                if not bounds:
++                    break
++                start, inner_start, inner_end, end = bounds
++                inner = _remove_flag_line(content[inner_start:inner_end], "off")
++                if inner == content[inner_start:inner_end]:
++                    break
++                if inner.strip() or block_name != key or key == name:
++                    content = content[:inner_start] + inner + content[inner_end:]
++                    break
++                content = content[:start] + content[end:].lstrip("\n")
++    return content
+ 
+ 
+ def cmd_set_output_power(args):
+@@ -473,6 +517,9 @@ def cmd_set_output_power(args):
+     Off is written to an output block named after the monitor itself, placed before every other
+     output block: niri uses the first block that matches, so it wins over one named after the
+     connector the monitor happens to be on today.
++
++    The laptop's own screen is the exception: it goes dark for now only and is never written down,
++    since it would stay dark at the next start even with the other display unplugged.
+     """
+     if len(args) != 2 or args[1] not in ("on", "off"):
+         print(json.dumps({"error": "Usage: set-output-power <name> on|off"}))
+@@ -494,10 +541,21 @@ def cmd_set_output_power(args):
+             print(json.dumps({"error": "At least one display has to stay on."}))
+             return 1
+ 
++    if power == "off" and is_builtin_panel(output_name):
++        # Until niri restarts or reloads its displays; the shell turns it back on if it is ever
++        # the only display left (keep-builtin-on).
++        message, rc = run_niri("output", output_name, "off")
++        if rc != 0:
++            print(json.dumps({"error": f"niri msg failed: {message}"}))
++            return 1
++        print(json.dumps({"success": True, "kept": False}))
++        return 0
++
+     key = output_display_id(out) or output_name
+     outputs_file = resolve_niri_section_file("config.d/15-outputs.kdl")
+     outputs_file.parent.mkdir(parents=True, exist_ok=True)
+     content = outputs_file.read_text() if outputs_file.exists() else ""
++    content = _drop_builtin_off(content, outputs)
+ 
+     if power == "off":
+         bounds = _find_output_block_bounds(content, key)
+@@ -535,6 +593,45 @@ def cmd_set_output_power(args):
+     return result
+ 
+ 
++def cmd_keep_builtin_on():
++    """Make sure the laptop's own screen can't be left dark.
++
++    An `off` that an earlier version wrote for it is taken out of the config, and when no display
++    is lit at all (the other display was unplugged while the laptop's screen was off) it is turned
++    back on. Nothing is written when there is nothing to undo.
++    """
++    raw, rc = run_niri("-j", "outputs")
++    if rc != 0:
++        print(json.dumps({"error": f"niri msg failed: {raw}"}))
++        return 1
++    try:
++        outputs = json.loads(raw)
++    except ValueError as error:
++        print(json.dumps({"error": f"niri msg gave no outputs: {error}"}))
++        return 1
++    if not isinstance(outputs, dict):
++        print(json.dumps({"error": "niri msg gave no outputs"}))
++        return 1
++    builtin = [name for name in outputs if is_builtin_panel(name)]
++    lit = [name for name, out in outputs.items() if isinstance(out, dict) and out.get("logical")]
++
++    result = 0
++    changed = False
++    outputs_file = resolve_niri_section_file("config.d/15-outputs.kdl")
++    if builtin and outputs_file.exists():
++        content = outputs_file.read_text()
++        cleaned = _drop_builtin_off(content, outputs)
++        if cleaned != content:
++            changed = True
++            result = _write_validated(outputs_file, cleaned)
++    if builtin and not lit:
++        for name in builtin:
++            run_niri("output", name, "on")
++    if not changed:
++        print(json.dumps({"success": True, "changed": False, "lit": bool(lit)}))
++    return result
++
++
+ def _ensure_vrr_window_rule():
+     """Add the default on-demand VRR window rule if no rule opts into VRR yet.
+ 
+@@ -3579,6 +3676,7 @@ def main():
+         "persist-output": lambda: cmd_persist_output(args),
+         "persist-layout": lambda: cmd_persist_layout(args),
+         "set-output-power": lambda: cmd_set_output_power(args),
++        "keep-builtin-on": lambda: cmd_keep_builtin_on(),
+         "get-input": lambda: cmd_get_input(),
+         "get-hot-corners": lambda: cmd_get_hot_corners(),
+         "get-layout": lambda: cmd_get_layout(),
+diff --git a/scripts/panel-brightness.sh b/scripts/panel-brightness.sh
+index 6e41570..e7525ac 100644
+--- a/scripts/panel-brightness.sh
++++ b/scripts/panel-brightness.sh
+@@ -1,10 +1,36 @@
+ #!/bin/sh
+ set -eu
+ control=/nix/store/7z8shv7dffj4yssxvns5pb4g7n2zvj78-goran-brightness/bin/goran-brightness
++# hp-snap: that tool sets the luminance of an eDP panel that takes one over AUX, the OmniBook
++# Ultra's OLED (it stays at this one path: the brightness sudo rule names the python and script it
++# runs). Another panel behind nvidia_0, such as the OmniBook X's, has no such control and the tool
++# fails there every time, so the panel's backlight does the job instead, in the same 5..100 steps.
++# The tool remembers a level once it has set one: where it ever has, nothing changes here, and a
++# failure stays a failure as before (the OLED's backlight would undo its luminance mode).
++saved="${XDG_STATE_HOME:-$HOME/.local/state}/goran-brightness/percent"
++# Once the tool has failed in this session, later calls go to the backlight straight away.
++marker="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/hp-os-panel-brightness-backlight}"
++backlight_only() { [ ! -e "$saved" ] && [ -n "$marker" ] && [ -e "$marker" ]; }
++use_backlight() {
++    [ ! -e "$saved" ] || return 1
++    if [ -n "$marker" ]; then : > "$marker" 2>/dev/null || true; fi
++}
+ case "$1" in
+ get)
+-    status=$("$control" status)
+-    printf "%s\n" "$status" | awk '/saved_percent=/ { split($0,a,"="); print a[2],100 }'
++    if ! backlight_only && status=$("$control" status); then
++        printf "%s\n" "$status" | awk '/saved_percent=/ { split($0,a,"="); print a[2],100 }'
++    else
++        use_backlight
++        level=$(brightnessctl -d nvidia_0 g)
++        max=$(brightnessctl -d nvidia_0 m)
++        [ "$max" -gt 0 ]
++        printf '%s %s\n' "$(( (level * 100 + max / 2) / max ))" 100
++    fi
++    ;;
++set)
++    if ! backlight_only && "$control" set "$2"; then exit 0; fi
++    use_backlight
++    case "$2" in ''|*[!0-9]*) exit 2;; esac
++    exec brightnessctl -d nvidia_0 s "$2%" --quiet
+     ;;
+-set) exec "$control" set "$2";;
+ esac
+diff --git a/services/NiriService.qml b/services/NiriService.qml
+index b296c5d..a4adb90 100644
+--- a/services/NiriService.qml
++++ b/services/NiriService.qml
+@@ -145,6 +145,7 @@ Singleton {
+                     outputs = outputsData
+                     console.info("NiriService: Loaded", Object.keys(outputsData).length, "outputs")
+                     root.followMainDisplay()
++                    root.keepBuiltinScreenOn()
+                     updateDisplayScales()
+                     if (windows.length > 0) {
+                         windows = sortWindowsByLayout(windows)
+@@ -313,6 +314,37 @@ Singleton {
+     // niri takes a moment to reload its config and light or darken the display.
+     Timer { id: outputPowerRefresh; interval: 400; onTriggered: root.fetchOutputs() }
+ 
++    // hp-snap: the laptop's own screen is only ever turned off for now, never for good. Once the
++    // displays are known, an `off` an earlier version wrote for it is taken out again; and whenever
++    // no display is lit at all (the other one was unplugged while the laptop's screen was off),
++    // the laptop's screen is turned back on, once for each time it goes dark.
++    function isBuiltinScreen(name: string): bool {
++        return /^(eDP-|LVDS|DSI-)/.test(String(name ?? ""))
++    }
++    property bool _builtinScreenChecked: false
++    property bool _darkHandled: false
++    function keepBuiltinScreenOn(): void {
++        const names = Object.keys(root.outputs ?? {})
++        if (names.length === 0 || keepBuiltinOnProcess.running)
++            return
++        const dark = !names.some(name => root.outputInUse(name))
++        if (!dark)
++            root._darkHandled = false
++        if (root._builtinScreenChecked && (!dark || root._darkHandled))
++            return
++        root._builtinScreenChecked = true
++        if (!names.some(name => root.isBuiltinScreen(name)))
++            return
++        if (dark)
++            root._darkHandled = true
++        keepBuiltinOnProcess.running = true
++    }
++    Process {
++        id: keepBuiltinOnProcess
++        command: ["python3", Quickshell.shellPath("scripts/niri-config.py"), "keep-builtin-on"]
++        onExited: outputPowerRefresh.restart()
++    }
++
+     function fetchOutputs() {
+         if (!CompositorService.isNiri)
+             return
+diff --git a/scripts/hp-snap/desktop_files.py b/scripts/hp-snap/desktop_files.py
+index 57a2814..c9bd32d 100644
+--- a/scripts/hp-snap/desktop_files.py
++++ b/scripts/hp-snap/desktop_files.py
+@@ -1076,12 +1076,30 @@ def run(action, args):
+     raise Problem("That isn’t possible here.")
+ 
+ 
++# What can change the Trash: dragging or pasting items out of it, moving items to it, putting them back, emptying it.
++CHANGES_TRASH = ("bring", "paste", "trash", "restore", "empty-trash")
++
++
++def tell_files_trash_changed():
++    """An open Trash window in Files lists the Trash through KIO, which only looks again when told: changes made here
++    (not through KIO) would leave it showing items that are gone. Files listens for this on the session bus; with
++    nothing listening it does nothing."""
++    try:
++        subprocess.run(["gdbus", "emit", "--session", "--object-path", "/", "--signal",
++                        "org.kde.KDirNotify.FilesAdded", "'trash:/'"],
++                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
++    except (OSError, subprocess.SubprocessError):
++        pass
++
++
+ def main(argv):
+     action = argv[1] if len(argv) > 1 else ""
+     try:
+         problems = run(action, argv[2:])
+     except (OSError, Problem, ValueError, shutil.Error, subprocess.CalledProcessError) as error:
+         problems = [message(error)]
++    if action in CHANGES_TRASH:
++        tell_files_trash_changed()
+     if not problems:
+         return 0
+     text = "\n".join(problems)

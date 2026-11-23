@@ -427,14 +427,14 @@ LoginSurface {
             opacity: root.core.hint.length > 0 ? 1 : 0
             Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
             text: hintLine.words
-            font.underline: root.core.offerRecovery
+            font.underline: root.core.hintOpensRecovery
             MouseArea {
                 anchors.fill: parent
-                enabled: root.core.offerRecovery
+                enabled: root.core.hintOpensRecovery
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.core.openRecovery()
             }
-            color: root.core.hintIsWarning ? root.core.danger : root.core.highlight
+            color: root.core.hintIsWarning ? root.core.danger : root.core.hintIsQuiet ? root.inkSoft : root.core.highlight
             font.family: root.core.fontMain
             font.pixelSize: root.type(15)
             font.weight: Font.Medium

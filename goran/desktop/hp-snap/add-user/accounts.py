@@ -3,7 +3,12 @@
 
 Reads one JSON line {"name", "username", "password", "picture"} from stdin and answers with one JSON
 line. "picture" is empty (their initial) or the name of one of the pictures shipped beside this file.
-It can only ever create a standard (non-administrator) account, and never touches an existing one.
+It never touches an existing account, and the login screen's Add user only ever creates a standard one.
+
+Settings' "Add a person" uses it too, so every account is made by the same rules: it may add "administrator": true
+(honoured only when the administrator who approved through pkexec is the one asking) and "prepare": false (the new
+person's desktop is then set up at their first sign-in instead of now). Either way, an account that couldn't be
+finished is deleted again, never left half-made.
 
 With --first-boot it is started by the hp-os-first-setup socket instead, for the login screen of a device
 that has never been set up: it makes the device's first account, an administrator. It refuses unless the
@@ -42,6 +47,7 @@ NMCLI = "/usr/bin/nmcli"
 CONNECTIONS = "/etc/NetworkManager/system-connections"
 UPDATE_STATE = "/var/lib/hp-os/update"
 RECOVERY = "/opt/hp-os/device/hp-os-recovery"
+DEVICE = "/opt/hp-os/device/hp-os-device"
 # Left for the welcome by the restart that finishes an update, so it carries on at the name step.
 UPDATED_MARK = "/var/lib/hp-os/welcome-updated.qml"
 ADMIN_GROUPS = ("sudo", "admin", "wheel")
@@ -87,6 +93,39 @@ def validated(request):
     raise Refused("That username is already in use.")
 
 
+def may_make_administrator():
+    """An administrator account only for an administrator asking from their own desktop (Settings): pkexec says who
+    asked in PKEXEC_UID. The login screen's Add user runs as the login screen's account, so it never can."""
+    try:
+        asking = pwd.getpwuid(int(os.environ.get("PKEXEC_UID", "")))
+    except (KeyError, ValueError):
+        return False
+    if not 1000 <= asking.pw_uid < 60000:
+        return False
+    groups = set()
+    for gid in os.getgrouplist(asking.pw_name, asking.pw_gid):
+        try:
+            groups.add(grp.getgrgid(gid).gr_name)
+        except KeyError:
+            pass
+    return bool(groups & set(ADMIN_GROUPS))
+
+
+def forget_earlier_account(username):
+    """What an earlier account of the same name left outside its home folder goes first (its login-screen wallpaper,
+    its Nix profiles, the login screen remembering it), so the new person never starts with someone else's. The list
+    is hp-os-device's, the same one a factory reset erases."""
+    try:
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import module_from_spec, spec_from_loader
+        loader = SourceFileLoader("hp_os_device", DEVICE)
+        module = module_from_spec(spec_from_loader("hp_os_device", loader))
+        loader.exec_module(module)
+        module.Device("/").forget(username)
+    except Exception:       # An older device without it: the account is still made.
+        pass
+
+
 def remove_login_picture(username):
     try:
         os.unlink(os.path.join(FACES, username + ".face.icon"))
@@ -117,6 +156,7 @@ def create(name, username, password, picture, administrator=False):
     encoded = password_hash(password)
     bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
     remove_login_picture(username)  # Left by an earlier account of the same name.
+    forget_earlier_account(username)
     path = call(bus, ROOT, SERVICE, "CreateUser", "(ssi)", (username, name, 1 if administrator else 0))[0]
     try:
         # Stays locked until everything else has succeeded.
@@ -559,16 +599,22 @@ def main(first_boot=False):
         if first_boot and isinstance(request, dict) and "action" in request:
             new_device()
             return welcome_step(request)
+        wants_administrator = request.get("administrator") is True
+        prepare_now = request.get("prepare") is not False
         request = validated(request)
         if first_boot:
             lock = open("/run/hp-os/first-setup.lock", "w")
             fcntl.flock(lock, fcntl.LOCK_EX)
             new_device()
-        create(*request, administrator=first_boot)
+        elif wants_administrator and not may_make_administrator():
+            raise Refused("Only an administrator can add another administrator.")
+        create(*request, administrator=first_boot or wants_administrator)
         if first_boot:
             os.unlink(FIRST_BOOT)   # Set up: this screen never comes back.
             if os.path.exists(UPDATED_MARK):
                 os.unlink(UPDATED_MARK)
+        if not prepare_now:
+            return {"ok": True, "prepared": False}
         say({"progress": 1})
         return {"ok": True, "prepared": prepare(request[1])}
     except Refused as reason:

@@ -3,7 +3,8 @@ set -euo pipefail
 runtime="${HP_OS_RUNTIME:-@runtime@}"
 packaging="${HP_OS_PACKAGING:-@packaging@}"
 if [[ ! -d "$packaging" ]]; then packaging="$(cd -- "$(dirname -- "$0")" && pwd)"; fi
-python3 "$packaging/migrate-brand.py"
+# A settings file it cannot read must not keep the desktop from starting.
+python3 "$packaging/migrate-brand.py" || echo 'HP-OS could not update settings from an older version; continuing.' >&2
 config="${INIR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/hp-os}"
 export INIR_CONFIG_DIR="$config"
 export INIR_STATE_DIR="${INIR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/hp-os}"
@@ -16,6 +17,309 @@ export PATH="$(dirname -- "$0"):$PATH"
 export INIR_NIRI_CONFIG_DIR="${INIR_NIRI_CONFIG_DIR:-$config/niri}"
 command="${1:-run}"
 [[ $# -eq 0 ]] || shift
+
+# "run" keeps the shell running for the whole session and holds this lock while it does.
+# "stop" and "restart" leave it a note beside the lock, so the shell neither comes back
+# after "stop" nor starts twice after "restart".
+shell_session="${WAYLAND_DISPLAY:-none}"
+shell_lock="${XDG_RUNTIME_DIR:-}/hp-os-shell-${shell_session//\//_}.lock"
+shell_request="${XDG_RUNTIME_DIR:-}/hp-os-shell-${shell_session//\//_}.request"
+
+shell_supervised() {
+  [[ -n "${XDG_RUNTIME_DIR:-}" && -e "$shell_lock" ]] && command -v flock >/dev/null || return 1
+  local held=0
+  flock -n -E 75 "$shell_lock" true 2>/dev/null || held=$?
+  [[ "$held" == 75 ]]
+}
+
+take_shell_request() {
+  local request=""
+  if [[ -f "$shell_request" ]]; then
+    request="$(cat -- "$shell_request" 2>/dev/null || true)"
+    rm -f -- "$shell_request"
+  fi
+  printf '%s' "$request"
+}
+
+# niri discards what its children print, so the journal keeps a record too.
+shell_note() {
+  echo "HP-OS: $*" >&2
+  if command -v logger >/dev/null; then logger -t hp-os -- "$*" 2>/dev/null || true; fi
+}
+
+shell_uptime() {
+  local seconds=0 rest
+  read -r seconds rest < /proc/uptime || true
+  printf '%s' "${seconds%%.*}"
+}
+
+# The compositor is still there, so the session has not ended.
+compositor_alive() {
+  local display="${WAYLAND_DISPLAY:-}"
+  [[ -z "$display" || "$display" == /* ]] || display="${XDG_RUNTIME_DIR:-}/$display"
+  [[ -z "$display" || -S "$display" ]] && [[ -z "${NIRI_SOCKET:-}" || -S "$NIRI_SOCKET" ]]
+}
+
+# An HP-OS shell already runs on this display (a busy one still counts).
+shell_running() {
+  local status=0
+  timeout 5 qs ipc -p "$runtime" show >/dev/null 2>&1 || status=$?
+  [[ "$status" == 0 || "$status" == 124 ]]
+}
+
+# Never replace another desktop's notification server. One still held by an HP-OS shell
+# on its way out (after a crash or a restart) is waited for, for up to 10 seconds.
+notifications_free() {
+  local reply pid argument owner attempt
+  command -v gdbus >/dev/null || return 0
+  for attempt in {1..50}; do
+    reply="$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications 2>/dev/null || true)"
+    [[ "$reply" == *true* ]] || return 0
+    reply="$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.Notifications 2>/dev/null || true)"
+    # An HP-OS shell (this runtime or another generation's) is waited for, and so is an owner
+    # that has just gone or is exiting (no command line left). Anyone else's is not.
+    owner=gone
+    if [[ "$reply" =~ uint32\ ([0-9]+) ]]; then
+      pid="${BASH_REMATCH[1]}"
+      {
+        while IFS= read -r -d '' argument; do
+          if [[ "$argument" == "$runtime" || "$argument" == /nix/store/*-hp-os-runtime*/share/quickshell/inir ]]; then
+            owner=hp-os
+          elif [[ "$owner" == gone ]]; then
+            owner=other
+          fi
+        done < "/proc/$pid/cmdline"
+      } 2>/dev/null || true
+    fi
+    [[ "$owner" != other ]] || return 1
+    sleep 0.2
+  done
+  return 1
+}
+
+# Settings the shell reads as it starts, before every start. One that fails is reported
+# and the shell starts anyway.
+prepare_shell() {
+  mkdir -p "$config" "$INIR_STATE_DIR/user" "$INIR_CACHE_DIR"
+  python3 "$packaging/initialize-config.py" "$packaging/default-config.json" "$config/config.json" "$runtime/assets/hpos-wallpaper.png"
+  python3 "$packaging/write-version.py" "$config"
+}
+
+# Keeps the shell running until the session ends or "hp-os stop". After an unexpected stop
+# it starts again, waiting 1, 2, 4... up to 30 seconds after each failure, and gives up after
+# 6 failures in 10 minutes rather than spin. If the shell stopped while the screen was locked,
+# niri keeps the screen locked, and the new shell locks it again as it starts (its lock screen
+# records this in session-lock.state).
+supervise_shell() {
+  local child="" status request now failure delay tick failures=() recent
+  trap 'trap - TERM INT HUP; [[ -z "${child:-}" ]] || kill -TERM "$child" 2>/dev/null || true; exit 0' TERM INT HUP
+  while :; do
+    "${shell_command[@]}" -n -p "$runtime" "$@" 9>&- &
+    child=$!
+    status=0
+    wait "$child" || status=$?
+    child=""
+    request="$(take_shell_request)"
+    [[ "$request" != stop ]] || return 0
+    compositor_alive || return 0
+    if [[ "$request" != restart ]]; then
+      now="$(shell_uptime)"
+      recent=()
+      for failure in "${failures[@]}"; do
+        (( now - failure >= 600 )) || recent+=("$failure")
+      done
+      failures=("${recent[@]}" "$now")
+      if (( ${#failures[@]} >= 6 )); then
+        shell_note "the shell stopped ${#failures[@]} times in 10 minutes (last status $status); not starting it again"
+        return 1
+      fi
+      delay=$(( 1 << (${#failures[@]} - 1) ))
+      (( delay <= 30 )) || delay=30
+      shell_note "the shell stopped unexpectedly (status $status); starting it again in $delay s"
+      for (( tick = 0; tick < delay * 4; tick++ )); do
+        [[ ! -e "$shell_request" ]] || break
+        sleep 0.25
+      done
+      request="$(take_shell_request)"
+      [[ "$request" != stop ]] || return 0
+      compositor_alive || return 0
+    fi
+    [[ "$request" != restart ]] || failures=()
+    if shell_running; then
+      shell_note "another HP-OS shell is already running; leaving it to that one"
+      return 0
+    fi
+    if ! notifications_free; then
+      shell_note "another program now shows notifications; not starting the shell again"
+      return 1
+    fi
+    prepare_shell || shell_note "some settings could not be prepared; starting the shell anyway"
+  done
+}
+
+# niri must get settings it accepts: with settings it rejects it starts on its own defaults,
+# without the HP-OS shell. Each sign-in whose settings niri accepts keeps a copy of them in
+# last-good. Settings niri rejects are kept in rejected, and the files that changed since
+# are put back, one at a time first so that as much as possible of the latest stays. If that
+# is not enough, the latest settings are tried without each include in turn, and then HP-OS's
+# own settings are used, with each of the account's own includes that niri accepts.
+# Exits 0 if the settings were accepted, 3 if others were put in their place, 2 otherwise.
+keep_niri_config() {
+  python3 - "$INIR_NIRI_CONFIG_DIR" "$packaging/niri.kdl" <<'PY'
+import os, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
+
+root, packaged = Path(sys.argv[1]), Path(sys.argv[2])
+main, good, rejected = root / 'config.kdl', root / 'last-good', root / 'rejected'
+STATE = 'config.kdl.bindings-state.json'  # the bindings sync's record of the shortcuts it manages
+
+
+def accepted(path):
+    """True if niri accepts the settings, False if it rejects them, None if it cannot say."""
+    try:
+        code = subprocess.run(['niri', 'validate', '--config', str(path)], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(code)
+
+
+def names(base):
+    found = ['config.kdl'] if (base / 'config.kdl').is_file() else []
+    if (base / 'config.d').is_dir():
+        found += sorted('config.d/' + p.name for p in (base / 'config.d').iterdir() if p.name.endswith('.kdl') and p.is_file())
+    return found
+
+
+def read(path):
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def write(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def contents(base):
+    files = {name: read(base / name) for name in names(base) + [STATE]}
+    return {name: data for name, data in files.items() if data is not None}
+
+
+def copy(files, target):
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(mode=0o700)
+    for name, data in files.items():
+        write(target / name, data)
+
+
+def put(name, data):
+    if data is None:
+        (root / name).unlink(missing_ok=True)
+    else:
+        write(root / name, data)
+
+
+def save():
+    files = contents(root)
+    if contents(good) == files:
+        return
+    fresh = root / '.last-good.new'
+    copy(files, fresh)
+    shutil.rmtree(good, ignore_errors=True)
+    fresh.rename(good)
+
+
+def recover(before):
+    kept = contents(good) if (good / 'config.kdl').is_file() else {}
+    changed = [name for name in kept if name != STATE and not (root / name).is_symlink() and before.get(name) != kept[name]]
+    for name in changed:
+        put(name, kept[name])
+        if accepted(main):
+            if name == 'config.kdl':
+                put(STATE, kept.get(STATE))
+            return f'put back the last accepted {name}'
+        put(name, before.get(name))
+    if changed:
+        for name in changed + [STATE]:
+            put(name, kept.get(name))
+        if accepted(main):
+            return 'put back the last accepted settings'
+        for name in changed + [STATE]:
+            put(name, before.get(name))
+    # The latest settings without the one include niri rejects (a Home Manager file, say).
+    if not (root / 'config.kdl').is_symlink():
+        lines = (before.get('config.kdl') or b'').decode(errors='replace').splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if re.fullmatch(r'include\s+(optional=true\s+)?"[^"]+"', line.strip()):
+                put('config.kdl', ''.join(lines[:index] + lines[index + 1:]).encode())
+                if accepted(main):
+                    return f'left out {line.strip()}'
+        put('config.kdl', before.get('config.kdl'))
+    try:
+        text = packaged.read_text()
+    except OSError:
+        return None
+    startup = 'config.d/50-startup.kdl'
+    candidate = root / '.config-candidate.kdl'
+    try:
+        write(candidate, text.encode())
+        if not accepted(candidate):
+            # HP-OS's settings include the account's own startup entries: set those aside too.
+            if (root / startup).is_symlink():
+                return None
+            put(startup, b'// HP-OS user startup entries\n')
+            if not accepted(candidate):
+                put(startup, before.get(startup))
+                return None
+        own = (before.get('config.kdl') or b'').decode(errors='replace').splitlines()
+        text = text.rstrip() + '\n'
+        for line in dict.fromkeys(line.strip() for line in own):
+            if re.fullmatch(r'include\s+(optional=true\s+)?"config\.d/[^"]+"', line) and line not in text:
+                write(candidate, (text + line + '\n').encode())
+                if accepted(candidate):
+                    text += line + '\n'
+        put('config.kdl', text.encode())
+        put(STATE, None)  # its record belonged to the settings set aside; the sync starts afresh
+    finally:
+        candidate.unlink(missing_ok=True)
+    return "started from HP-OS's own settings"
+
+
+verdict = accepted(main)
+if verdict is None:
+    sys.exit(2)
+if verdict:
+    save()
+    sys.exit(0)
+before = contents(root)
+copy(before, rejected)
+done = recover(before)
+if not done:
+    print(f'HP-OS: niri rejected {main} and nothing it accepts could be put back; starting anyway.', file=sys.stderr)
+    sys.exit(2)
+print(f'HP-OS: niri rejected {main}; {done}. What it rejected is kept in {rejected}.', file=sys.stderr)
+sys.exit(3)
+PY
+}
+
+# Touch gestures for this laptop, from touch-support (config.d/60-touch.kdl).
+touch_gestures() {
+  local flags=() fragment="$INIR_NIRI_CONFIG_DIR/config.d/60-touch.kdl"
+  [[ "${HP_OS_TOUCH_PATCHED:-0}" != 1 ]] || flags+=(--patched)
+  touch-support gestures "${flags[@]}" > "$fragment.tmp" && mv "$fragment.tmp" "$fragment" || { rm -f "$fragment.tmp"; return 1; }
+  grep -q 'include "config.d/60-touch.kdl"' "$INIR_NIRI_CONFIG_DIR/config.kdl" || printf '\ninclude "config.d/60-touch.kdl"\n' >> "$INIR_NIRI_CONFIG_DIR/config.kdl"
+}
+
 case "$command" in
   doctor)
     exec python3 "$packaging/doctor.py" "$@"
@@ -31,28 +335,30 @@ case "$command" in
       echo 'Start this session from a login manager or a free TTY; a Wayland session is already active.' >&2
       exit 1
     fi
-    mkdir -p "$INIR_NIRI_CONFIG_DIR/config.d"
+    # Nothing here may keep niri from starting, or the sign-in screen comes back again and
+    # again: a step that fails is reported and skipped, and keep_niri_config makes sure niri
+    # gets settings it accepts.
+    mkdir -p "$INIR_NIRI_CONFIG_DIR/config.d" || true
     if [[ ! -e "$INIR_NIRI_CONFIG_DIR/config.kdl" ]]; then
-      (umask 077; set -o noclobber; cat "$packaging/niri.kdl" > "$INIR_NIRI_CONFIG_DIR/config.kdl")
+      (umask 077; set -o noclobber; cat "$packaging/niri.kdl" > "$INIR_NIRI_CONFIG_DIR/config.kdl") || true
     fi
-    python3 "$packaging/migrate-niri-input.py" "$INIR_NIRI_CONFIG_DIR/config.kdl"
+    python3 "$packaging/migrate-niri-input.py" "$INIR_NIRI_CONFIG_DIR/config.kdl" || echo 'HP-OS skipped updating the touchpad settings.' >&2
     if [[ ! -e "$INIR_NIRI_CONFIG_DIR/config.d/50-startup.kdl" ]]; then
-      (umask 077; set -o noclobber; printf '// HP-OS user startup entries\n' > "$INIR_NIRI_CONFIG_DIR/config.d/50-startup.kdl")
+      (umask 077; set -o noclobber; printf '// HP-OS user startup entries\n' > "$INIR_NIRI_CONFIG_DIR/config.d/50-startup.kdl") || true
     fi
     if command -v touch-support >/dev/null; then
-      touch_flags=()
-      [[ "${HP_OS_TOUCH_PATCHED:-0}" != 1 ]] || touch_flags+=(--patched)
-      touch-support gestures "${touch_flags[@]}" > "$INIR_NIRI_CONFIG_DIR/config.d/60-touch.kdl.tmp"
-      mv "$INIR_NIRI_CONFIG_DIR/config.d/60-touch.kdl.tmp" "$INIR_NIRI_CONFIG_DIR/config.d/60-touch.kdl"
-      if ! grep -q 'include "config.d/60-touch.kdl"' "$INIR_NIRI_CONFIG_DIR/config.kdl"; then
-        printf '\ninclude "config.d/60-touch.kdl"\n' >> "$INIR_NIRI_CONFIG_DIR/config.kdl"
-      fi
-      niri validate --config "$INIR_NIRI_CONFIG_DIR/config.kdl"
+      touch_gestures || echo 'HP-OS kept its previous touch gestures; touch-support failed.' >&2
     elif [[ "${HP_OS_TOUCH_PATCHED:-0}" == 1 ]]; then
-      echo "Patched HP-OS requires the packaged touch-support command." >&2
-      exit 1
+      echo 'Patched HP-OS requires the packaged touch-support command; starting without its gestures.' >&2
     fi
     "$0" sync-bindings || echo "HP-OS kept its last valid bindings; sync failed." >&2
+    niri_config=0
+    keep_niri_config || niri_config=$?
+    if [[ "$niri_config" == 3 ]]; then
+      # Settings were put back: merge this account's shortcuts into them again.
+      "$0" sync-bindings || echo "HP-OS kept its last valid bindings; sync failed." >&2
+      keep_niri_config || true
+    fi
     export XDG_CURRENT_DESKTOP=HP-OS:niri
     export XDG_SESSION_DESKTOP=hp-os
     export XDG_SESSION_TYPE=wayland
@@ -83,22 +389,36 @@ case "$command" in
       [[ -z "${DISPLAY:-}" ]] || activation_vars+=(DISPLAY)
       dbus-update-activation-environment "${activation_vars[@]}"
     fi
-    # Never replace another desktop's notification server.
-    if command -v gdbus >/dev/null && gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications 2>/dev/null | grep -q true; then
+    shell_command=(qs)
+    # One "run" per session keeps the shell; another one leaves it to that.
+    supervise=0
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]] && command -v flock >/dev/null && exec 9>>"$shell_lock"; then
+      locked=0
+      flock -n -E 75 9 || locked=$?
+      if [[ "$locked" == 75 ]]; then
+        echo 'HP-OS is already running in this session; "hp-os restart" restarts it.' >&2
+        exit 0
+      fi
+      # Without the lock (it could not be taken) the shell still starts, as before.
+      if [[ "$locked" == 0 ]]; then
+        rm -f -- "$shell_request"
+        supervise=1
+      fi
+    fi
+    if ! notifications_free; then
       echo 'A notification server is already running. Start HP-OS in its own session.' >&2
       exit 1
     fi
-    mkdir -p "$config" "$INIR_STATE_DIR/user" "$INIR_CACHE_DIR"
-    python3 "$packaging/initialize-config.py" "$packaging/default-config.json" "$config/config.json" "$runtime/assets/hpos-wallpaper.png"
-    python3 "$packaging/write-version.py" "$config"
+    prepare_shell || shell_note "some settings could not be prepared; starting the shell anyway"
     # Qt has no desktop-provided icon theme on some standalone Linux sessions.
     # Scope the configured theme to Quickshell, preserving an explicit override.
     export QS_ICON_THEME="${QS_ICON_THEME:-$(python3 -c 'import json,sys; theme = json.load(open(sys.argv[1])).get("appearance", {}).get("iconTheme") or "HP-OS"; print("HP-OS" if theme == "Papirus" else theme)' "$config/config.json")}"
     if [[ "${HP_OS_OWNED_SESSION:-0}" == 1 ]] && command -v touch-support >/dev/null; then
-      touch-support session-start &
-      touch-support rotation-run &
+      touch-support session-start 9>&- &
+      touch-support rotation-run 9>&- &
     fi
-    exec qs -n -p "$runtime" "$@"
+    [[ "$supervise" == 1 ]] || exec "${shell_command[@]}" -n -p "$runtime" "$@"
+    supervise_shell "$@"
     ;;
   ipc)
     exec qs ipc -p "$runtime" call "$@"
@@ -107,10 +427,18 @@ case "$command" in
     exec qs ipc -p "$runtime" call settings toggle
     ;;
   stop)
+    # The session's "run" must not start it again.
+    if shell_supervised; then printf 'stop\n' > "$shell_request"; fi
     exec qs kill -p "$runtime"
     ;;
   restart)
-    qs kill -p "$runtime"
+    if shell_supervised; then
+      # The session's "run" starts it again straight away.
+      printf 'restart\n' > "$shell_request"
+      qs kill -p "$runtime" || true
+      exit 0
+    fi
+    qs kill -p "$runtime" || true
     # Wait only for the selected runtime; never control an iNiR systemd unit.
     for attempt in {1..30}; do
       if ! qs ipc -p "$runtime" show >/dev/null 2>&1; then break; fi

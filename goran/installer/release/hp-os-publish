@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "goran/installer/system"))
@@ -448,6 +449,22 @@ def remote_head(settings, branch):
     return head
 
 
+CHROME_DAYS = 21
+
+
+def chrome_age_warning():
+    """Chrome comes from its own Nixpkgs (flake.nix, nixpkgs-chrome) so it can be kept fresh; says when it isn't."""
+    try:
+        lock = json.loads((REPO / "flake.lock").read_text())
+        updated = lock["nodes"]["nixpkgs-chrome"]["locked"]["lastModified"]
+    except (OSError, ValueError, KeyError):
+        return
+    days = (time.time() - updated) / 86400
+    if days > CHROME_DAYS:
+        print("Note: Chrome in this release is %d days old. For its security fixes, first run\n"
+              "  nix flake update nixpkgs-chrome && git commit -am \"Newest Chrome\"" % days, flush=True)
+
+
 def publish(notes, skip_build=False):
     settings = config()
     if not notes.strip():
@@ -455,6 +472,7 @@ def publish(notes, skip_build=False):
     if git("status", "--porcelain", "--untracked-files=no"):
         stop("commit your changes first. Only committed code is published.")
     commit = git("rev-parse", "HEAD")
+    chrome_age_warning()
     version = next_version(settings)
     bucket = storage()
     prebuilt = []
@@ -478,7 +496,8 @@ def publish(notes, skip_build=False):
         # Devices whose chip is listed download this release ready-built; others wait until it is added.
         manifest.update(prebuilt=sorted(prebuilt), cache=device_cache(bucket))
     channel = sign_and_send(settings, manifest, "HP-OS " + version)
-    push_git(settings, "push", "--quiet", remote(settings), "%s:refs/heads/%s" % (stable, release.STABLE),
+    # Both or neither: a signed release whose code didn't arrive would be offered to devices that can't fetch it.
+    push_git(settings, "push", "--quiet", "--atomic", remote(settings), "%s:refs/heads/%s" % (stable, release.STABLE),
              "%s:refs/heads/%s" % (channel, release.CHANNEL))
     settings["version"] = version
     CONFIG.write_text(json.dumps(settings, indent=2) + "\n")

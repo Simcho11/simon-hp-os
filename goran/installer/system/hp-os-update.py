@@ -8,14 +8,17 @@
   hp-os-update enroll FILE    connect this device to its publisher, from the bundle made on the publishing laptop
   hp-os-update status         print the current state
   hp-os-update clock          set the clock from the internet, on a device with nothing else that does
+  hp-os-update selftest       check a newly installed updater works before it replaces the old one
 
 Nothing is changed until a release has passed every check: signed by the publisher, exactly the files that were
 signed, newer than what is installed, and fully built. People's files are never touched, and if installing fails
-the version that was working is put back.
+the version that was working is put back. An install cut off halfway (the battery, a crash) is never left half done:
+at the next start the version that was working is put back by itself.
 """
 import importlib.machinery
 import importlib.util
 import email.utils
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -33,6 +36,11 @@ import hp_os_release as release  # noqa: E402
 UPDATER = "hp-os-updater"
 MINIMUM_FREE_GB = 15
 MINIMUM_BATTERY = 30
+BUSY = ("downloading", "installing", "restoring")
+# Versions kept on the device: this one and the one before it (Settings can go back to it).
+KEEP_GENERATIONS = 2
+CLEAN_UP_SECONDS = 1200
+REPAIR_TRIES = 2
 CHIPS = {"aarch64": "aarch64-linux", "arm64": "aarch64-linux", "x86_64": "x86_64-linux", "amd64": "x86_64-linux"}
 NIX_SETTINGS = "etc/nix/nix.conf"
 NETRC = "etc/nix/hp-os-updates.netrc"
@@ -49,6 +57,31 @@ GITHUB_KEY = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOo
 
 class Stop(Exception):
     """A reason the person can act on."""
+
+
+def write_atomic(path, text, mode=0o644):
+    """The whole file or the old one, never half of it, even if the power goes in the middle."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    try:
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
+    except OSError:
+        pass
 
 
 def device_tools():
@@ -121,11 +154,33 @@ class Updater:
         current.update(changes)
         self.state.mkdir(parents=True, exist_ok=True)
         os.chmod(self.state, 0o755)
-        temporary = self.status_file.with_suffix(".new")
-        temporary.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n")
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, self.status_file)
+        write_atomic(self.status_file, json.dumps(current, indent=2, ensure_ascii=False) + "\n")
         return current
+
+    def lock(self, wait=True):
+        """One check, install or restore at a time: they share the release mirror and the unpacked versions. Returns
+        the held lock (closing it lets go), or None when something else holds it and wait is False."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        handle = open(self.state / "lock", "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            handle.close()
+            return None
+        return handle
+
+    def job_running(self, lock_held=False):
+        """An install or restore running right now (also one started by an updater from before the lock existed).
+        lock_held: this process holds the lock already (a second flock here would only ever see itself)."""
+        if not lock_held:
+            held = self.lock(wait=False)
+            if held is None:
+                return True
+            held.close()
+        if self.root != Path("/"):
+            return False
+        return subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", "hp-os-update-job.service"],
+                              check=False).returncode == 0
 
     def enrolled(self):
         return (self.config_dir / "config.json").is_file() and self.signers.is_file()
@@ -224,8 +279,7 @@ class Updater:
             BEGIN, cache["url"].rstrip("/"), cache["publicKey"], NETRC, END)
         wanted_settings = (kept + "\n\n" if kept else "") + block
         if current != wanted_settings:
-            settings.parent.mkdir(parents=True, exist_ok=True)
-            settings.write_text(wanted_settings)
+            write_atomic(settings, wanted_settings)
             changed = True
         return changed
 
@@ -239,23 +293,92 @@ class Updater:
         target.mkdir(parents=True)
         archive = subprocess.Popen(["/usr/bin/git", "-c", "safe.directory=*", "-C", str(self.mirror), "archive",
                                     manifest["commit"]], stdout=subprocess.PIPE)
-        with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-            bundle.extractall(target, filter="tar")
+        try:
+            with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
+                bundle.extractall(target, filter="tar")
+        except tarfile.TarError:
+            archive.kill()
+            archive.wait()
+            shutil.rmtree(target, ignore_errors=True)
+            raise Stop("This update couldn’t be read, so it wasn’t installed. Try again later.")
         if archive.wait() != 0 or release.tree_digest(target) != manifest["digest"]:
             shutil.rmtree(target, ignore_errors=True)
             raise Stop("This update didn’t match what was signed, so it wasn’t installed.")
         return target     # Stays root's: what was verified is what gets installed.
 
     # ── Checks before anything starts ──
+    def free_gb(self):
+        return shutil.disk_usage(self.state).free / 1024 ** 3
+
     def ready_to_install(self):
-        free = shutil.disk_usage(self.state).free / 1024 ** 3
-        if free < MINIMUM_FREE_GB:
+        if self.free_gb() < MINIMUM_FREE_GB:
+            # Old versions first: they are usually what fills the disk, and the person can't remove them.
+            self.clean_up()
+        if self.free_gb() < MINIMUM_FREE_GB:
             raise Stop("Free up at least %d GB of storage, then try again." % MINIMUM_FREE_GB)
-        supplies = Path("/sys/class/power_supply")
-        on_power = any((path / "online").read_text().strip() == "1" for path in supplies.glob("ADP*") if (path / "online").exists())
-        for battery in supplies.glob("BAT*"):
-            if not on_power and int((battery / "capacity").read_text()) < MINIMUM_BATTERY:
-                raise Stop("Plug in your device, or charge it to %d%%, then try again." % MINIMUM_BATTERY)
+        supplies = self.root / "sys/class/power_supply"
+        if not self.on_power(supplies):
+            for battery in supplies.glob("BAT*"):
+                try:
+                    capacity = int((battery / "capacity").read_text())
+                except (OSError, ValueError):
+                    continue
+                if capacity < MINIMUM_BATTERY:
+                    raise Stop("Plug in your device, or charge it to %d%%, then try again." % MINIMUM_BATTERY)
+
+    @staticmethod
+    def on_power(supplies):
+        """Plugged in, by the kind of supply rather than its name: ARM laptops call the charger ADP1, Intel ones often
+        AC or a USB-C port."""
+        try:
+            found = list(supplies.iterdir())
+        except OSError:
+            return False
+        for path in found:
+            try:
+                kind = (path / "type").read_text().strip() if (path / "type").exists() else ""
+                online = (path / "online").read_text().strip() == "1"
+            except OSError:
+                continue
+            if online and (kind in ("Mains", "USB", "USB_C", "USB_PD", "USB_PD_DRP") or path.name.startswith(("ADP", "AC"))):
+                return True
+        return False
+
+    # ── Old versions ──
+    def profiles(self):
+        """The device's own Nix profiles (the login screen, Add user, first-login setup), not their numbered versions."""
+        folder = self.root / "nix/var/nix/profiles"
+        return sorted(path for path in folder.glob("hp-os-*") if path.is_symlink() and not re.search(r"-\d+-link$", path.name))
+
+    def clean_up(self):
+        """Removes versions older than this one and the one before it: the device's own parts, each account's desktop,
+        and what nothing uses any more. Runs only when no session can still be using an older version (after the
+        restart an update asks for), and never fails an update. Parts a new account needs to be set up without the
+        internet are kept: the release's sources are held by first-login setup itself, and with keep-outputs the
+        build tools of every kept desktop stay too."""
+        if self.root != Path("/"):
+            return False
+        # A session signed in before the last install still runs the version before it, file by file.
+        if (self.state / "installed.json").exists() and not self.restarted_since_install():
+            return False
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE, "text": True, "check": False}
+        try:
+            for profile in self.profiles():
+                subprocess.run(["/usr/bin/nix-env", "--profile", str(profile), "--delete-generations", "+%d" % KEEP_GENERATIONS],
+                               timeout=300, **quiet)
+            for name in self.accounts():
+                profile = self.root / "home" / name / ".local/state/nix/profiles/home-manager"
+                if profile.is_symlink():
+                    subprocess.run(["/usr/sbin/runuser", "-u", name, "--", "/usr/bin/nix-env", "--profile", str(profile),
+                                    "--delete-generations", "+%d" % KEEP_GENERATIONS], timeout=300, **quiet)
+            subprocess.run(["/usr/bin/nice", "-n", "19", "/usr/bin/ionice", "-c", "3", "/usr/bin/nix-store", "--gc",
+                            "--option", "keep-outputs", "true", "--option", "keep-derivations", "true"],
+                           timeout=CLEAN_UP_SECONDS, **quiet)
+        except (OSError, subprocess.SubprocessError) as error:
+            print("clean-up stopped: %s" % error, file=sys.stderr)
+            return False
+        self.save(cleanedFor=self.installed())
+        return True
 
     def accounts(self):
         names = []
@@ -346,16 +469,48 @@ class Updater:
             self.as_updater(["/usr/bin/nix", "build", "--no-link", "--impure", "--expr", expression], timeout=14400)
 
     def apply(self, source):
-        """The same installer this device was set up with, from the verified release."""
+        """The same installer this device was set up with, from the verified release. While it runs the device can't be
+        shut down or put to sleep from the desktop (closing the lid included): that is the one moment it would be left
+        half one version, half the other."""
         environment = dict(os.environ, SUDO_USER=UPDATER, PATH="/usr/sbin:/usr/bin:/sbin:/bin", HOME="/root")
-        result = subprocess.run([str(Path(source) / "goran/installer/system/hp-os-add-user.sh")], env=environment,
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=7200, check=False)
+        with self.keep_on():
+            result = subprocess.run([str(Path(source) / "goran/installer/system/hp-os-add-user.sh")], env=environment,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=7200, check=False)
         if result.returncode != 0:
             raise RuntimeError(result.stderr[-2000:])
 
+    def keep_on(self):
+        """Holds off shutdown and sleep for as long as the with-block runs. The holder reads from a pipe, so it lets go
+        even if this process dies; an almost empty battery still shuts down (the system's own last resort)."""
+        updater = self
+
+        class Hold:
+            def __enter__(self):
+                self.process = None
+                if updater.root == Path("/") and Path("/usr/bin/systemd-inhibit").exists():
+                    try:
+                        self.process = subprocess.Popen(
+                            ["/usr/bin/systemd-inhibit", "--what=shutdown:sleep:handle-lid-switch", "--who=HP-OS",
+                             "--why=Installing an update", "--mode=block", "/usr/bin/cat"],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except OSError:
+                        self.process = None
+                return self
+
+            def __exit__(self, *_):
+                if self.process:
+                    try:
+                        self.process.stdin.close()
+                        self.process.wait(timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        self.process.kill()
+                return False
+
+        return Hold()
+
     def record(self, version, previous):
         data = json.dumps({"version": version, "previous": previous, "at": int(time.time()), "boot": self.boot_id()}) + "\n"
-        (self.state / "installed.json").write_text(data)
+        write_atomic(self.state / "installed.json", data)
         keep = {version, previous}
         for folder in self.versions.iterdir():
             if folder.name not in keep:
@@ -375,10 +530,44 @@ class Updater:
                             "HP-OS %s is available" % offer["version"], "Open Settings to install it."],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def settle(self):
-        """After the restart an update asked for, it is simply installed: Settings stops asking to restart."""
-        if self.status().get("state") == "restart" and self.restarted_since_install():
+    def settle(self, recover=False, lock_held=False):
+        """After the restart an update asked for, it is simply installed: Settings stops asking to restart.
+        recover: an install or restore that was cut off (the power, a crash) is finished off instead of staying "busy"
+        for ever. Only at startup and in the daily check, which hold the lock: Settings asking for the state never
+        decides it."""
+        status = self.status()
+        if status.get("state") == "restart" and self.restarted_since_install():
             return self.save(state="idle", message="", progress=0)
+        if recover and status.get("state") in BUSY and not self.job_running(lock_held=lock_held):
+            return self.recover(status)
+        return status
+
+    def settle_at_start(self):
+        held = self.lock(wait=False)
+        if held is None:
+            return self.status()
+        try:
+            return self.settle(recover=True, lock_held=True)
+        finally:
+            held.close()
+
+    def recover(self, status):
+        """Nothing changes on the device until "installing", so a download cut off left it as it was. Once installing
+        has started the device may be part old, part new: the version that was working is put back by itself (an
+        update the person asked for is then offered again). Tried twice at most, so a repeated cut-off can't loop."""
+        print("an update was interrupted while %s" % status.get("state"), file=sys.stderr)
+        if status.get("state") == "downloading":
+            return self.save(state="error", progress=0, message="The update was interrupted before it changed anything. "
+                             "Try again.")
+        tries = int(status.get("repairTries") or 0)
+        if tries >= REPAIR_TRIES:
+            return self.save(state="error", progress=0, repairTries=0,
+                             message="The update was interrupted and couldn’t be finished. Restart your device, then install "
+                                     "the update again.")
+        write_atomic(self.job_file, "repair\n")
+        self.save(state="installing", progress=10, message="Finishing an update that was interrupted…", repairTries=tries + 1)
+        if self.root == Path("/"):
+            subprocess.run(["/usr/bin/systemctl", "start", "--no-block", "hp-os-update-job.service"], check=False)
         return self.status()
 
     def boot_id(self):
@@ -414,27 +603,46 @@ class Updater:
                 pass
         if not self.enrolled():
             return self.save(state="idle")
-        self.settle()
-        if self.status().get("state") in ("downloading", "installing", "restoring"):
+        held = self.lock(wait=False)
+        if held is None:        # An install is running; it reports for itself.
+            return self.status()
+        try:
+            return self.check_locked()
+        finally:
+            held.close()
+
+    def check_locked(self):
+        self.settle(recover=True, lock_held=True)
+        if self.status().get("state") in BUSY:
             return self.status()
         try:
             self.fetch()
             manifest = self.latest()
         except (subprocess.SubprocessError, OSError, ValueError, KeyError, Stop) as error:
             message = str(error) if isinstance(error, Stop) else "Couldn’t reach the update server."
-            return self.save(lastChecked=int(time.time()), checkError=message)
+            self.save(lastChecked=int(time.time()), checkError=message)
+            return self.tidy()
         offer = {key: manifest.get(key, "") for key in ("version", "notes", "date")}
         if not self.newer(manifest) or not self.ready_for_this_device(manifest):
             state = self.status().get("state")
-            return self.save(state="restart" if state == "restart" else "idle", available=None, lastChecked=int(time.time()),
-                             checkError="")
+            self.save(state="restart" if state == "restart" else "idle", available=None, lastChecked=int(time.time()),
+                      checkError="")
+            return self.tidy()
         known = self.status().get("available") or {}
         if known.get("version") == offer["version"] and "downloadBytes" in known:
             offer.update({key: known[key] for key in ("downloadBytes", "builds", "estimateSeconds") if key in known})
         else:
             offer.update(self.measure(manifest))
         self.notify(offer)
-        return self.save(state="available", available=offer, lastChecked=int(time.time()), checkError="", message="")
+        self.save(state="available", available=offer, lastChecked=int(time.time()), checkError="", message="")
+        return self.tidy()
+
+    def tidy(self):
+        """Once per installed version, after its restart: the old versions go (see clean_up)."""
+        status = self.status()
+        if status.get("installed") and status.get("cleanedFor") != status.get("installed") and status.get("state") not in BUSY:
+            self.clean_up()
+        return self.status()
 
     def install(self):
         current = self.installed()
@@ -451,27 +659,46 @@ class Updater:
                 self.restart_nix()
             self.save(state="downloading", progress=20, message="Preparing the update. This can take a while…")
             self.build(source)
-        except (Stop, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
+        except Exception as error:      # Nothing on the device has changed yet, whatever went wrong.
+            print("download failed: %r" % error, file=sys.stderr)
             reason = str(error) if isinstance(error, Stop) else "The update couldn’t be downloaded. Your device wasn’t changed."
             return self.save(state="error", message=reason, progress=0)
         try:
             self.save(state="installing", progress=75, message="Installing…")
             self.apply(source)
-        except (RuntimeError, subprocess.SubprocessError, OSError) as error:
-            print("install failed: %s" % error, file=sys.stderr)
+        except Exception as error:
+            print("install failed: %r" % error, file=sys.stderr)
             self.save(state="restoring", progress=85, message="Putting the previous version back…")
             restored = False
             if current_source and current_source.is_dir():
                 try:
                     self.apply(current_source)
                     restored = True
-                except (RuntimeError, subprocess.SubprocessError, OSError) as second:
-                    print("restore failed: %s" % second, file=sys.stderr)
-            return self.save(state="error", progress=0, message="The update couldn’t be installed. "
+                except Exception as second:
+                    print("restore failed: %r" % second, file=sys.stderr)
+            return self.save(state="error", progress=0, repairTries=0, message="The update couldn’t be installed. "
                              + ("Your device is back on the previous version." if restored else "Restart your device."))
         self.record(manifest["version"], current)
-        return self.save(state="restart", installed=manifest["version"], available=None, progress=100,
+        return self.save(state="restart", installed=manifest["version"], available=None, progress=100, repairTries=0,
                          message="Restart to finish updating.")
+
+    def repair(self):
+        """After an install or restore was cut off: the version installed.json names (the one that was working) is put
+        back in full."""
+        current = self.installed()
+        source = self.versions / current if current else None
+        if not source or not source.is_dir():
+            # A device whose first version wasn't recorded: the only complete version it can get is the newest one.
+            return self.install()
+        try:
+            self.save(state="installing", progress=40, message="Finishing an update that was interrupted…")
+            self.apply(source)
+        except Exception as error:
+            print("repair failed: %r" % error, file=sys.stderr)
+            return self.save(state="error", progress=0, message="An update was interrupted and couldn’t be finished. "
+                             "Restart your device, then try again.")
+        return self.save(state="restart", progress=100, repairTries=0,
+                         message="An update was interrupted, so the version you had was put back. Restart to finish.")
 
     def restore(self):
         previous = self.previous()
@@ -482,20 +709,31 @@ class Updater:
         try:
             self.save(state="restoring", progress=40, message="Putting the previous version back…")
             self.apply(source)
-        except (RuntimeError, subprocess.SubprocessError, OSError):
+        except Exception as error:
+            print("restore failed: %r" % error, file=sys.stderr)
             return self.save(state="error", progress=0, message="The previous version couldn’t be restored.")
-        (self.state / "installed.json").write_text(json.dumps({"version": previous, "previous": "", "at": int(time.time()),
-                                                              "boot": self.boot_id()}) + "\n")
+        write_atomic(self.state / "installed.json", json.dumps({"version": previous, "previous": "", "at": int(time.time()),
+                                                               "boot": self.boot_id()}) + "\n")
         shutil.rmtree(self.versions / current, ignore_errors=True)
         return self.save(state="restart", installed=previous, progress=100, message="Restart to finish.")
 
     def job(self):
+        held = self.lock()
         try:
-            action = self.job_file.read_text().strip()
-            self.job_file.unlink()
-        except OSError:
-            return self.status()
-        return self.restore() if action == "restore" else self.install()
+            try:
+                action = self.job_file.read_text().strip()
+                self.job_file.unlink()
+            except OSError:
+                return self.status()
+            work = {"restore": self.restore, "repair": self.repair}.get(action, self.install)
+            try:
+                return work()
+            except Exception as error:      # Never left "busy": the next start would otherwise have to sort it out.
+                print("%s failed: %r" % (action, error), file=sys.stderr)
+                return self.save(state="error", progress=0, message="Something went wrong while updating. Restart your "
+                                 "device, then try again.")
+        finally:
+            held.close()
 
     def answer(self, uid, message):
         action = message.get("action")
@@ -516,9 +754,9 @@ class Updater:
         if not isinstance(password, str) or not password or not tools.password_matches(who, password):
             time.sleep(2)
             return {"ok": False, "error": "That password isn’t correct."}
-        if self.status().get("state") in ("downloading", "installing", "restoring"):
+        if self.status().get("state") in BUSY:
             return {"ok": True}
-        self.job_file.write_text(action + "\n")
+        write_atomic(self.job_file, action + "\n")
         subprocess.run(["/usr/bin/systemctl", "start", "--no-block", "hp-os-update-job.service"], check=False)
         return {"ok": True}
 
@@ -555,11 +793,18 @@ def main():
     elif command == "clock":
         print(json.dumps({"moved": round(set_clock())}))
     elif command == "settle":
-        updater.settle()
+        updater.settle_at_start()
     elif command == "job":
         updater.job()
     elif command == "status":
         print(json.dumps(updater.status(), indent=2, ensure_ascii=False))
+    elif command == "selftest":
+        # A new updater checks it can do its everyday work before it is kept: read the state, the device tools and the
+        # release checks. Changes nothing.
+        updater.status()
+        tools = device_tools()
+        assert callable(tools.Device("/").person) and callable(release.signature_valid) and callable(release.tree_digest)
+        print("ok")
     elif command == "enroll" and len(sys.argv) == 3:
         updater.enroll(sys.argv[2])
     elif command == "request":

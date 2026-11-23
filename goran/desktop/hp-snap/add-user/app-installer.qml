@@ -18,6 +18,16 @@ ShellRoot {
     readonly property string title: String(app.info.title || app.info.name || "This app")
     readonly property bool sameVersion: !!app.info.installed && app.info.installed === app.info.version
     readonly property bool admin: app.info.admin === true
+    // The file itself, and where it came from: its name and folder here, the website when the browser noted it.
+    readonly property string fileName: app.file.replace(/^file:\/\//, "").split("/").pop()
+    readonly property string fileFolder: { const parts = app.file.replace(/^file:\/\//, "").split("/"); return parts.length > 2 ? parts[parts.length - 2] : "" }
+    readonly property string fileLine: !app.fileName ? ""
+        : app.fileName + (app.info.origin ? "  ·  downloaded from " + app.info.origin : app.fileFolder ? "  ·  in " + app.fileFolder : "")
+    // Nothing in a downloaded file is checked by HP-OS: its name, description and publisher are what its maker wrote.
+    readonly property string caution: {
+        const said = app.info.publisher ? " The file says it comes from " + app.info.publisher + "." : ""
+        return "This app hasn’t been checked by HP-OS. Install it only if you trust where you got it." + said
+    }
 
     Process {
         id: request
@@ -105,9 +115,11 @@ ShellRoot {
     QtObject {
         id: previews
         readonly property var ready: ({ ok: true, allowed: true, admin: true, title: "ChatGPT", version: "26.1103.60933", publisher: "OpenAI", size: "412 MB",
-            about: "Chat, write and code with ChatGPT and Codex.", installed: "", icon: "" })
+            about: "Chat, write and code with ChatGPT and Codex.", installed: "", icon: "", origin: "chatgpt.com", package: "chatgpt" })
         readonly property var update: ({ ok: true, allowed: true, admin: true, title: "ChatGPT", version: "26.1120.10101", publisher: "OpenAI", size: "415 MB",
-            about: "Chat, write and code with ChatGPT and Codex.", installed: "26.1103.60933", isUpdate: true, icon: "" })
+            about: "Chat, write and code with ChatGPT and Codex.", installed: "26.1103.60933", isUpdate: true, icon: "", package: "chatgpt" })
+        readonly property var source: ({ ok: true, allowed: true, admin: true, title: "Google Chrome", version: "142.0.7444.59", publisher: "Chrome Linux Team", size: "380 MB",
+            about: "The web browser from Google.", installed: "", icon: "", origin: "google.com", package: "google-chrome-stable", addsSource: true })
         readonly property var refused: ({ ok: true, allowed: false, admin: true, title: "Steam", version: "1.0.0.87", publisher: "Valve Corporation", size: "20 MB",
             reason: "This version of the app is for Intel and AMD computers, and this laptop is an ARM computer. If the app’s maker offers a version for ARM (sometimes called arm64 or aarch64), download that one instead.", icon: "" })
         readonly property var standard: ({ ok: true, allowed: true, admin: false, title: "ChatGPT", version: "26.1103.60933", publisher: "OpenAI", size: "412 MB",
@@ -116,7 +128,7 @@ ShellRoot {
     function showPreview() {
         const kind = app.preview
         app.info = previews[kind] || previews[kind.replace(/^(asking|installing|done|error)$/, "ready")] || previews.ready
-        app.stage = kind === "refused" ? "refused" : kind === "standard" || kind === "update" ? "ready" : (["asking", "installing", "done", "error"].indexOf(kind) >= 0 ? kind : "ready")
+        app.stage = kind === "refused" ? "refused" : kind === "standard" || kind === "update" || kind === "source" ? "ready" : (["asking", "installing", "done", "error"].indexOf(kind) >= 0 ? kind : "ready")
         app.notice = kind === "refused" ? app.info.reason : kind === "error" ? "ChatGPT needs other software that couldn’t be found. Make sure you’re connected to the internet, then try again." : ""
         app.progress = kind === "done" ? { apps: [{ id: "chatgpt.desktop", name: "ChatGPT" }] } : { progress: 46, message: "Installing ChatGPT…" }
     }
@@ -127,7 +139,7 @@ ShellRoot {
         visible: true
         title: "App Installer"
         color: "#071a3f"
-        implicitWidth: 620; implicitHeight: 560
+        implicitWidth: 620; implicitHeight: 680
 
         component Label: Text {
             color: "white"
@@ -220,8 +232,16 @@ ShellRoot {
                 visible: !!app.info.version && ["ready", "asking", "refused"].indexOf(app.stage) >= 0
                 color: Qt.rgba(1, 1, 1, 0.72)
                 font.pixelSize: 15; font.weight: Font.Medium
-                text: ["Version " + app.info.version, app.info.publisher ? "from " + app.info.publisher : "", app.info.size || ""]
-                    .filter(part => part.length > 0).join("  ·  ")
+                text: ["Version " + app.info.version, app.info.size || ""].filter(part => part.length > 0).join("  ·  ")
+            }
+            // Which file this is, and where it came from.
+            Label {
+                visible: app.fileLine.length > 0 && ["ready", "asking", "refused"].indexOf(app.stage) >= 0
+                color: Qt.rgba(1, 1, 1, 0.6)
+                font.pixelSize: 14
+                elide: Text.ElideMiddle
+                wrapMode: Text.NoWrap
+                text: app.fileLine
             }
             Label {
                 visible: text.length > 0
@@ -230,7 +250,8 @@ ShellRoot {
                 text: app.stage === "nofile" ? "Open an app’s installer file (it ends in .deb) to install it."
                     : app.stage === "ready" || app.stage === "asking"
                         ? (app.sameVersion ? "This version is already installed."
-                           : app.info.isUpdate ? "Version " + app.info.installed + " is installed now. This updates it."
+                           : app.info.isUpdate ? "“" + (app.info.package || app.title) + "” " + app.info.installed
+                               + " is already on this laptop. Installing this file replaces it."
                            : String(app.info.about || ""))
                     : app.stage === "installing" ? String(app.progress.message || "")
                     : app.stage === "done" ? "Find it with your other apps, or open it now."
@@ -277,12 +298,40 @@ ShellRoot {
                 text: "You can close this window. The install carries on."
             }
 
-            // A word on trust, where the decision is made.
-            Label {
-                visible: app.stage === "ready" && !app.sameVersion
-                color: Qt.rgba(1, 1, 1, 0.62)
-                font.pixelSize: 14
-                text: "Install apps only from companies you trust. An app you install can change this laptop for every account."
+            // A word on trust, where the decision is made: what HP-OS knows, and what it doesn't.
+            Rectangle {
+                visible: app.stage === "ready" || app.stage === "asking"
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: parent.width; height: trust.implicitHeight + 28
+                radius: 16
+                color: app.info.addsSource ? Qt.rgba(1, 0.71, 0.67, 0.14) : Qt.rgba(1, 1, 1, 0.07)
+                Column {
+                    id: trust
+                    anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; margins: 18 }
+                    spacing: 8
+                    Text {
+                        width: parent.width
+                        color: Qt.rgba(1, 1, 1, 0.8)
+                        font.family: "HarmonyOS Sans"
+                        font.pixelSize: 14
+                        lineHeight: 1.15
+                        wrapMode: Text.WordWrap
+                        horizontalAlignment: Text.AlignHCenter
+                        text: app.caution
+                    }
+                    Text {
+                        visible: app.info.addsSource === true
+                        width: parent.width
+                        color: "#ffb4ab"
+                        font.family: "HarmonyOS Sans"
+                        font.pixelSize: 14; font.weight: Font.Medium
+                        lineHeight: 1.15
+                        wrapMode: Text.WordWrap
+                        horizontalAlignment: Text.AlignHCenter
+                        text: "It also adds a software source of its own: from then on, its maker can install updates and "
+                            + "other software on this laptop, for every account. Many apps do this to stay up to date."
+                    }
+                }
             }
 
             // An administrator's password

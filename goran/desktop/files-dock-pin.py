@@ -3,6 +3,7 @@
 
 HP-OS Files (Dolphin) is the one file manager. Accounts that pinned COSMIC Files
 get HP-OS Files in the same place; nothing else in the dock changes.
+A config.json that can't be read as HP-OS settings is left exactly as it is.
 """
 import json
 import os
@@ -11,12 +12,27 @@ import tempfile
 import sys
 
 
+def skip(path, reason):
+    # This runs in every Home Manager update: a damaged config.json must not stop the rest of it.
+    print(f'files-dock-pin: left {path} as it is ({reason})', file=sys.stderr)
+    return False
+
+
 def update(path):
     if not path.exists():
         return False
-    config = json.loads(path.read_text())
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError) as error:
+        return skip(path, error)
+    if not isinstance(config, dict):
+        return skip(path, 'not a JSON object')
     dock = config.setdefault('dock', {})
+    if not isinstance(dock, dict):
+        return skip(path, 'dock is not an object')
     old = dock.get('pinnedApps', [])
+    if not isinstance(old, list):
+        return skip(path, 'dock.pinnedApps is not a list')
     files = 'org.kde.dolphin'
     pins = []
     for app in old:

@@ -76,6 +76,12 @@ in {
     # The screenshot tool's "Screenshot copied" and the recorder's "Recording saved" open the file in its folder.
     git apply ${./show-saved.patch}
     substituteInPlace scripts/hp-snap/show-saved.sh --replace-fail '@notifySend@' ${pkgs.libnotify}/bin/notify-send
+    # The desktop keeps working when parts of it fail: the shell comes back, the laptop's own screen can't stay dark.
+    if grep -q '^diff --git' ${./stability.patch}; then git apply ${./stability.patch}; fi
+    # After a crash the shell comes back, and a locked screen comes back locked.
+    if grep -q '^diff --git' ${./session-recovery.patch}; then git apply ${./session-recovery.patch}; fi
+    # Sign-in, accounts and passwords: clearer and safer.
+    if grep -q '^diff --git' ${./accounts-polish.patch}; then git apply ${./accounts-polish.patch}; fi
     substituteInPlace scripts/hp-snap/desktop_files.py \
       --replace-fail '@fileClipboard@' ${fileClipboard}/bin/hp-os-file-clipboard
   '';

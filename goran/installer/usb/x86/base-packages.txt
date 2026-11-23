@@ -12,6 +12,15 @@ pipewire pipewire-pulse pipewire-alsa wireplumber libspa-0.2-bluetooth alsa-util
 # The speaker and microphone profiles for each laptop's sound chip. They are only "recommended" by Ubuntu, so the
 # install (which skips recommended extras) left them out, and newer Intel laptops showed only "Dummy Output".
 alsa-ucm-conf alsa-topology-conf
+# Realtime priority for PipeWire, so calls don't crackle when the laptop is busy (also only "recommended").
+rtkit
+# Printing: network printers found by themselves (AirPrint / IPP Everywhere), USB printers (IPP over USB), and HP's
+# drivers for older HP printers. Chrome prints through these.
+cups cups-browsed cups-filters ipp-usb avahi-daemon libnss-mdns hplip printer-driver-hpcups
+# Firmware updates (HP's included), Thunderbolt and USB4 docks, and Intel's thermal management.
+fwupd bolt thermald
+# Ubuntu's daily security updates (hp-os-system-packages.sh turns them on and holds back the kernel and startup parts).
+unattended-upgrades
 # Login screen
 sddm libpam-gnome-keyring gnome-keyring libpam-systemd
 qml6-module-qt5compat-graphicaleffects qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtqml-workerscript

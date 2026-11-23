@@ -130,6 +130,9 @@ in {
     # and the wallpaper follows light/dark.
     systemd.user.services.hp-os-app-theme = {
       Unit.Description = "Sync GTK and Qt application themes and the wallpaper with the HP-OS shell";
+      # Settings can save config.json several times a second. With systemd's default start limit
+      # (5 starts in 10 s) such a burst would stop the watcher below for the rest of the session.
+      Unit.StartLimitIntervalSec = 0;
       Service = { Type = "oneshot"; ExecStart = [ appTheme followMode ]; };
       Install.WantedBy = [ "default.target" ];
     };

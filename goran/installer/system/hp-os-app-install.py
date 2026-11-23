@@ -8,6 +8,10 @@ The window never hands over a path: it opens the file itself and passes the open
 reads a path someone else chose. The file is copied, then checked: its name, version, publisher and whether this
 device can run it. Only an administrator's password installs it, and never anything that would remove, downgrade or
 replace a part of HP-OS itself (apt is asked first, in a trial run). Nothing here runs in the background.
+
+Nothing in a downloaded package is verified: its name, description and publisher are whatever its maker wrote. The
+window says so, says where the file came from when the browser noted it, and warns when the package adds a software
+source of its own (so its maker can send this laptop more software later) or replaces something already installed.
 """
 import array
 import hashlib
@@ -25,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 STATE = Path("/var/lib/hp-os/app-install")
 ICONS = Path("/var/lib/hp-os/app-install-icons")    # readable by everyone: the window shows the app's own icon
@@ -42,6 +47,16 @@ PROTECTED = re.compile(r"(linux-.*|systemd.*|libsystemd.*|udev|grub.*|shim.*|efi
                        r"|python3|python3\.\d+|python3-minimal|libpython3.*|openssh-.*|ca-certificates|chrony"
                        r"|base-files|base-passwd|bash|coreutils|util-linux|mount|tzdata|locales)")
 NAME = re.compile(r"[a-z0-9][a-z0-9+.-]{0,99}")
+# A software source of the package's own, and the key its updates are signed with. Many apps' makers add one so their
+# app keeps itself up to date; it also lets them send this laptop other software later. Warned about, never refused.
+SOURCE_FOLDERS = ("/etc/apt/sources.list.d/", "/etc/apt/trusted.gpg.d/", "/etc/apt/keyrings/", "/usr/share/keyrings/",
+                  "/etc/apt/preferences.d/")
+SOURCE_FILES = ("/etc/apt/sources.list", "/etc/apt/trusted.gpg")
+# The same, done by the package's own install scripts instead of as files (Chrome and VS Code work this way).
+SOURCE_WORDS = re.compile(rb"sources\.list|trusted\.gpg|/keyrings/|apt-key|add-apt-repository")
+# Chrome (and other browsers) note on a download the page it came from.
+ORIGIN_ATTRIBUTE = "user.xdg.origin.url"
+HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}\.)*[a-z0-9-]{1,63}")
 
 
 def device_tools():
@@ -99,16 +114,19 @@ class Installer:
     def newer(self, first, second):
         return self.run(["dpkg", "--compare-versions", first, "gt", second]).returncode == 0
 
-    def members(self, deb, wanted):
-        """{path: bytes} of the package's small regular files for which wanted(path) is true, read as a stream."""
+    def members(self, deb, wanted, seen=None, part="--fsys-tarfile"):
+        """{path: bytes} of the package's small regular files for which wanted(path) is true, read as a stream.
+        seen(path), when given, is told every path on the way. part="--ctrl-tarfile" reads its install scripts."""
         import tarfile
         found = {}
-        process = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", str(deb)], stdout=subprocess.PIPE,
+        process = subprocess.Popen(["dpkg-deb", part, str(deb)], stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
         try:
             with tarfile.open(fileobj=process.stdout, mode="r|*") as archive:
                 for member in archive:
                     path = member.name.lstrip(".")
+                    if seen:
+                        seen(path)
                     if member.isfile() and member.size < 4 * 1024 ** 2 and wanted(path):
                         found[path] = archive.extractfile(member).read()
         except (tarfile.TarError, OSError):
@@ -123,11 +141,23 @@ class Installer:
         """The app's name and its own icon, from the launcher the package brings (cached: the token is its contents)."""
         cache = self.state / token / "look.json"
         try:
-            return json.loads(cache.read_text())
+            cached = json.loads(cache.read_text())
+            if isinstance(cached, dict) and isinstance(cached.get("sources"), list):   # older ones didn't look for these
+                return cached
         except (OSError, ValueError):
             pass
-        look = {"title": "", "icon": ""}
-        launchers = self.members(deb, lambda p: p.startswith("/usr/share/applications/") and p.endswith(".desktop"))
+        look = {"title": "", "icon": "", "sources": []}
+
+        def source(path):
+            if (path.startswith(SOURCE_FOLDERS) and not path.endswith("/")) or path in SOURCE_FILES:
+                if path not in look["sources"]:
+                    look["sources"].append(path)
+        launchers = self.members(deb, lambda p: p.startswith("/usr/share/applications/") and p.endswith(".desktop"),
+                                 seen=source)
+        scripts = self.members(deb, lambda p: p in ("/preinst", "/postinst", "/config"), part="--ctrl-tarfile")
+        if any(SOURCE_WORDS.search(text) for text in scripts.values()):
+            look["sources"].append("its install script")
+        look["sources"] = look["sources"][:6]
         icon = ""
         for path in sorted(launchers):
             text = launchers[path].decode(errors="replace")
@@ -154,6 +184,19 @@ class Installer:
                 look["icon"] = str(target)
         cache.write_text(json.dumps(look) + "\n")
         return look
+
+    @staticmethod
+    def origin(descriptor):
+        """The website the file was downloaded from (its name only), when the browser noted it on the file; else ""."""
+        try:
+            noted = os.getxattr(descriptor, ORIGIN_ATTRIBUTE)[:2048].decode("utf-8", errors="replace")
+            address = urllib.parse.urlsplit(noted.strip())
+            host = (address.hostname or "").rstrip(".")
+        except (OSError, ValueError, TypeError):
+            return ""
+        if address.scheme not in ("http", "https") or len(host) > 253 or not HOST.fullmatch(host):
+            return ""
+        return host[4:] if host.startswith("www.") else host
 
     @staticmethod
     def icon_size(path):
@@ -226,6 +269,7 @@ class Installer:
         }
         look = self.look(deb, token)
         info["title"], info["icon"] = look["title"] or info["name"], look["icon"]
+        info["addsSource"] = bool(look.get("sources"))
         machine = self.architectures()
         if architecture not in machine + ["all"]:
             kind = {"amd64": "Intel and AMD", "arm64": "ARM", "i386": "older 32-bit"}.get(architecture, architecture)
@@ -266,6 +310,7 @@ class Installer:
                 return {"ok": False, "error": str(error) if isinstance(error, ValueError) else "This file couldn’t be read."}
             info = self.describe(token)
             info["admin"] = bool(who) and tools.is_admin(who)
+            info["origin"] = self.origin(descriptor)
             return info
         token = str(message.get("token", ""))
         if not re.fullmatch(r"[0-9a-f]{32}", token) or not (self.state / token).is_dir():

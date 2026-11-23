@@ -1,8 +1,29 @@
 diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
-index 1f68367..62a7c8e 100644
+index 1f68367..eeff4b5 100644
 --- a/src/layout/scrolling.rs
 +++ b/src/layout/scrolling.rs
-@@ -2909,18 +2909,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+@@ -30,6 +30,10 @@ use crate::window::ResolvedWindowRules;
+ /// Amount of touchpad movement to scroll the view for the width of one working area.
+ const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 1200.;
+ 
++/// HP-OS: how long a window going fullscreen stays in front before it has drawn itself fullscreen.
++/// Apps answer well within this; one that never does (a hung app) then stops covering the Dock.
++const FULLSCREEN_ANSWER_TIME: Duration = Duration::from_secs(1);
++
+ /// A scrollable-tiling space for windows.
+ #[derive(Debug)]
+ pub struct ScrollingSpace<W: LayoutElement> {
+@@ -179,6 +183,9 @@ pub struct Column<W: LayoutElement> {
+     /// take some time to catch up and actually unfullscreen.
+     is_pending_fullscreen: bool,
+ 
++    /// HP-OS: when this column was last asked to go fullscreen (unadjusted clock time).
++    pending_fullscreen_since: Option<Duration>,
++
+     /// Whether this column is going to be maximized.
+     ///
+     /// Can be `true` together with `is_pending_fullscreen`, which means that the column is
+@@ -2909,18 +2916,24 @@ impl<W: LayoutElement> ScrollingSpace<W> {
      }
  
      pub fn render_above_top_layer(&self) -> bool {
@@ -17,7 +38,9 @@ index 1f68367..62a7c8e 100644
 +        // until the app had drawn itself at full size and the view had finished scrolling to it,
 +        // so a floating window going fullscreen (a YouTube video) showed behind the other windows
 +        // and the Dock for a moment first. Only a swipe in progress keeps it behind, so the
-+        // neighbouring desktops show while the finger moves.
++        // neighbouring desktops show while the finger moves. An app that asks for fullscreen but
++        // never draws itself fullscreen (a hung one) goes back behind the Dock after a moment,
++        // so it can't cover the Dock and the shell for good.
 +        if self.view_offset.is_gesture() {
              return false;
          }
@@ -26,7 +49,38 @@ index 1f68367..62a7c8e 100644
 -            .sizing_mode()
 -            .is_fullscreen()
 +        let col = &self.columns[self.active_column_idx];
-+        col.sizing_mode().is_fullscreen() || col.pending_sizing_mode().is_fullscreen()
++        col.sizing_mode().is_fullscreen() || col.is_going_fullscreen()
      }
  
      pub fn render<R: NiriRenderer>(
+@@ -3994,6 +4007,7 @@ impl<W: LayoutElement> Column<W> {
+             is_full_width,
+             is_pending_maximized: false,
+             is_pending_fullscreen: false,
++            pending_fullscreen_since: None,
+             display_mode,
+             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
+             move_animation: None,
+@@ -4169,6 +4183,14 @@ impl<W: LayoutElement> Column<W> {
+         self.is_pending_maximized
+     }
+ 
++    /// HP-OS: asked to go fullscreen a moment ago; the app may not have drawn itself fullscreen yet.
++    fn is_going_fullscreen(&self) -> bool {
++        self.is_pending_fullscreen
++            && self.pending_fullscreen_since.is_some_and(|since| {
++                self.clock.now_unadjusted().saturating_sub(since) < FULLSCREEN_ANSWER_TIME
++            })
++    }
++
+     pub fn pending_sizing_mode(&self) -> SizingMode {
+         if self.is_pending_fullscreen {
+             SizingMode::Fullscreen
+@@ -5118,6 +5140,7 @@ impl<W: LayoutElement> Column<W> {
+         }
+ 
+         self.is_pending_fullscreen = is_fullscreen;
++        self.pending_fullscreen_since = is_fullscreen.then(|| self.clock.now_unadjusted());
+         self.update_tile_sizes(true);
+     }
+ 

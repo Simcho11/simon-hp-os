@@ -46,10 +46,24 @@ fi
 
 /usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-device.py"
 install -d -m 755 /opt/hp-os/device "$state"
+# The updater is the one part a later update can't mend if it breaks: a new one has to pass its own check before it
+# is kept. Otherwise the working one is put back and this update fails, so it is rolled back as a whole.
+updater_files=(hp-os-device hp-os-update hp_os_release.py)
+for file in "${updater_files[@]}"; do
+    [[ ! -f "/opt/hp-os/device/$file" ]] || cp -a "/opt/hp-os/device/$file" "/opt/hp-os/device/.$file.previous"
+done
 install -m 755 -o root -g root "$here/hp-os-device.py" "$tool"
 /usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-update.py"
 install -m 755 -o root -g root "$here/hp-os-update.py" /opt/hp-os/device/hp-os-update
 install -m 644 -o root -g root "$here/hp_os_release.py" /opt/hp-os/device/hp_os_release.py
+if ! /usr/bin/python3 -I /opt/hp-os/device/hp-os-update selftest >/dev/null; then
+    for file in "${updater_files[@]}"; do
+        [[ ! -f "/opt/hp-os/device/.$file.previous" ]] || mv -f "/opt/hp-os/device/.$file.previous" "/opt/hp-os/device/$file"
+    done
+    echo "The new updater failed its own check; the working one was kept." >&2
+    exit 1
+fi
+for file in "${updater_files[@]}"; do rm -f "/opt/hp-os/device/.$file.previous"; done
 /usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/hp-os-login-wallpaper.py"
 install -m 755 -o root -g root "$here/hp-os-login-wallpaper.py" /opt/hp-os/device/hp-os-login-wallpaper
 install -d -m 755 "$state/login-wallpapers"
@@ -72,6 +86,8 @@ Description=HP-OS factory reset requests
 ListenStream=/run/hp-os/factory-reset.sock
 SocketMode=0666
 Accept=yes
+# Any account can ask, so a flood of requests can't pile up helpers running as root.
+MaxConnections=8
 
 [Install]
 WantedBy=sockets.target
@@ -85,6 +101,7 @@ ExecStart=/usr/bin/python3 -I $tool request
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
+TimeoutSec=120
 UNIT
 cat > "$units/hp-os-factory-wipe.service" <<UNIT
 [Unit]
@@ -134,6 +151,8 @@ Description=HP-OS software update requests
 ListenStream=/run/hp-os/update.sock
 SocketMode=0666
 Accept=yes
+# Any account can ask, so a flood of requests can't pile up helpers running as root.
+MaxConnections=8
 
 [Install]
 WantedBy=sockets.target
@@ -147,6 +166,7 @@ ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-update request
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
+TimeoutSec=120
 UNIT
 cat > "$units/hp-os-update-job.service" <<UNIT
 [Unit]
@@ -182,6 +202,8 @@ Description=HP-OS login screen wallpapers
 ListenStream=/run/hp-os/login-wallpaper.sock
 SocketMode=0666
 Accept=yes
+# Any account can ask, so a flood of requests can't pile up helpers running as root.
+MaxConnections=8
 
 [Install]
 WantedBy=sockets.target
@@ -206,6 +228,8 @@ Description=HP-OS recovery key requests
 ListenStream=/run/hp-os/recovery.sock
 SocketMode=0666
 Accept=yes
+# Any account can ask, so a flood of requests can't pile up helpers running as root (each key check is costly on purpose).
+MaxConnections=4
 
 [Install]
 WantedBy=sockets.target
@@ -255,6 +279,8 @@ Description=HP-OS App Installer requests
 ListenStream=/run/hp-os/app-install.sock
 SocketMode=0666
 Accept=yes
+# Any account can ask, so a flood of requests can't pile up helpers running as root.
+MaxConnections=8
 
 [Install]
 WantedBy=sockets.target
@@ -268,6 +294,8 @@ ExecStart=/usr/bin/python3 -I /opt/hp-os/device/hp-os-app-install request
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
+# Looking inside a downloaded app takes seconds; a file that never finishes reading can't hold a helper for ever.
+TimeoutSec=300
 UNIT
 # Runs on its own, so closing the window never stops an install halfway.
 cat > "$units/hp-os-app-install-job@.service" <<UNIT

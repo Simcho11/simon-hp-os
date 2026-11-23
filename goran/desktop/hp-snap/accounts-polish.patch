@@ -1,0 +1,350 @@
+# HP-OS shell changes (accounts-polish). Applied by default.nix only once it contains a `diff --git`.
+diff --git a/modules/settings/AccountsConfig.qml b/modules/settings/AccountsConfig.qml
+index 582e9ca..8890788 100644
+--- a/modules/settings/AccountsConfig.qml
++++ b/modules/settings/AccountsConfig.qml
+@@ -161,6 +161,7 @@ Flickable {
+         root.photoToDelete = ""
+         root.deletion = null
+         root.selectedUser = account.username
++        currentPassword.text = ""
+         username.text = account.username
+         fullName.text = account.name
+         profileName.text = account.name
+@@ -249,6 +250,7 @@ Flickable {
+     property var pending: ({})
+     property var deletion: null
+     property string selectedUser: ""
++    readonly property bool ownSelected: root.selectedUser.length > 0 && root.selectedUser === Quickshell.env("USER")
+     function request(data) {
+         if (backend.running) return
+         lastAction = String(data.action)
+@@ -265,6 +267,7 @@ Flickable {
+             root.pending = ({})
+             password.text = ""
+             confirmation.text = ""
++            currentPassword.text = ""
+         }
+         stdout: StdioCollector {
+             onStreamFinished: {
+@@ -291,13 +294,15 @@ Flickable {
+                     if (photoStep && !result.ok) return
+                     if (result.users) { root.users = result.users; root.faceRevision++; root.serveAccountPhotoRequest() }
+                     if (result.photoDeleted) root.photoToDelete = ""
+-                    if (result.deleted) {
++                    if (result.deleted || result.created) {
+                         root.selectedUser = ""
+                         root.deletion = null
+                         username.text = ""
+                         fullName.text = ""
++                        administrator.checked = false
+                     }
+-                    root.message = result.deleted ? Translation.tr("Account and its files deleted.") : result.ok ? Translation.tr("Account information updated.") : result.error
++                    root.message = result.deleted ? Translation.tr("Account and its files deleted.")
++                        : result.ok ? (result.message || Translation.tr("Account information updated.")) : result.error
+                 } catch (error) {
+                     root.message = Translation.tr("Unable to read account information.")
+                 }
+@@ -657,8 +662,18 @@ Flickable {
+             spacing: 10
+             AccountField { id: fullName; Layout.fillWidth: true; placeholderText: Translation.tr("Full name"); visible: !root.selectedUser }
+             AccountField { id: username; Layout.fillWidth: true; placeholderText: Translation.tr("Username"); enabled: !root.selectedUser }
++            // Your own password: the current one first, so the keyring holding your browser's saved sign-ins can move
++            // to the new one with it.
++            AccountField { id: currentPassword; Layout.fillWidth: true; visible: root.ownSelected; placeholderText: Translation.tr("Current password"); echoMode: TextInput.Password }
+             AccountField { id: password; Layout.fillWidth: true; placeholderText: Translation.tr("New password"); echoMode: TextInput.Password }
+             AccountField { id: confirmation; Layout.fillWidth: true; placeholderText: Translation.tr("Confirm password"); echoMode: TextInput.Password }
++            IrisText {
++                visible: password.text.length > 0 && (password.text.length < 8 || (confirmation.text.length > 0 && confirmation.text !== password.text))
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: "#d93025"
++                text: password.text.length < 8 ? Translation.tr("Use at least 8 characters.") : Translation.tr("Those passwords don’t match.")
++            }
+             CheckBox {
+                 palette.windowText: IrisStyle.text
+                 id: administrator
+@@ -670,13 +685,16 @@ Flickable {
+                 visible: !!root.selectedUser
+                 Layout.fillWidth: true
+                 wrapMode: Text.WordWrap
+-                text: Translation.tr("Resetting a login password may leave saved passwords encrypted with the old password. Administrator authorization may be required.")
++                text: root.ownSelected
++                    ? Translation.tr("Your browser keeps its saved sign-ins: they move to the new password with you. An administrator may need to approve the change.")
++                    : Translation.tr("They’ll need to sign in to websites again: what their browser saved is locked with their old password. An administrator needs to approve the change.")
+             }
+             RippleButton {
+                 Layout.fillWidth: true
+                 implicitHeight: 48
+-                enabled: !backend.running && username.text.length > 0 && password.text.length > 0 && password.text === confirmation.text
+-                onClicked: root.request({ action: root.selectedUser ? "password" : "create", username: username.text, name: fullName.text, password: password.text, administrator: administrator.checked })
++                enabled: !backend.running && username.text.length > 0 && password.text.length >= 8 && password.text === confirmation.text
++                    && (!root.ownSelected || currentPassword.text.length > 0)
++                onClicked: root.request({ action: root.selectedUser ? "password" : "create", username: username.text, name: fullName.text, password: password.text, current: root.ownSelected ? currentPassword.text : "", administrator: administrator.checked })
+                 contentItem: IrisText {
+                     text: backend.running ? Translation.tr("Working…") : root.selectedUser ? Translation.tr("Set password") : Translation.tr("Create account")
+                     horizontalAlignment: Text.AlignHCenter
+@@ -715,7 +733,7 @@ Flickable {
+                 visible: !!root.selectedUser
+                 Layout.fillWidth: true
+                 implicitHeight: 42
+-                onClicked: { root.deletion = null; root.selectedUser = ""; username.text = ""; fullName.text = ""; password.text = ""; confirmation.text = "" }
++                onClicked: { root.deletion = null; root.selectedUser = ""; username.text = ""; fullName.text = ""; password.text = ""; confirmation.text = ""; currentPassword.text = "" }
+                 contentItem: IrisText { text: Translation.tr("Add another person"); horizontalAlignment: Text.AlignHCenter }
+             }
+         }
+diff --git a/scripts/accounts.py b/scripts/accounts.py
+index 0eefb19..3549575 100644
+--- a/scripts/accounts.py
++++ b/scripts/accounts.py
+@@ -1,12 +1,22 @@
+ #!/usr/bin/python3
+-"""HP-OS account UI backend. Authorization is enforced by AccountsService."""
++"""HP-OS account UI backend. Authorization is enforced by AccountsService.
++
++A new person is made by the same helper as the login screen's Add user (an administrator approves it through
++pkexec), so every account follows the same rules and none is ever left half-made. A new password keeps the person's
++login keyring (where Chrome keeps the key to their saved sign-ins) in step with it: changed along with it when they
++change their own, put aside by hp-os-recovery when an administrator sets someone else's (the old one is unknown).
++"""
+ import ctypes
+ import json
+ import shutil
+ import os
++import pwd
+ import re
+ import secrets
++import socket
++import subprocess
+ import sys
++import time
+ from gi.repository import Gio, GLib
+ 
+ BUS = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+@@ -16,6 +26,12 @@ USER = SERVICE + ".User"
+ ICONS = "/var/lib/AccountsService/icons"
+ PICTURES = "/nix/var/nix/profiles/hp-os-add-user/share/hp-os-add-user/pictures"
+ PICTURE_NAMES = ("daybreak", "tide", "bloom", "dune", "aurora")
++ADD_USER = "/nix/var/nix/profiles/hp-os-add-user/share/hp-os-add-user/accounts.py"
++DEVICE_SOCKET = "/run/hp-os/factory-reset.sock"
++RECOVERY_SOCKET = "/run/hp-os/recovery.sock"
++SECRETS = "org.freedesktop.secrets"
++SECRETS_PATH = "/org/freedesktop/secrets"
++LOGIN_KEYRING = SECRETS_PATH + "/collection/login"
+ 
+ def call(path, interface, method, signature=None, values=()):
+     parameters = GLib.Variant(signature, values) if signature else None
+@@ -110,6 +126,154 @@ def delete_account(request):
+     if any(session[1] == uid for session in sessions):
+         raise ValueError("Sign this account out of all sessions before deleting it.")
+     call(ROOT, SERVICE, "DeleteUser", "(xb)", (uid, True))
++    # What it left outside its home (its login-screen wallpaper, its Nix profiles, the login screen remembering it)
++    # goes too, so a later account with the same name starts clean. hp-os-device only does this for a name that no
++    # longer has an account; the account is deleted either way.
++    ask_device(DEVICE_SOCKET, {"action": "forget-account", "user": target["username"]})
++
++def ask_device(path, message):
++    """One request to an HP-OS root helper's socket. Its answer, or {} when it couldn't be asked."""
++    try:
++        with socket.socket(socket.AF_UNIX) as connection:
++            connection.settimeout(30)
++            connection.connect(path)
++            connection.sendall((json.dumps(message) + "\n").encode())
++            answer = json.loads(connection.makefile("r", encoding="utf-8").readline() or "{}")
++        return answer if isinstance(answer, dict) else {}
++    except (OSError, ValueError):
++        return {}
++
++USERNAME = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
++
++def checked_password(password):
++    """The same rule as Add user and the recovery key's reset."""
++    if not isinstance(password, str) or not 8 <= len(password) <= 256 or "\0" in password:
++        raise ValueError("Use a password of at least 8 characters.")
++    return password
++
++def create_account(request):
++    """Add a person: the login screen's Add user helper makes the account, approved by an administrator through
++    pkexec. It refuses a short password, a used name, a device where HP-OS isn't fully installed, and deletes an
++    account it couldn't finish. Their desktop is set up at their first sign-in."""
++    username = request.get("username", "")
++    if not isinstance(username, str) or not USERNAME.fullmatch(username):
++        raise ValueError("Use a username beginning with a lowercase letter, followed by lowercase letters, numbers, underscores or hyphens.")
++    name = request.get("name")
++    name = name.strip() if isinstance(name, str) and name.strip() else username
++    password = checked_password(request.get("password"))
++    if not os.path.isfile(ADD_USER):
++        raise ValueError("HP-OS isn’t fully installed on this device.")
++    payload = {"name": name, "username": username, "password": password, "picture": "",
++               "administrator": request.get("administrator") is True, "prepare": False}
++    try:
++        done = subprocess.run(["/usr/bin/pkexec", "/usr/bin/python3", "-I", ADD_USER], input=json.dumps(payload) + "\n",
++                              capture_output=True, text=True, timeout=900, check=False)
++    except (OSError, subprocess.SubprocessError):
++        raise ValueError("The account couldn’t be created. Nothing was changed.")
++    answer = None
++    for line in reversed(done.stdout.splitlines()):
++        try:
++            answer = json.loads(line)
++        except ValueError:
++            continue
++        if isinstance(answer, dict) and "ok" in answer:
++            break
++        answer = None
++    if answer is None:
++        if done.returncode in (126, 127):
++            raise ValueError("An administrator needs to approve this change.")
++        raise ValueError("The account couldn’t be created. Nothing was changed.")
++    if not answer.get("ok"):
++        raise ValueError(str(answer.get("error") or "The account couldn’t be created. Nothing was changed."))
++
++def current_password_matches(username, password):
++    """The signed-in person's own password, checked by unix_chkpwd (the helper PAM itself uses, which only ever checks
++    the caller's own account). None when this device has no such helper."""
++    for helper in ("/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"):
++        if os.path.isfile(helper):
++            try:
++                done = subprocess.run([helper, username, "nonull"], input=password.encode() + b"\0",
++                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
++            except (OSError, subprocess.SubprocessError):
++                return None
++            return done.returncode == 0
++    return None
++
++def own_keyrings():
++    return os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "keyrings")
++
++def own_keyring_aside():
++    """Renames (never deletes) their login keyring: the next sign-in makes a new one with the new password."""
++    folder = own_keyrings()
++    day = time.strftime("%Y-%m-%d")
++    for number in range(1, 100):
++        aside = os.path.join(folder, "login.keyring.before-reset-%s%s" % (day, "" if number == 1 else "-%d" % number))
++        if not os.path.lexists(aside):
++            try:
++                os.rename(os.path.join(folder, "login.keyring"), aside)
++            except OSError:
++                return "kept"
++            return "moved"
++    return "kept"
++
++def change_own_keyring(old, new):
++    """Their login keyring gets the new password too (gnome-keyring's own call for it, in this session), so Chrome
++    keeps its saved sign-ins and the next sign-in opens it. Returns "changed", "none" (they have no login keyring),
++    "moved" (it couldn't be changed, so it was put aside) or "kept"."""
++    if not os.path.lexists(os.path.join(own_keyrings(), "login.keyring")):
++        return "none"
++    try:
++        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
++        _, session = bus.call_sync(SECRETS, SECRETS_PATH, "org.freedesktop.Secret.Service", "OpenSession",
++                                   GLib.Variant("(sv)", ("plain", GLib.Variant("s", ""))), GLib.VariantType("(vo)"),
++                                   Gio.DBusCallFlags.NONE, 10000, None).unpack()
++        try:
++            bus.call_sync(SECRETS, SECRETS_PATH, "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface",
++                          "ChangeWithMasterPassword",
++                          GLib.Variant("(o(oayays)(oayays))", (LOGIN_KEYRING, (session, b"", old.encode(), "text/plain"),
++                                                                (session, b"", new.encode(), "text/plain"))),
++                          None, Gio.DBusCallFlags.NONE, 30000, None)
++        finally:
++            try:
++                bus.call_sync(SECRETS, session, "org.freedesktop.Secret.Session", "Close", None, None,
++                              Gio.DBusCallFlags.NONE, 5000, None)
++            except GLib.Error:
++                pass
++        return "changed"
++    except GLib.Error:
++        # The keyring didn't open with their current password (it was already out of step with it), or no keyring
++        # service answers: left as it is, the next sign-in would ask for the old password.
++        return own_keyring_aside()
++
++def set_password(request):
++    username = request.get("username", "")
++    if not isinstance(username, str) or not USERNAME.fullmatch(username):
++        raise ValueError("Select an account.")
++    password = checked_password(request.get("password"))
++    own = username == pwd.getpwuid(os.getuid()).pw_name
++    current = request.get("current")
++    if own:
++        if not isinstance(current, str) or not current:
++            raise ValueError("Type your current password.")
++        if current_password_matches(username, current) is False:
++            time.sleep(1)
++            raise ValueError("Your current password isn’t right.")
++    encoded = password_hash(password)
++    path = call(ROOT, SERVICE, "FindUserByName", "(s)", (username,))[0]
++    call(path, USER, "SetPassword", "(ss)", (encoded, ""))
++    if own:
++        keyring = change_own_keyring(current, password)
++        if keyring == "moved":
++            return "Password changed. You’ll need to sign in to websites again: what your browser saved was locked with your old password."
++        if keyring == "kept":
++            return "Password changed. An app that saved passwords may ask for your old one once."
++        return "Password changed."
++    keyring = ask_device(RECOVERY_SOCKET, {"action": "keyring-aside", "user": username}).get("keyring")
++    if keyring == "moved":
++        return "Password changed. %s will need to sign in to websites again: what their browser saved was locked with the old password." % username
++    if keyring == "none":
++        return "Password changed."
++    return "Password changed. An app that saved passwords may ask %s for the old one once." % username
+ 
+ def account_path(request):
+     username = request.get("username", "")
+@@ -304,33 +468,13 @@ def main():
+     if action == "photo-discard":
+         forget_photo()
+         return {"ok": True, "photoDiscarded": True}
+-    username = request.get("username", "")
+-    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+-        raise ValueError("Use a username beginning with a lowercase letter, followed by lowercase letters, numbers, underscores or hyphens.")
+-    encoded = password_hash(request.get("password"))
+     if action == "create":
+-        if not os.path.isfile("/usr/share/wayland-sessions/hpos.desktop"):
+-            raise RuntimeError("Install the shared HP-OS session before adding a user.")
+-        path = call(ROOT, SERVICE, "CreateUser", "(ssi)",
+-                    (username, request.get("name", "").strip(), 1 if request.get("administrator") else 0))[0]
+-        try:
+-            # Keep this newly created account disabled until its HP-OS session is set.
+-            call(path, USER, "SetLocked", "(b)", (True,))
+-            call(path, USER, "SetXSession", "(s)", ("hpos",))
+-            # SetPassword enables login only after the preceding setup has succeeded.
+-            call(path, USER, "SetPassword", "(ss)", (encoded, ""))
+-        except (GLib.Error, OSError, RuntimeError) as error:
+-            try:
+-                call(path, USER, "SetLocked", "(b)", (True,))
+-            except GLib.Error:
+-                pass
+-            raise RuntimeError("The HP-OS account was created, but setup did not finish. An administrator should check it in Users & Accounts before enabling sign-in; do not create it again.") from error
+-    elif action == "password":
+-        path = call(ROOT, SERVICE, "FindUserByName", "(s)", (username,))[0]
+-        call(path, USER, "SetPassword", "(ss)", (encoded, ""))
+-    else:
+-        raise ValueError("Unknown account operation.")
+-    return {"ok": True, "users": users()}
++        create_account(request)
++        return {"ok": True, "created": request.get("username"), "users": users(),
++                "message": "%s can sign in now. Their desktop is set up the first time they do." % request.get("username")}
++    if action == "password":
++        return {"ok": True, "message": set_password(request), "users": users()}
++    raise ValueError("Unknown account operation.")
+ 
+ try:
+     print(json.dumps(main()))
+diff --git a/services/PolkitService.qml b/services/PolkitService.qml
+index 9633c8e..fff75fd 100644
+--- a/services/PolkitService.qml
++++ b/services/PolkitService.qml
+@@ -28,9 +28,14 @@ Singleton {
+ 
+     readonly property string rawMessage: String(flow?.message ?? "").trim()
+     readonly property bool batteryChargeLimitRequest: rawMessage.includes("battery-charge-limit")
++    // hp-snap: HP-OS's own helpers (adding a person in Settings) run through pkexec, whose message only names the
++    // program ("…to run `/usr/bin/python3' as the super user"): said in plain words instead.
++    readonly property bool hposHelperRequest: /run [`'"]?\/usr\/bin\/python3[`'"]? as the super user/.test(rawMessage)
+     readonly property string cleanMessage: {
+         if (batteryChargeLimitRequest)
+             return Translation.tr("Do you want to allow this app to make changes to your device?")
++        if (hposHelperRequest)
++            return Translation.tr("An administrator’s password is needed to change the people who use this device")
+         return rawMessage.endsWith(".") ? rawMessage.slice(0, -1) : rawMessage
+     }
+     readonly property string cleanPrompt: {

@@ -552,6 +552,8 @@ ShellRoot {
     property var usbAnswer: null
     property string recoveryNotice: ""
     property bool recoveryBusy: false
+    // After a reset: what happened to their login keyring ("moved", "none", or "kept"/"" when it couldn't be done).
+    property string resetKeyring: ""
     Process {
         id: recoveryRequest
         property string message: ""
@@ -632,7 +634,7 @@ ShellRoot {
         app.recoveryBusy = true; app.recoveryNotice = ""
         app.askRecovery({ action: "reset", user: app.recoveryLogin, key: key, password: password }, answer => {
             app.recoveryBusy = false
-            if (answer.ok) { app.step = 11; return }
+            if (answer.ok) { app.resetKeyring = String(answer.keyring || ""); app.step = 11; return }
             app.recoveryNotice = answer.error || "The password couldn’t be reset. Nothing was changed."
             keyField.input.forceActiveFocus()
         })
@@ -1712,7 +1714,14 @@ ShellRoot {
         Page {
             index: 11
             Title { text: "Your password is reset" }
-            Subtitle { text: "Sign in with your new password. An app that saved passwords may ask for your old one once." }
+            // The keyring holding what the browser saved was locked with the old password: hp-os-recovery put it
+            // aside, so nothing asks for the old password, and websites ask them to sign in again.
+            Subtitle {
+                text: app.resetKeyring === "moved"
+                    ? "Sign in with your new password. You’ll need to sign in to websites again: what your browser saved was locked with your old password."
+                    : app.resetKeyring === "none" ? "Sign in with your new password."
+                    : "Sign in with your new password. An app that saved passwords may ask for your old one once."
+            }
             Gap { size: 22 }
             Primary { anchors.horizontalCenter: parent.horizontalCenter; label: "Back to sign in"; onActivated: Qt.quit() }
         }

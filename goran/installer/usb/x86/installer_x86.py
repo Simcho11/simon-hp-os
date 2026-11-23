@@ -167,6 +167,21 @@ def check_computer_parts():
                                           " [touchpad]" if is_touchpad else ""))
     checks.append(("Touchpad: %s" % ("ready" if touchpad else "not found"), touchpad))
     checks.append(("Keyboard: %s" % ("ready" if keyboard else "not found"), keyboard))
+    # The camera: a USB camera works as it is. A camera on Intel's image processing unit (IPU, built into newer Intel
+    # chips) needs drivers Ubuntu doesn't have yet, so video calls would have no picture.
+    usb_camera = any(read(path) == "0e" for path in glob.glob("/sys/bus/usb/devices/*/bInterfaceClass"))
+    ipu = [d for d in pci if d["vendor"] == "0x8086" and d["class"].startswith("0x0480")]
+    details.extend("camera-ipu: %s %s:%s driver-now=%s" % (d["slot"], d["vendor"], d["device"], d["driver"] or "-") for d in ipu)
+    if usb_camera:
+        checks.append(("Camera: ready", True))
+    elif ipu:
+        checks.append(("Camera: needs work", False))
+    else:
+        checks.append(("Camera: not found", None))
+    bluetooth = bool(glob.glob("/sys/class/bluetooth/hci*")) or any(
+        read(Path(path).parent / "bInterfaceClass") == "e0" and read(Path(path).parent / "bInterfaceProtocol") == "01"
+        for path in glob.glob("/sys/bus/usb/devices/*/bInterfaceSubClass") if read(path) == "01")
+    checks.append(("Bluetooth: %s" % ("ready" if bluetooth else "not found"), None))
     battery = bool(glob.glob("/sys/class/power_supply/BAT*"))
     checks.append(("Battery: %s" % ("ready" if battery else "not found"), None))
     secure = read(glob.glob("/sys/firmware/efi/efivars/SecureBoot-*")[0], "") if glob.glob("/sys/firmware/efi/efivars/SecureBoot-*") else ""

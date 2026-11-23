@@ -1,0 +1,137 @@
+# HP-OS shell changes (session-recovery). Applied by default.nix only once it holds a diff.
+diff --git a/modules/lock/Lock.qml b/modules/lock/Lock.qml
+index 7219c33..d0d9f1b 100644
+--- a/modules/lock/Lock.qml
++++ b/modules/lock/Lock.qml
+@@ -71,6 +71,9 @@ Scope {
+         path: root._lockRecoveryPath
+         blockLoading: true
+         atomicWrites: true
++        // hp-snap: written before the lock reaches niri, so a shell that dies just as it locks
++        // still comes back locked (the session's "hp-os run" starts it again).
++        blockWrites: true
+         printErrors: false
+ 
+         onLoaded: root.loadRecoveryState()
+diff --git a/scripts/inir b/scripts/inir
+index f4115eb..8cb23dc 100755
+--- a/scripts/inir
++++ b/scripts/inir
+@@ -4320,6 +4320,11 @@ case "$command_name" in
+         exec "$qs_bin" -n -d -p "$config_dir"
+         ;;
+     restart)
++        # hp-snap: in HP-OS the session keeps the shell running (hp-os run); it restarts it there,
++        # with the session's own Quickshell, instead of a second copy beside it.
++        if [[ -n "${HP_OS_RUNTIME:-}" ]] && command -v hp-os >/dev/null 2>&1; then
++            exec hp-os restart
++        fi
+         require_qs
+         restart_quiet=""
+         while [[ $# -gt 0 ]]; do
+@@ -4709,6 +4714,10 @@ case "$command_name" in
+         run_setup_command "$setup_dir" "$@"
+         ;;
+     service)
++        # hp-snap: HP-OS has no iNiR service; its session restarts the shell (see restart).
++        if [[ "${1:-}" == restart && -n "${HP_OS_RUNTIME:-}" ]] && command -v hp-os >/dev/null 2>&1; then
++            exec hp-os restart
++        fi
+         run_service_command "$@"
+         ;;
+     cleanup-orphans)
+diff --git a/modules/iris/background/IrisDesktopActions.qml b/modules/iris/background/IrisDesktopActions.qml
+index a88cd45..a6cb8ff 100644
+--- a/modules/iris/background/IrisDesktopActions.qml
++++ b/modules/iris/background/IrisDesktopActions.qml
+@@ -44,11 +44,11 @@ Singleton {
+         { id: "files", group: 1, label: Translation.tr("Files"), glyph: "folder", tint: "sky",
+             run: screen => Quickshell.execDetached(["xdg-open", Quickshell.env("HOME") ?? "/"]) },
+         { id: "settings", group: 2, label: Translation.tr("Settings"), glyph: "settings", tint: "gray",
+-            run: screen => root.inir(["iris", "settings", ""]) },
+-        { id: "restart", group: 2, label: Translation.tr("Restart shell"), glyph: "restart_alt", tint: "gray",
+-            run: screen => root.inir(["restart"]) }
++            run: screen => root.inir(["iris", "settings", ""]) }
++        // hp-snap: "Restart shell" is no longer here, one slip away on every right click: it lives in
++        // Settings › Advanced › Desktop. A menu saved with it simply leaves it out (chosen keeps known ids only).
+     ]
+-    readonly property var defaultItems: ["widgets", "customize", "screenshot", "terminal", "settings", "restart"]
++    readonly property var defaultItems: ["widgets", "customize", "screenshot", "terminal", "settings"]
+ 
+     readonly property var options: Config.options?.iris?.desktopMenu ?? ({})
+     readonly property bool showWallpaper: root.options.wallpaper ?? true
+diff --git a/modules/iris/settings/IrisOptions.qml b/modules/iris/settings/IrisOptions.qml
+index e7ce60d..bb49a0d 100644
+--- a/modules/iris/settings/IrisOptions.qml
++++ b/modules/iris/settings/IrisOptions.qml
+@@ -567,7 +567,7 @@ QtObject {
+         { target: "desktop", group: "Widgets", label: "Outline", description: "The line around each widget. Auto follows the shell's outline on Glass, Solid and Tinted and leaves Transparent bare. While arranging it always shows.", path: "iris.widgets.outline", showIf: () => DesktopWidgetDesign.current === "iris", kind: "choice", fallback: "auto", choices: [{label:"Auto",value:"auto",glyph:"auto_awesome"},{label:"Always",value:"always",glyph:"crop_square"},{label:"None",value:"none",glyph:"block"}], keywords: ["outline", "border", "frame", "rim", "hairline", "edge", "line", "stroke", "marco", "borde"] },
+         { target: "desktop", group: "Widgets", label: "Widgets with their own material", description: "They chose a material or surface opacity in their Look controls, so the rows above don't reach them. Match puts them on these.", kind: "action", button: "Match", run: () => DesktopWidgetDesign.matchSurfaces(), showIf: () => DesktopWidgetDesign.current === "iris" && DesktopWidgetDesign.ownSurfaceCount > 0, keywords: ["match", "same", "material", "glass", "opacity", "own", "reset", "every widget"] },
+         { target: "desktop", group: "Desktop menu", label: "Wallpaper at the top", description: "The right-click menu opens on your wallpaper: tap it for the gallery, or the round button for the next one.", path: "iris.desktopMenu.wallpaper", kind: "switch", fallback: true, keywords: ["right click", "context menu", "desktop menu", "wallpaper", "shuffle"] },
+-        { target: "desktop", group: "Desktop menu", label: "Actions", description: "What the right-click menu offers, in the order you switch them on. They group themselves: the desktop, tools, then the shell.", path: "iris.desktopMenu.items", kind: "pieces", fallback: ["widgets", "customize", "screenshot", "terminal", "settings", "restart"], choices: IrisDesktopActions.catalogue.map(entry => ({ label: entry.label, value: entry.id })), keywords: ["right click", "context menu", "desktop menu", "terminal", "screenshot", "files", "record", "colour picker", "restart"] },
++        { target: "desktop", group: "Desktop menu", label: "Actions", description: "What the right-click menu offers, in the order you switch them on. They group themselves: the desktop, tools, then the shell.", path: "iris.desktopMenu.items", kind: "pieces", fallback: ["widgets", "customize", "screenshot", "terminal", "settings"], choices: IrisDesktopActions.catalogue.map(entry => ({ label: entry.label, value: entry.id })), keywords: ["right click", "context menu", "desktop menu", "terminal", "screenshot", "files", "record", "colour picker", "restart"] },
+         { target: "motion", group: "Style per surface", label: "Island", description: "A surface can move in a style of its own. Family follows Movement above; None shows and hides it at once.", path: "iris.appearance.surfaces.island.morph", visibleWhen: "iris.appearance.motion", kind: "choice", fallback: "", choices: [{label:"Family",value:""},{label:"Direct",value:"direct"},{label:"Liquid",value:"liquid"},{label:"Glide",value:"glide"},{label:"Snap",value:"snap"},{label:"Elastic",value:"elastic"},{label:"None",value:"instant"}], keywords: ["morph", "animation", "spring", "bounce", "instant", "no animation", "none"] },
+         { target: "motion", group: "Style per surface", label: "Cards", path: "iris.appearance.surfaces.cards.morph", visibleWhen: "iris.appearance.motion", kind: "choice", fallback: "", choices: [{label:"Family",value:""},{label:"Direct",value:"direct"},{label:"Liquid",value:"liquid"},{label:"Glide",value:"glide"},{label:"Snap",value:"snap"},{label:"Elastic",value:"elastic"},{label:"None",value:"instant"}], keywords: ["morph", "animation", "spring", "bounce", "instant", "no animation", "none"] },
+         { target: "motion", group: "Style per surface", label: "Control Center", path: "iris.appearance.surfaces.controlCenter.morph", visibleWhen: "iris.appearance.motion", kind: "choice", fallback: "", choices: [{label:"Family",value:""},{label:"Direct",value:"direct"},{label:"Liquid",value:"liquid"},{label:"Glide",value:"glide"},{label:"Snap",value:"snap"},{label:"Elastic",value:"elastic"},{label:"None",value:"instant"}], keywords: ["morph", "animation", "spring", "bounce", "instant", "no animation", "none"] },
+diff --git a/modules/settings/AdvancedConfig.qml b/modules/settings/AdvancedConfig.qml
+index 6ce1c69..cf51e5f 100644
+--- a/modules/settings/AdvancedConfig.qml
++++ b/modules/settings/AdvancedConfig.qml
+@@ -19,17 +19,21 @@ ContentPage {
+         icon: "construction"
+         title: Translation.tr("Advanced")
+         description: Translation.tr("Advanced controls are split between color-generation internals and runtime resource instrumentation.")
+-        summary: Translation.tr("Color generation · resources")
++        summary: Translation.tr("Color generation · resources · desktop")
+         currentValue: root.activeSection
+         onSelected: value => root.activeSection = value
+         searchAliases: ({
+             "color generation": "color",
+             "cava options": "color",
+-            "cava & spectrum options": "color"
++            "cava & spectrum options": "color",
++            "restart": "desktop",
++            "restart shell": "desktop",
++            "restart desktop": "desktop"
+         })
+         options: [
+             { displayName: Translation.tr("Color"), icon: "colors", value: "color" },
+-            { displayName: Translation.tr("Resources"), icon: "memory_alt", value: "resources" }
++            { displayName: Translation.tr("Resources"), icon: "memory_alt", value: "resources" },
++            { displayName: Translation.tr("Desktop"), icon: "restart_alt", value: "desktop" }
+         ]
+     }
+ 
+@@ -516,4 +520,32 @@ ContentPage {
+     }
+         }
+     }
++
++    // hp-snap: restarting the desktop (Dock, menus, notifications), for when they stop responding. Was on the desktop's
++    // right-click menu; here it can't be chosen by mistake. Open apps keep running.
++    SettingsTaskLoader {
++        requested: root.activeSection === "desktop"
++        sourceComponent: Component {
++    SettingsCardSection {
++        settingsTaskSection: "desktop"
++        expanded: true
++        icon: "restart_alt"
++        title: Translation.tr("Desktop")
++
++        SettingsGroup {
++            StyledText {
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                color: Appearance.colors.colSubtext
++                text: Translation.tr("If the Dock, menus or notifications stop responding, restart the desktop. Your open apps keep running.")
++            }
++            RippleButtonWithIcon {
++                materialIcon: "restart_alt"
++                mainText: Translation.tr("Restart the desktop")
++                onClicked: Quickshell.execDetached([Quickshell.shellPath("scripts/inir"), "restart"])
++            }
++        }
++    }
++        }
++    }
+ }

@@ -197,6 +197,8 @@ exec /usr/bin/systemctl --root=/ enable "$@"
 EOF
     chmod 755 "$root/opt/hp-os-build/bin/systemctl"
     inside env PATH=/opt/hp-os-build/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin /opt/hp-os-build/system/hp-os-device-setup.sh
+    # Ubuntu's daily security updates on (the kernel and startup parts held back), printing and printer discovery on.
+    inside env PATH=/opt/hp-os-build/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin /opt/hp-os-build/system/hp-os-system-packages.sh
     rm -rf "$root/opt/hp-os-build"
 
     # Services

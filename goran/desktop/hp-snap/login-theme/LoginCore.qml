@@ -137,7 +137,7 @@ QtObject {
         core.signInDelay.start()
     }
     function typed() {
-        if (core.field && core.field.text.length > 0) { core.failed = false; core.notice = "" }
+        if (core.field && core.field.text.length > 0) { core.failed = false; core.notice = ""; core.showNoKeyHelp = false }
     }
     property Connections link: Connections {
         target: sddm
@@ -151,24 +151,60 @@ QtObject {
         }
         function onInformationMessage(message) { core.notice = String(message || "") }
     }
-    // HP-OS: after three wrong passwords, the hint offers the recovery key (only on a device that has one).
-    // hp-os-recovery leaves the tiny QML mark so this screen can tell without any privileges.
+    // HP-OS: a quiet "Forgot password?" under the password whenever nothing more important is said there, and after
+    // three wrong passwords the stronger prompt. With a recovery key it opens the reset (hp-os-recovery leaves the tiny
+    // QML mark so this screen can tell without any privileges). A device without one (set up before recovery keys, or
+    // its key never made) still offers it, and then says plainly who can set a new password.
     property int failures: 0
     property Loader recoveryMark: Loader { source: "file:///var/lib/hp-os/recovery-key.qml" }
-    readonly property bool offerRecovery: core.failures >= 3 && core.recoveryMark.status === Loader.Ready
-        && !core.addedChosen && core.userLogin.length > 0
+    readonly property bool hasRecoveryKey: core.recoveryMark.status === Loader.Ready
+    readonly property bool canAsk: !core.addedChosen && core.userLogin.length > 0
+    readonly property bool canRecover: core.hasRecoveryKey && core.canAsk
+    readonly property bool offerRecovery: core.failures >= 3 && core.canAsk
+    property bool showNoKeyHelp: false
+    onUserLoginChanged: core.showNoKeyHelp = false
     function openRecovery() {
-        if (!core.offerRecovery) return
+        if (!core.canAsk) return
         core.failures = 0
         core.failed = false
+        if (!core.hasRecoveryKey) { core.showNoKeyHelp = true; return }
         Qt.openUrlExternally("hpos-add-user:recover:" + core.userLogin)
     }
-    readonly property string hint: core.signingIn ? ""
-        : core.notice.length > 0 ? core.notice
-        : core.offerRecovery ? "Forgot your password? Reset it with your recovery key."
-        : core.failed ? core.text.loginFailed
-        : keyboard.capsLock ? core.text.capslockWarning : ""
+    // HP-OS: this account's desktop couldn't be set up at its last sign-in. hp-os-device (root) keeps a tiny QML note
+    // for it naming only the reason, so this screen can say what to do, in plain words, until the desktop opens.
+    property Loader setupNoteMark: Loader {
+        source: !core.addedChosen && /^[a-z_][a-z0-9_-]{0,31}$/.test(core.userLogin)
+            ? "file:///var/lib/hp-os/setup-notes/" + core.userLogin + ".qml" : ""
+    }
+    readonly property string setupNote: {
+        const reason = core.setupNoteMark.status === Loader.Ready && core.setupNoteMark.item
+            ? String(core.setupNoteMark.item.reason || "") : ""
+        if (reason === "storage") return "Your desktop couldn’t be set up: this laptop is out of storage. Ask an administrator to free up space, then sign in again."
+        if (reason === "network") return "Your desktop couldn’t be set up. Connect to Wi-Fi, then sign in again."
+        if (reason.length > 0) return "Your desktop couldn’t be set up. Sign in again to try once more."
+        return ""
+    }
+    // What the line under the password says, most important first.
+    readonly property string hintKind: core.signingIn ? ""
+        : core.notice.length > 0 ? "notice"
+        : core.showNoKeyHelp ? "nokey"
+        : core.offerRecovery ? "recovery"
+        : core.failed ? "failed"
+        : keyboard.capsLock ? "caps"
+        : core.setupNote.length > 0 ? "setup"
+        : core.canAsk ? "forgot" : ""
+    readonly property string hint: core.hintKind === "notice" ? core.notice
+        : core.hintKind === "recovery" ? (core.hasRecoveryKey ? "Forgot your password? Reset it with your recovery key."
+                                                              : "Forgot your password?")
+        : core.hintKind === "nokey" ? "No recovery key on this laptop. An administrator can set a new password in Settings › Users & Accounts."
+        : core.hintKind === "failed" ? core.text.loginFailed
+        : core.hintKind === "caps" ? core.text.capslockWarning
+        : core.hintKind === "setup" ? core.setupNote
+        : core.hintKind === "forgot" ? "Forgot password?" : ""
     readonly property bool hintIsWarning: !core.signingIn && (core.failed || core.notice.length > 0)
+    // Clicking the line opens Forgot password: the stronger prompt, or the quiet link (drawn softly).
+    readonly property bool hintOpensRecovery: core.hintKind === "recovery" || core.hintKind === "forgot"
+    readonly property bool hintIsQuiet: core.hintKind === "forgot"
 
     // ── Fonts: one static file per weight (a variable font ignores font.weight); the installer copies them ──
     property FontLoader symbols: FontLoader { source: "fonts/MaterialSymbolsRounded.ttf" }

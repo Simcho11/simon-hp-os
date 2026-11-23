@@ -87,15 +87,53 @@ if [[ "$service" == sddm || "$service" == gdm-password ]]; then
 fi
 
 setup=/nix/var/nix/profiles/hp-os-accounts/bin/hp-os-account-setup
-# Still to be set up (for example an account made with adduser): HP logo and a progress bar.
+own="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/home-manager/home-path/bin"
+# hp-os-account-setup leaves how its last try went here: "running", "ok" or "failed REASON".
+outcome_file="${XDG_STATE_HOME:-$HOME/.local/state}/hp-os/enrollment/outcome"
+# When this account's desktop couldn't be set up, the login screen says why, in plain words: hp-os-device (root)
+# keeps a note for it in /var/lib/hp-os/setup-notes, holding only the reason (storage, network or other).
+setup_note() {
+    printf '{"action": "setup-note", "reason": "%s"}\n' "$1" | /usr/bin/timeout 10 /usr/bin/python3 -I -c '
+import socket, sys
+connection = socket.socket(socket.AF_UNIX)
+connection.settimeout(8)
+connection.connect("/run/hp-os/factory-reset.sock")
+connection.sendall(sys.stdin.readline().encode())
+connection.makefile().readline()' >/dev/null 2>&1 || true
+}
+rm -f -- "$outcome_file" 2>/dev/null
+# Still to be set up (for example an account made with adduser): HP logo and a progress bar, which runs the setup.
 first_setup=/nix/var/nix/profiles/hp-os-add-user/bin/hp-os-first-setup
+screen=0 outcome=""
 if [[ -x "$first_setup" ]] && "$setup" --needed; then
+    screen=1
     "$first_setup" || logger -t hp-os-session "first-setup screen for ${USER:-?} ended with status $?" 2>/dev/null || true
 fi
-"$setup" || finish $? "first-login setup"
-own="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/home-manager/home-path/bin"
+# Never a second try after the screen's: a setup that failed there fails here too, on a black screen. Only when the
+# screen never got to start it (no screen, or the screen itself couldn't open) does it run here.
+if (( ! screen )) || [[ ! -s "$outcome_file" ]]; then
+    "$setup" && outcome=ok
+fi
+[[ -n "${outcome:-}" ]] || outcome=$(head -c 64 -- "$outcome_file" 2>/dev/null)
+if [[ "$outcome" != ok ]]; then
+    case "$outcome" in
+        "failed storage") reason=storage ;;
+        "failed network") reason=network ;;
+        "") # Nothing recorded: often a full disk, where nothing can be written.
+            free=$(/usr/bin/df -Pk /nix/store "$HOME" 2>/dev/null | /usr/bin/awk 'NR > 1 && (least == "" || $4 < least) { least = $4 } END { print least + 0 }')
+            if (( ${free:-0} > 0 && free < 1048576 )); then reason=storage; else reason=other; fi ;;
+        *) reason=other ;;
+    esac
+    logger -t hp-os-session "first-login setup for ${USER:-?} didn't finish (${outcome:-nothing recorded}; $reason)" 2>/dev/null || true
+    # No desktop yet: back to the login screen, which says what happened. It is set up again at the next sign-in.
+    [[ -x "$own/hp-os-session" ]] || { setup_note "$reason"; finish 1 "first-login setup"; }
+    # This account already has a desktop that works (the setup was for an update): open that one. The update is
+    # tried again at the next sign-in.
+fi
 export PATH="$own:$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin"
 [[ -x "$own/hp-os-session" ]] || finish 127 "missing $own/hp-os-session"
+# The desktop opens: the login screen's note about an earlier failed setup goes.
+[[ ! -e "/var/lib/hp-os/setup-notes/${USER:-}.qml" ]] || setup_note ""
 # This account's wallpaper on the login screen: shared as the session starts (in the background) and again as it
 # ends, when it changed during the session.
 wallpaper=/opt/hp-os/device/hp-os-login-wallpaper
@@ -103,7 +141,9 @@ wallpaper=/opt/hp-os/device/hp-os-login-wallpaper
 # Not exec: this script must outlive the session to hand SDDM a clean status.
 "$own/hp-os-session"
 status=$?
-[[ ! -x "$wallpaper" ]] || timeout 20 /usr/bin/python3 -I "$wallpaper" share >/dev/null 2>&1 || true
+# Signing out goes straight to the login screen: the share at the end runs beside it (in its own session, so it
+# outlives this script), and can never hold the screen black while it converts the picture.
+[[ ! -x "$wallpaper" ]] || /usr/bin/setsid -f /usr/bin/timeout 20 /usr/bin/python3 -I "$wallpaper" share </dev/null >/dev/null 2>&1 || true
 finish $status "HP-OS session"
 EOF
 bash -n "$target.new"
@@ -112,9 +152,21 @@ mv "$target.new" "$target"
 echo "Installed $target (previous version: $backup)."
 
 # Accounts created later run the same setup at their first HP-OS login.
-failed=0
+# One account that can't be updated now (its disk quota, a broken file of its own) mustn't fail the whole
+# update and roll it back for everyone: it keeps its working desktop and is set up again at its next sign-in
+# (hp-os-account-setup --needed). Only when no account could be updated is the update itself at fault.
+tried=0 failed=0
 while IFS=: read -r name _ uid _ _ directory shell; do
     [[ $uid -ge 1000 && $uid -le 60000 && "$directory" == "/home/$name" && "$shell" != */nologin && "$shell" != */false ]] || continue
-    "$repo/goran/installer/hp-os-user-apply.sh" "$name" || failed=1
+    tried=$((tried + 1))
+    if ! "$repo/goran/installer/hp-os-user-apply.sh" "$name"; then
+        failed=$((failed + 1))
+        echo "The desktop of $name couldn't be updated now; it is set up again when $name next signs in." >&2
+        logger -t hp-os-update "account $name not updated; retried at its next sign-in" 2>/dev/null || true
+    fi
 done < <(getent -s files passwd)
-exit "$failed"
+if [[ $tried -gt 0 && $failed -eq $tried ]]; then
+    echo "No account could be updated." >&2
+    exit 1
+fi
+exit 0

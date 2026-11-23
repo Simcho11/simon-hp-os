@@ -65,7 +65,17 @@ def main(argv):
         signal.signal(sig, stop)
     try:
         child = subprocess.Popen(argv)
-        rc = child.wait()
+        # Every app the compositor starts comes back to this subreaper when it exits: reap
+        # them as they go, or they stay behind as zombies until the session ends.
+        while True:
+            try:
+                pid, status = os.waitpid(-1, 0)
+            except ChildProcessError:
+                rc = 0
+                break
+            if pid == child.pid:
+                rc = os.waitstatus_to_exitcode(status)
+                break
     except SessionStop:
         rc = 0
     finally:

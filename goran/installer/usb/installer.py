@@ -8,6 +8,7 @@ import mmap
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import shutil
 import struct
@@ -310,6 +311,18 @@ def part(disk, number):
 
 
 # ── Installing ──
+def own_identity(target):
+    """Each laptop its own machine ID instead of the image's (logs, Bluetooth and network services tell laptops apart
+    by it). Written here, rather than left empty for the first start, so nothing about that first start changes."""
+    machine_id = target / "etc/machine-id"
+    machine_id.write_text(secrets.token_hex(16) + "\n")
+    os.chmod(machine_id, 0o444)
+    dbus_id = target / "var/lib/dbus/machine-id"
+    if dbus_id.exists() and not dbus_id.is_symlink():
+        dbus_id.unlink()
+        dbus_id.symlink_to("/etc/machine-id")
+
+
 def install(screen, disk):
     def step(fraction, line):
         screen.frame("Installing HP-OS", [line, "Please keep your laptop plugged in and open."], progress=fraction)
@@ -351,6 +364,7 @@ def install(screen, disk):
         log(tail)
         raise RuntimeError("copy failed: " + tail[-300:])
 
+    own_identity(TARGET)
     step(0.92, "Setting up startup...")
     startup = SOURCE / "system/boot/efi"
     for folder, _, files in os.walk(startup):     # The startup partition keeps no owners or permissions.

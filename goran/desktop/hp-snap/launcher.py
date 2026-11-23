@@ -14,14 +14,18 @@ SESSION_NEW = '''    # hp-snap: run niri on the normal session bus, not a privat
     export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
     # hp-snap: right after an automatic login, niri hides the cursor from its first frame until the
     # boot cover has faded into the lock screen (boot-cover/start.sh empties the file again). Rewritten
-    # at every login, so a hidden cursor can never outlive the session that needed it.
+    # at every login, so a hidden cursor can never outlive the session that needed it. Only an account
+    # that has the boot cover hides it (nothing else gives it back), and never for more than a minute.
     boot_cursor="$INIR_NIRI_CONFIG_DIR/config.d/48-boot-cursor.kdl"
     if [[ -f "$boot_cursor" ]]; then
-      if [[ -n "${XDG_SESSION_ID:-}" && ! -e "${XDG_RUNTIME_DIR:-/tmp}/hp-snap-boot-cover-$XDG_SESSION_ID" ]] \\
+      boot_cursor_shown='// hp-snap: written by the session launcher at every login. Empty, except right after an automatic\\n// login, when it hides the cursor until the boot cover has faded into the lock screen.\\n'
+      if [[ -x "$HOME/.local/share/hp-snap/boot-cover/start.sh" ]] \\
+          && [[ -n "${XDG_SESSION_ID:-}" && ! -e "${XDG_RUNTIME_DIR:-/tmp}/hp-snap-boot-cover-$XDG_SESSION_ID" ]] \\
           && [[ "$(loginctl show-session "$XDG_SESSION_ID" -p Service --value 2>/dev/null)" =~ ^(gdm|sddm)-autologin$ ]]; then
-        printf '// hp-snap: boot cover running; boot-cover/start.sh empties this file again.\\ncursor {\\n    hide-after-inactive-ms 1\\n}\\n' > "$boot_cursor"
+        printf '// hp-snap: boot cover running; boot-cover/start.sh empties this file again.\\ncursor {\\n    hide-after-inactive-ms 1\\n}\\n' > "$boot_cursor" || true
+        ( sleep 60; ! grep -q hide-after-inactive-ms "$boot_cursor" || printf "$boot_cursor_shown" > "$boot_cursor" ) >/dev/null 2>&1 &
       else
-        printf '// hp-snap: written by the session launcher at every login. Empty, except right after an automatic\\n// login, when it hides the cursor until the boot cover has faded into the lock screen.\\n' > "$boot_cursor"
+        printf "$boot_cursor_shown" > "$boot_cursor" || true
       fi
     fi
     exec python3 "$packaging/session-supervisor.py" niri --config "$INIR_NIRI_CONFIG_DIR/config.kdl"

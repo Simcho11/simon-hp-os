@@ -8,16 +8,26 @@
 Requests, one JSON line each:
   {"action": "status"}                                  does this device have a key?
   {"action": "new", "password": P}                      an administrator makes a new key (the old one stops working)
-  {"action": "save-usb", "key": K}                      copy the key, as a small text file, to a USB stick
+  {"action": "save-usb", "key": K}                      first-time setup or an administrator copies the key, as a
+                                                        small text file, to a USB stick
   {"action": "reset", "user": U, "key": K, "password": P}
                                                         the login screen sets a new password for U
+  {"action": "keyring-aside", "user": U}                an administrator has just set a new password for U in
+                                                        Settings: U's login keyring is put aside (see below)
 
 The key is 24 letters and digits (about 120 bits), shown once. The device keeps only a salted scrypt hash of it,
-private to root. Wrong keys are slowed down, then locked out for a while. Nothing here runs in the background.
+private to root. Wrong keys (from a reset or a USB copy alike) are slowed down, then locked out for a while, and
+checked one at a time. Nothing here runs in the background.
+
+A password set without the old one (a reset) can't open the person's login keyring, where Chrome keeps the key to
+their saved sign-ins: their next sign-in would ask for the old password. So the keyring is renamed (never deleted)
+and the next sign-in makes a new one with the new password; websites then ask them to sign in again.
 """
 import ctypes
 import datetime
+import fcntl
 import grp
+import math
 import hashlib
 import hmac
 import json
@@ -27,6 +37,7 @@ import pwd
 import re
 import secrets
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -34,6 +45,7 @@ import tempfile
 import time
 
 ADMIN_GROUPS = ("sudo", "admin", "wheel")
+LONGEST_WAIT = 86400                       # a lockout never lasts more than a day, whatever the clock does
 # No I, O, 0 or 1, which are easy to mix up when copying by hand.
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 KEY_LENGTH = 24
@@ -124,14 +136,40 @@ class Recovery:
             pass
 
     def wait_left(self):
-        return max(0, int(self.read_tries()[1] - self.now() + 0.999))
+        # Never more than a day: a clock set back (a dead clock battery, a wrong time from a network) would otherwise
+        # stretch the wait by however far it went back.
+        left = self.read_tries()[1] - self.now()
+        if not math.isfinite(left):
+            return 0        # a damaged record never locks anyone out for good; the next wrong key writes a new one
+        return max(0, min(LONGEST_WAIT, int(left + 0.999)))
 
     def failed(self):
         count, _ = self.read_tries()
         count += 1
-        until = self.now() + (min(86400, 60 * 2 ** (count - FREE_TRIES - 1)) if count > FREE_TRIES else 0)
+        until = self.now() + (min(LONGEST_WAIT, 60 * 2 ** min(count - FREE_TRIES - 1, 20)) if count > FREE_TRIES else 0)
         private_write(self.tries, json.dumps({"failed": count, "until": until}) + "\n", 0o600)
         self.pause(2)
+
+    def one_at_a_time(self):
+        """Held while a key is checked: guesses on parallel connections wait their turn (each costs 32 MiB of scrypt),
+        and none of them can miss another's count. Closing the returned file lets the next one in."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.state / "recovery-tries.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        stream = os.fdopen(descriptor, "r+")
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        return stream
+
+    def checked_key(self, key):
+        """None when the key is right; otherwise what to tell the person. Counts a wrong key toward the lockout."""
+        left = self.wait_left()
+        if left:
+            return self.wait_text(left)
+        if not isinstance(key, str) or not self.matches(key):
+            self.failed()
+            left = self.wait_left()
+            return self.wait_text(left) if left else "That recovery key isn’t right. Check it and try again."
+        self.forget_tries()
+        return None
 
     @staticmethod
     def wait_text(seconds):
@@ -159,7 +197,12 @@ class Recovery:
 
     @staticmethod
     def is_admin(who):
-        groups = {grp.getgrgid(gid).gr_name for gid in os.getgrouplist(who.pw_name, who.pw_gid)}
+        groups = set()
+        for gid in os.getgrouplist(who.pw_name, who.pw_gid):
+            try:
+                groups.add(grp.getgrgid(gid).gr_name)
+            except KeyError:
+                pass     # a group number with no name can't be an administrators' group
         return bool(groups & set(ADMIN_GROUPS))
 
     def shadow(self, name):
@@ -191,6 +234,51 @@ class Recovery:
         # Wrong passwords typed before the reset shouldn't keep the account locked.
         if os.path.exists(self.root / "usr/sbin/faillock"):
             self.run(["/usr/sbin/faillock", "--user", who.pw_name, "--reset"])
+
+    # ── The login keyring, after a password set without the old one ──
+    def keyring_aside(self, who):
+        """Renames the person's login keyring, so their next sign-in makes a new one that opens with the new password.
+        Returns "moved", "none" (they have no keyring) or "kept" (it couldn't be done safely; nothing was changed).
+
+        Root works inside someone else's home here, so nothing they could have put there is trusted: each folder on
+        the way is opened without following links and must be theirs, the keyring must be a plain file of theirs, and
+        it's only renamed within its own folder. The new name doesn't end in .keyring, so it's never loaded again."""
+        if who.pw_dir != "/home/" + who.pw_name:
+            return "kept"
+        folders = []
+        try:
+            here = os.open(self.root / who.pw_dir.lstrip("/"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            folders.append(here)
+            if os.fstat(here).st_uid != who.pw_uid:
+                return "kept"
+            for name in (".local", "share", "keyrings"):
+                try:
+                    here = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=here)
+                except FileNotFoundError:
+                    return "none"
+                folders.append(here)
+                if os.fstat(here).st_uid != who.pw_uid:
+                    return "kept"
+            try:
+                status = os.stat("login.keyring", dir_fd=here, follow_symlinks=False)
+            except FileNotFoundError:
+                return "none"
+            if not stat.S_ISREG(status.st_mode) or status.st_uid != who.pw_uid:
+                return "kept"
+            day = datetime.date.fromtimestamp(self.now()).isoformat()
+            for number in range(1, 100):
+                aside = "login.keyring.before-reset-%s%s" % (day, "" if number == 1 else "-%d" % number)
+                try:
+                    os.stat(aside, dir_fd=here, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename("login.keyring", aside, src_dir_fd=here, dst_dir_fd=here)
+                    return "moved"
+            return "kept"
+        except OSError:
+            return "kept"
+        finally:
+            for folder in folders:
+                os.close(folder)
 
     # ── USB stick ──
     def usb_places(self):
@@ -267,16 +355,18 @@ class Recovery:
                 return {"ok": False, "error": "That password isn’t correct."}
             return self.new()
         if action == "save-usb":
+            # Only where the key is shown: first-time setup (the login screen) and Settings' new key (an administrator).
+            caller = self.uid_person(uid)
+            if uid not in (0, self.login_screen()) and not (caller and self.is_admin(caller)):
+                return {"ok": False, "error": "Only an administrator can save the recovery key."}
             key = message.get("key")
-            if not isinstance(key, str) or not self.matches(key):
-                return {"ok": False, "error": "That isn’t this device’s recovery key."}
+            with self.one_at_a_time():
+                problem = self.checked_key(key)
+            if problem:
+                return {"ok": False, "error": problem}
             return self.save_usb(key)
         if action == "reset":
-            try:
-                login_screen = pwd.getpwnam("sddm").pw_uid
-            except KeyError:
-                login_screen = -1
-            if uid not in (0, login_screen):
+            if uid not in (0, self.login_screen()):
                 return {"ok": False, "error": "Use Forgot password? on the login screen."}
             if not self.has_key():
                 return {"ok": False, "error": "This device doesn’t have a recovery key. Ask an administrator to set a new password."}
@@ -286,17 +376,29 @@ class Recovery:
                 return {"ok": False, "error": "Choose your account first."}
             if not isinstance(password, str) or not 8 <= len(password) <= 256 or "\0" in password or "\n" in password:
                 return {"ok": False, "error": "Use a password of at least 8 characters."}
-            left = self.wait_left()
-            if left:
-                return {"ok": False, "error": self.wait_text(left)}
-            if not isinstance(key, str) or not self.matches(key):
-                self.failed()
-                left = self.wait_left()
-                return {"ok": False, "error": self.wait_text(left) if left else "That recovery key isn’t right. Check it and try again."}
-            self.forget_tries()
+            with self.one_at_a_time():
+                problem = self.checked_key(key)
+            if problem:
+                return {"ok": False, "error": problem}
             self.set_password(who, password)
-            return {"ok": True}
+            return {"ok": True, "keyring": self.keyring_aside(who)}
+        if action == "keyring-aside":
+            # Settings, right after an administrator set someone else's password (AccountsService did that part).
+            caller = self.uid_person(uid)
+            if uid != 0 and not (caller and self.is_admin(caller)):
+                return {"ok": False, "error": "Only an administrator can do this."}
+            who = self.person(str(message.get("user", "")))
+            if not who or who.pw_uid == uid:
+                return {"ok": False, "error": "Choose someone else’s account."}
+            return {"ok": True, "keyring": self.keyring_aside(who)}
         return {"ok": False, "error": "That request isn’t available."}
+
+    @staticmethod
+    def login_screen():
+        try:
+            return pwd.getpwnam("sddm").pw_uid
+        except KeyError:
+            return -1
 
 
 def serve(recovery):

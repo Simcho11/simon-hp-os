@@ -46,6 +46,15 @@ let
   shutdown = pkgs.writeShellScript "goran-niri-shutdown" ''
     ${pkgs.systemd}/bin/systemctl --user stop goran-niri.target || true
   '';
+  # Shortcuts from Simon's earlier desktop: other launchers, the DMS wallpaper search and Alt+key
+  # copies for remote control. HP-OS takes its shortcuts from here (hp-os sync-bindings), so on
+  # standard accounts these lines are commented out: there they open nothing or something that
+  # isn't HP-OS, and Alt+T, Alt+D, Alt+A and Alt+L belong to the apps. Super+T opens HP-OS's Terminal.
+  personalShortcuts = config.programs.goran-hp-os.personalShortcuts;
+  personal = lib.optionalString (!personalShortcuts) "// ";
+  terminal = if personalShortcuts
+    then ''Mod+T hotkey-overlay-title="Open a Terminal: cosmic-term" { spawn "${pkgs.cosmic-term}/bin/cosmic-term"; }''
+    else ''Mod+T hotkey-overlay-title="Open Terminal" { spawn "${pkgs.ghostty}/bin/ghostty"; }'';
 in {
   home.packages = [
     niri brightness hdrControl xwayland-satellite.packages.${system}.default
@@ -178,17 +187,17 @@ in {
       XF86MonBrightnessDown allow-when-locked=true { spawn "${brightness}/bin/goran-brightness" "down"; }
       // Slazenger desktop shortcuts, verified against its live config on 4 Oct 2026.
       // Alt aliases launch directly here; Slazenger's VNC wrappers are absent there.
-      Mod+T hotkey-overlay-title="Open a Terminal: cosmic-term" { spawn "${pkgs.cosmic-term}/bin/cosmic-term"; }
-      Alt+T hotkey-overlay-title="Open a Terminal (remote)" { spawn "${pkgs.cosmic-term}/bin/cosmic-term"; }
-      Mod+D hotkey-overlay-title="Run an Application: fuzzel" { spawn "${config.home.homeDirectory}/.local/bin/fuzzel-focused"; }
-      Alt+D hotkey-overlay-title="Run an Application (remote)" { spawn "${config.home.homeDirectory}/.local/bin/fuzzel-focused"; }
-      Mod+A hotkey-overlay-title="Run an Application: cosmic-launcher" { spawn "${pkgs.cosmic-launcher}/bin/cosmic-launcher"; }
-      Alt+A hotkey-overlay-title="Run an Application (remote)" { spawn "${pkgs.cosmic-launcher}/bin/cosmic-launcher"; }
-      Mod+Shift+D hotkey-overlay-title="Open the App Library" { spawn "${pkgs.cosmic-app-library}/bin/cosmic-app-library"; }
-      Mod+Shift+Tab hotkey-overlay-title="Search Wallhaven Wallpapers" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "wallhavenCarousel" "discover"; }
-      Alt+Shift+D hotkey-overlay-title="Open the App Library (remote)" { spawn "${pkgs.cosmic-app-library}/bin/cosmic-app-library"; }
+      ${terminal}
+      ${personal}Alt+T hotkey-overlay-title="Open a Terminal (remote)" { spawn "${pkgs.cosmic-term}/bin/cosmic-term"; }
+      ${personal}Mod+D hotkey-overlay-title="Run an Application: fuzzel" { spawn "${config.home.homeDirectory}/.local/bin/fuzzel-focused"; }
+      ${personal}Alt+D hotkey-overlay-title="Run an Application (remote)" { spawn "${config.home.homeDirectory}/.local/bin/fuzzel-focused"; }
+      ${personal}Mod+A hotkey-overlay-title="Run an Application: cosmic-launcher" { spawn "${pkgs.cosmic-launcher}/bin/cosmic-launcher"; }
+      ${personal}Alt+A hotkey-overlay-title="Run an Application (remote)" { spawn "${pkgs.cosmic-launcher}/bin/cosmic-launcher"; }
+      ${personal}Mod+Shift+D hotkey-overlay-title="Open the App Library" { spawn "${pkgs.cosmic-app-library}/bin/cosmic-app-library"; }
+      ${personal}Mod+Shift+Tab hotkey-overlay-title="Search Wallhaven Wallpapers" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "wallhavenCarousel" "discover"; }
+      ${personal}Alt+Shift+D hotkey-overlay-title="Open the App Library (remote)" { spawn "${pkgs.cosmic-app-library}/bin/cosmic-app-library"; }
       Mod+Alt+L hotkey-overlay-title="Lock the Screen" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "lock" "lock"; }
-      Alt+L hotkey-overlay-title="Lock the Screen (remote)" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "lock" "lock"; }
+      ${personal}Alt+L hotkey-overlay-title="Lock the Screen (remote)" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "lock" "lock"; }
       Mod+Shift+M hotkey-overlay-title="Toggle Microphone" { spawn "${pkgs.wireplumber}/bin/wpctl" "set-mute" "@DEFAULT_AUDIO_SOURCE@" "toggle"; }
       Super+Alt+S allow-when-locked=true hotkey-overlay-title=null { spawn-sh "${pkgs.procps}/bin/pkill orca || exec ${pkgs.orca}/bin/orca"; }
       // Native window, column, monitor, workspace, and wheel actions match Slazenger.

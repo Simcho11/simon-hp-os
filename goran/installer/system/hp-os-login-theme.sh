@@ -62,8 +62,22 @@ fi
 rm -rf "$previous"
 cp -a "$theme" "$previous"
 
-# Copy over the theme (files only; Inter, Rubik and Material Symbols in fonts/ stay).
-cp -r --no-preserve=mode,ownership "$built"/. "$theme"/
-chown -R root:root "$theme"
-chmod -R u=rwX,go=rX "$theme"
+# The new theme is put together beside the old one (files only; Inter, Rubik and Material Symbols in fonts/ stay),
+# then swapped in with a single rename: a power cut can never leave a half-copied login screen nobody can sign in past.
+staging="$theme.new"
+rm -rf "$staging"
+cp -a "$theme" "$staging"
+cp -r --no-preserve=mode,ownership "$built"/. "$staging"/
+chown -R root:root "$staging"
+chmod -R u=rwX,go=rX "$staging"
+sync -f "$staging" 2>/dev/null || sync
+if /usr/bin/mv --exchange -T "$staging" "$theme" 2>/dev/null; then
+    rm -rf "$staging"           # The old theme, after the swap.
+else
+    # A system whose mv can't swap: copied over in place, as before.
+    rm -rf "$staging"
+    cp -r --no-preserve=mode,ownership "$built"/. "$theme"/
+    chown -R root:root "$theme"
+    chmod -R u=rwX,go=rX "$theme"
+fi
 echo "Installed the HP-OS login screen from $built (previous theme: $backup)."
