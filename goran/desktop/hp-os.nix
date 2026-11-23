@@ -230,6 +230,9 @@ in {
     home.activation.hpOsDesktopControls = lib.hm.dag.entryAfter [ "linkGeneration" "hposNiriBindings" ] ''
       run ${pkgs.python3}/bin/python3 ${./hp-os-battery.py} "$HOME/.config/hp-os/config.json"
       run ${pkgs.python3}/bin/python3 ${./files-dock-pin.py} "$HOME/.config/hp-os/config.json"
+      # Google Chrome in the Dock, beside Files: added once, so someone who takes it off keeps it off.
+      run ${pkgs.python3}/bin/python3 ${./dock-add-once.py} "$HOME/.config/hp-os/config.json" \
+        google-chrome org.kde.dolphin "$HOME/.local/state/hp-os/dock-chrome-v1"
     '';
     home.packages = [ fonts launcher ];
     # Keep launcher discovery current during a preserved session whose

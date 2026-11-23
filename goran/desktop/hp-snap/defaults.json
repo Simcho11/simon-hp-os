@@ -2,6 +2,7 @@
   "dock": {
     "pinnedApps": [
       "org.kde.dolphin",
+      "google-chrome",
       "hp-os-trash",
       "hp-os-settings"
     ]
