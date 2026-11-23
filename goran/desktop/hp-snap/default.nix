@@ -71,6 +71,11 @@ in {
     git apply ${./desktop-files.patch}
     # Opening an app that's already open brings its window back, a minimized one restored, instead of another copy.
     git apply ${./bring-back.patch}
+    # Search finds folders by their name (Pictures › Screenshots), shown as folders.
+    git apply ${./search-folders.patch}
+    # The screenshot tool's "Screenshot copied" and the recorder's "Recording saved" open the file in its folder.
+    git apply ${./show-saved.patch}
+    substituteInPlace scripts/hp-snap/show-saved.sh --replace-fail '@notifySend@' ${pkgs.libnotify}/bin/notify-send
     substituteInPlace scripts/hp-snap/desktop_files.py \
       --replace-fail '@fileClipboard@' ${fileClipboard}/bin/hp-os-file-clipboard
   '';

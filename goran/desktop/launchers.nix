@@ -58,9 +58,28 @@
     mkdir -p "$screenshot_dir"
     file="$screenshot_dir/Screenshot from $(${pkgs.coreutils}/bin/date '+%Y-%m-%d %H-%M-%S').png"
 
+    # The notification says where the screenshot went. Clicking it, or Show in Folder, opens the
+    # Screenshots folder with this one selected; Open shows the picture. It stops listening after
+    # 15 minutes, so nothing is left running.
+    notify_saved() {
+      where="''${screenshot_dir#"$HOME"/}"
+      uri="$(${pkgs.python3}/bin/python3 -Ic 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$file")" || return 0
+      (
+        choice="$(${pkgs.coreutils}/bin/timeout 900 ${pkgs.libnotify}/bin/notify-send -a Screenshot -i camera-photo --wait \
+          --action=default="Show in Folder" --action=reveal="Show in Folder" --action=open=Open \
+          "Screenshot copied" "Saved in ''${where//\// › }")" || exit 0
+        case "$choice" in
+          default|reveal)
+            ${pkgs.dbus}/bin/dbus-send --session --print-reply --type=method_call --dest=org.freedesktop.FileManager1 \
+              /org/freedesktop/FileManager1 org.freedesktop.FileManager1.ShowItems "array:string:$uri" "string:" ;;
+          open) ${pkgs.xdg-utils}/bin/xdg-open "$file" ;;
+        esac
+      ) </dev/null >/dev/null 2>&1 &
+    }
+
     copy_file() {
       ${pkgs.wl-clipboard}/bin/wl-copy --type image/png < "$file"
-      ${pkgs.libnotify}/bin/notify-send -a screenshot-copy "Screenshot copied" "$file" >/dev/null 2>&1 || true
+      notify_saved
     }
 
     case "$mode" in
@@ -75,7 +94,7 @@
         ;;
       window)
         ${pkgs.niri}/bin/niri msg action screenshot-window --write-to-disk true --show-pointer false --path "$file"
-        ${pkgs.libnotify}/bin/notify-send -a screenshot-copy "Screenshot copied" "$file" >/dev/null 2>&1 || true
+        notify_saved
         ;;
       *)
         echo "usage: screenshot-copy {area|screen|window}" >&2

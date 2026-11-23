@@ -403,11 +403,13 @@ chapter("apps", "Apps",
     p(f"Terminal (Ghostty) gives advanced users a command line. Open it from the app launcher, the desktop menu, or press {keys('Super+T')}."),
     h2("apps-screens", "Screenshots"),
     table(["To capture…", "Do this"], [
-        ["An area you select", f"Press {keys('Super+Shift+4')} or <kbd>Print</kbd>, or click <b>Screen snip</b> in Control Center, then drag across the area."],
+        ["An area, with the screenshot tools", f"Press {keys('Super+Shift+S')}, right-click the desktop and choose <b>Screenshot</b>, or click <b>Screen snip</b> in Control Center, then drag across the area."],
+        ["An area, straight away", f"Press {keys('Super+Shift+4')} or <kbd>Print</kbd>, then drag across the area."],
         ["The whole screen", keys("Ctrl+Print")],
         ["One window", keys("Alt+Print")],
     ], "compact"),
-    p("Screenshots are copied, ready to paste into any app, and a notification confirms each one."),
+    p("Screenshots are copied, ready to paste into any app, and saved in <b>Pictures › Screenshots</b>. Click the "
+      "notification to see the screenshot in its folder, or search for <b>Screenshots</b> to open the folder later."),
 )
 
 # ================================================================ 11 Settings
@@ -510,7 +512,7 @@ shortcut_groups = [
         ("Super+Ctrl+Page_Up", "Move the window up a page"), ("Super+Ctrl+Page_Down", "Move the window down a page"),
         ("Super+Ctrl+1 … 9", "Move the window to page 1 to 9")]),
     ("Screenshots", [
-        ("Super+Shift+4", "Copy an area"), ("Print", "Copy an area"), ("Ctrl+Print", "Copy the whole screen"),
+        ("Super+Shift+S", "Screenshot tools"), ("Super+Shift+4", "Copy an area"), ("Print", "Copy an area"), ("Ctrl+Print", "Copy the whole screen"),
         ("Alt+Print", "Copy one window")]),
     ("Displays", [
         ("Super+Shift+Left / Right", "Focus the display to the left or right"),

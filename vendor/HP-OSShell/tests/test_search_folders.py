@@ -43,6 +43,17 @@ class SearchFolderTests(unittest.TestCase):
         (self.home / 'Dokumente' / 'Rechnung.pdf').write_bytes(b'%PDF')
         self.assertEqual([r['name'] for r in search.search(self.home, 'rechnung')], ['Rechnung.pdf'])
 
+    def test_a_folder_is_found_by_its_name_before_its_files(self):
+        shots = self.home / 'Pictures' / 'Screenshots'
+        shots.mkdir(parents=True)
+        (shots / 'Screenshot from 2026-11-21 10-00-00.png').write_bytes(b'png')
+        (self.home / 'Documents' / '.hidden' / 'Screenshots').mkdir(parents=True)
+        (self.home / 'Documents' / 'a' / 'b' / 'c' / 'd' / 'Screenshots').mkdir(parents=True)
+        found = search.folder_search(self.home, 'screenshots')
+        self.assertEqual([(r['path'], r['folder']) for r in found], [(str(shots), True)])
+        self.assertEqual([r['name'] for r in search.folder_search(self.home, 'pictures')], ['Pictures'])
+        self.assertEqual(search.folder_search(self.home, '  '), [])
+
     def test_index_folders_follow_the_user_folders_and_keep_other_settings(self):
         (self.home / 'Desktop').mkdir()
         conf = search.configure()

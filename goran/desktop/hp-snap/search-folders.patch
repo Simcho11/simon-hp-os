@@ -1,0 +1,15 @@
+diff --git a/modules/iris/palette/IrisPalette.qml b/modules/iris/palette/IrisPalette.qml
+index 3815ba9..a2312fe 100644
+--- a/modules/iris/palette/IrisPalette.qml
++++ b/modules/iris/palette/IrisPalette.qml
+@@ -111,7 +111,9 @@ Item {
+     }
+     readonly property var fileResults: Config.options?.panelFamily === "hpos" && root.plainQuery
+         ? HposFileSearch.results.slice(0, 2).map(file => ({name: file.name, comment: file.path,
+-            type: Translation.tr("File"), verb: Translation.tr("Open"), iconName: "description",
++            // hp-snap: a folder found by its name (Screenshots) says so, and opens in Files.
++            type: file.folder ? Translation.tr("Folder") : Translation.tr("File"), verb: Translation.tr("Open"),
++            iconName: file.folder ? "folder" : "description",
+             iconType: LauncherSearchResult.IconType.Material,
+             execute: () => root.openFile(file), reveal: () => root.revealFile(file)})).concat([{
+             name: Translation.tr("Search indexed documents"),

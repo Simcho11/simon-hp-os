@@ -299,6 +299,8 @@ in {
       Mod+Shift+P { power-off-monitors; }
       Mod+Space hotkey-overlay-title="DMS Launcher" { spawn "${config.programs.dank-material-shell.package}/bin/dms" "ipc" "call" "spotlight" "toggle"; }
       Super+Shift+4 hotkey-overlay-title="Screenshot: Copy Area" { spawn "${config.home.homeDirectory}/.local/bin/screenshot-copy" "area"; }
+      // Windows' snipping key, for people coming from Windows: HP-OS's own screenshot tool, the desktop menu's Screenshot.
+      Super+Shift+S hotkey-overlay-title="Screenshot" { spawn "hp-os" "ipc" "region" "screenshot"; }
       Print hotkey-overlay-title="Screenshot: Copy Area" { spawn "${config.home.homeDirectory}/.local/bin/screenshot-copy" "area"; }
       Ctrl+Print hotkey-overlay-title="Screenshot: Copy Screen" { spawn "${config.home.homeDirectory}/.local/bin/screenshot-copy" "screen"; }
       Alt+Print hotkey-overlay-title="Screenshot: Copy Window" { spawn "${config.home.homeDirectory}/.local/bin/screenshot-copy" "window"; }

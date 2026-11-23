@@ -1,0 +1,90 @@
+diff --git a/modules/regionSelector/AnnotationEditor.qml b/modules/regionSelector/AnnotationEditor.qml
+index 1b2eb75..8dc3a1a 100644
+--- a/modules/regionSelector/AnnotationEditor.qml
++++ b/modules/regionSelector/AnnotationEditor.qml
+@@ -529,11 +529,12 @@ PanelWindow {
+             _clip_msg="";
+             _clip_helper='${StringUtils.shellSingleQuoteEscape(Quickshell.shellPath("scripts/clipboard-copy.sh"))}';
+             if "$_clip_helper" < "$_ss" 2>/dev/null && printf '%s' "$_ss" | "$_clip_helper" --primary 2>/dev/null; then
+-                _clip_msg=" — copied to clipboard";
++                _clip_msg=" and copied";
+             else
+-                _clip_msg=" — clipboard unavailable (is wl-clipboard running?)";
++                _clip_msg=" (it couldn't be copied)";
+             fi;
+-            notify-send "Screenshot edited" "Saved to $_ss$_clip_msg" -a "Screenshot" -i camera-photo -t 4000;
++            # hp-snap: the notification opens the screenshot in its folder (Show in Folder, Open).
++            '${StringUtils.shellSingleQuoteEscape(Quickshell.shellPath("scripts/hp-snap/show-saved.sh"))}' Screenshot "Screenshot edited" "$_ss" "$_clip_msg";
+         `]
+         onExited: (code) => {
+             if (code !== 0) console.warn("[AnnotationEditor] saveProc exit", code);
+diff --git a/modules/regionSelector/RegionSelection.qml b/modules/regionSelector/RegionSelection.qml
+index 02b36d2..d411402 100644
+--- a/modules/regionSelector/RegionSelection.qml
++++ b/modules/regionSelector/RegionSelection.qml
+@@ -381,9 +381,11 @@ PanelWindow {
+         }
+         const annotationCommand = `${(Config.options?.regionSelector?.annotation?.useSatty ?? false) ? "satty" : "swappy"} -f -`;
+         const clipboardCopy = StringUtils.shellSingleQuoteEscape(Quickshell.shellPath("scripts/clipboard-copy.sh"));
++        // hp-snap: the notification opens the screenshot in its folder (Show in Folder, Open).
++        const showSaved = StringUtils.shellSingleQuoteEscape(Quickshell.shellPath("scripts/hp-snap/show-saved.sh"));
+         switch (root.action) {
+             case RegionSelection.SnipAction.Copy:
+-                snipProc.command = ["bash", "-c", `_dir='${screenshotSaveDir}' && mkdir -p "$_dir" && _ss="$_dir/$(date +'${StringUtils.shellSingleQuoteEscape(root.screenshotNameFormat)}').png" && ${cropToStdout} | tee "$_ss" | '${clipboardCopy}' && printf '%s' "$_ss" | '${clipboardCopy}' --primary && ${cleanup} && notify-send "Screenshot copied" "${rw}x${rh} saved to $_ss" -a "Screenshot" -i camera-photo -t 3000`]
++                snipProc.command = ["bash", "-c", `_dir='${screenshotSaveDir}' && mkdir -p "$_dir" && _ss="$_dir/$(date +'${StringUtils.shellSingleQuoteEscape(root.screenshotNameFormat)}').png" && ${cropToStdout} | tee "$_ss" | '${clipboardCopy}' && printf '%s' "$_ss" | '${clipboardCopy}' --primary && ${cleanup} && '${showSaved}' Screenshot "Screenshot copied" "$_ss"`]
+                 break;
+             case RegionSelection.SnipAction.Edit:
+                 if (Config.options?.regionSelector?.annotation?.useNativeEditor ?? true) {
+diff --git a/scripts/hp-snap/show-saved.sh b/scripts/hp-snap/show-saved.sh
+new file mode 100755
+index 0000000..28ed9ce
+--- /dev/null
++++ b/scripts/hp-snap/show-saved.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++# hp-snap: the "Screenshot copied" / "Recording saved" notification, saying where the file went.
++# Clicking it, or Show in Folder, opens its folder in Files with the file selected; Open opens the file.
++#
++#   show-saved.sh APP TITLE FILE [NOTE]
++#
++# Returns at once: a detached copy waits for the click, for at most 15 minutes, so nothing is left running.
++set -u
++notify_send=@notifySend@   # HP-OS's own: the system copy can wrongly decide the shell can't show buttons
++if [[ "${1:-}" != --wait ]]; then
++    exec setsid -f "$0" --wait "$@" </dev/null >/dev/null 2>&1
++fi
++shift
++app="${1:-Screenshot}" title="${2:-Saved}" file="${3:-}" note="${4:-}"
++icon=camera-photo
++[[ "$app" == Recorder ]] && icon=media-record
++[[ -e "$file" ]] && file="$(readlink -f -- "$file")"
++folder="$(dirname -- "$file")"
++where="${folder#"$HOME"/}"
++body="Saved in ${where//\// › }$note"
++if [[ ! -e "$file" ]]; then
++    exec "$notify_send" -a "$app" -i "$icon" "$title" "$body"
++fi
++uri="$(python3 -Ic 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).absolute().as_uri())' "$file")" || exit 0
++choice="$(timeout 900 "$notify_send" -a "$app" -i "$icon" --wait \
++    --action=default="Show in Folder" --action=reveal="Show in Folder" --action=open=Open \
++    "$title" "$body")" || exit 0
++case "$choice" in
++    default|reveal)
++        exec dbus-send --session --print-reply --type=method_call --dest=org.freedesktop.FileManager1 \
++            /org/freedesktop/FileManager1 org.freedesktop.FileManager1.ShowItems "array:string:$uri" "string:" ;;
++    open) exec xdg-open "$file" ;;
++esac
+diff --git a/scripts/videos/record.sh b/scripts/videos/record.sh
+index e6f60cd..55e8b4c 100755
+--- a/scripts/videos/record.sh
++++ b/scripts/videos/record.sh
+@@ -937,7 +937,8 @@ if start_recording_command "$recording_geometry" "$output_name"; then
+     cleanup_audio_mix
+     cleanup_recorder_status
+     if [[ -s "$output_file" ]] && is_truthy "$SHOW_NOTIFICATIONS"; then
+-        notify-send "Recording saved" "${SAVE_PATH%/}/$output_name" -a 'Recorder' & disown
++        # hp-snap: the notification opens the recording in its folder (Show in Folder, Open).
++        "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../hp-snap/show-saved.sh" Recorder "Recording saved" "${SAVE_PATH%/}/$output_name"
+     fi
+     maybe_compress_recording "$output_file"
+ else
