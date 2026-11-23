@@ -172,6 +172,8 @@ in {
     '';
     # Windows Office apps open beside the other desktop apps, on every account (included by
     # login-backdrop.py). The desktop-switching shortcuts reach HP-OS from ../niri.nix.
+    # The same file carries the rule for HP-OS's own glass windows, being already in every account's niri settings
+    # (a new file would need a new include, which a switch back to an earlier version would leave pointing nowhere).
     xdg.configFile."hp-os/niri/config.d/64-hp-office.kdl".text = ''
       // Managed by Home Manager (goran/desktop/hp-snap/home.nix).
       window-rule {
@@ -179,6 +181,12 @@ in {
           open-floating true
           default-column-width { fixed 1300; }
           default-window-height { fixed 900; }
+      }
+      // App Installer and Software Update are panes of glass: what is behind them shows through, other windows
+      // included, as through the desktop's own glass (niri's default for a window shows the wallpaper alone).
+      window-rule {
+          match app-id=r#"^org\.quickshell$"# title=r#"^(App Installer|Software Update)$"#
+          background-effect { xray false; }
       }
     '';
     # Commands the shell's settings call: the icon theme for KDE apps and the on-screen keyboard.

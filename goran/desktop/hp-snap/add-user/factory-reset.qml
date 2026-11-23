@@ -64,6 +64,8 @@ ShellRoot {
         visible: true
         title: "Factory reset"
         color: "#071a3f"
+        // Closed from its title bar, the app ends too, rather than staying in the background.
+        onClosed: Qt.quit()
         implicitWidth: 640; implicitHeight: 620
         function px(n) { return Math.round(n) }
 

@@ -2,6 +2,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import "."
 
 ShellRoot {
@@ -123,198 +124,225 @@ ShellRoot {
     Timer { running: true; repeat: true; interval: 1500; triggeredOnStart: true; onTriggered: { app.now = Date.now(); app.refresh() } }
     Component.onCompleted: if (app.preview.length > 0) { app.status = previews[app.preview] || previews.idle; app.admin = Quickshell.env("HP_OS_UPDATE_ROLE") !== "standard" }
 
+    // Light or dark and the accent, as the desktop has them, and its glass.
+    WindowLook { id: hpLook }
+
     FloatingWindow {
         id: win
         visible: true
         title: "Software Update"
-        color: "#071a3f"
-        implicitWidth: 680; implicitHeight: 620
+        color: "transparent"
+        implicitWidth: 640; implicitHeight: 570
+        // Niri blurs what is behind the window; the window lays a tint of HP-OS's surface over it.
+        property Region glassArea: Region { item: body; radius: hpLook.radius }
+        BackgroundEffect.blurRegion: hpLook.glass ? win.glassArea : null
+        // No title bar here (the launcher turns Qt's off): closing the window some other way (Super+Q) ends the app,
+        // so nothing is left running in the background.
+        onClosed: Qt.quit()
 
         component Label: Text {
-            color: "white"
-            font.family: "HarmonyOS Sans"
+            color: hpLook.text
+            font.family: hpLook.font
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             width: parent ? parent.width : implicitWidth
         }
-        component Action: Rectangle {
-            id: action
-            property string label: ""
-            property bool ready: true
-            signal activated()
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: 300; height: 52
-            radius: height / 2
-            color: !ready ? Qt.rgba(1, 1, 1, 0.16) : hit.pressed ? "#dfe8ff" : "white"
-            Text {
-                anchors.centerIn: parent
-                text: action.label
-                color: action.ready ? "#0b2a6b" : Qt.rgba(1, 1, 1, 0.5)
-                font.family: "HarmonyOS Sans"
-                font.pixelSize: 17; font.weight: Font.DemiBold
-            }
-            MouseArea { id: hit; anchors.fill: parent; enabled: action.ready; cursorShape: Qt.PointingHandCursor; onClicked: action.activated() }
-        }
-        component Quiet: Text {
-            id: quiet
-            signal activated()
-            anchors.horizontalCenter: parent.horizontalCenter
-            color: Qt.rgba(1, 1, 1, 0.8)
-            font.family: "HarmonyOS Sans"
-            font.pixelSize: 16; font.weight: Font.Medium
-            MouseArea { anchors { fill: parent; margins: -10 } cursorShape: Qt.PointingHandCursor; onClicked: quiet.activated() }
-        }
 
-        Column {
-            anchors.centerIn: parent
-            width: 540
-            spacing: 14
+        Rectangle {
+            id: body
+            anchors.fill: parent
+            radius: hpLook.radius
+            color: hpLook.body
+            border.width: 1
+            border.color: hpLook.rim
+            Behavior on color { ColorAnimation { duration: 260 } }
+            // With no title bar, the window moves by dragging anywhere on it outside its controls.
+            MouseArea { anchors.fill: parent; onPressed: win.startSystemMove() }
 
-            Label {
-                font.pixelSize: 34; font.weight: Font.DemiBold
-                text: app.state === "restart" ? "Ready to restart"
-                    : app.busy ? (app.state === "restoring" ? "Restoring" : "Updating HP-OS")
-                    : app.state === "error" ? "Update not installed"
-                    : app.offer ? "HP-OS " + app.offer.version : "HP-OS is up to date"
-            }
-            Label {
-                color: Qt.rgba(1, 1, 1, 0.82)
-                font.pixelSize: 17
-                text: app.state === "restart" || app.busy || app.state === "error" ? String(app.status.message || "")
-                    : app.offer ? "A new version is ready to install. Your files, apps and settings stay as they are."
-                    : app.checking ? "Checking for updates…"
-                    : app.status.installed ? "You’re on version " + app.status.installed + "." : "You’re on the latest version."
-            }
+            Item {
+                anchors { left: parent.left; right: parent.right; top: parent.top; bottom: buttons.top; margins: 44; bottomMargin: 20 }
+                Column {
+                    anchors.centerIn: parent
+                    width: parent.width
+                    spacing: 12
 
-            Label {
-                visible: app.sizeLine.length > 0 && !!app.offer && !app.busy && app.state !== "restart"
-                color: Qt.rgba(1, 1, 1, 0.7)
-                font.pixelSize: 15; font.weight: Font.Medium
-                text: app.sizeLine
-            }
+                    // Where things stand, at a glance.
+                    Rectangle {
+                        readonly property bool trouble: app.state === "error"
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: 80; height: 80; radius: 40
+                        color: trouble ? hpLook.cautionSoft : hpLook.accentSoft
+                        Glyph {
+                            anchors.centerIn: parent
+                            size: 40
+                            color: parent.trouble ? hpLook.caution : hpLook.accent
+                            name: parent.trouble ? "alert" : app.state === "restart" ? "restart"
+                                : app.busy || app.offer ? "download" : "check"
+                        }
+                    }
+                    Item { width: 1; height: 2 }
 
-            // What's new
-            Rectangle {
-                visible: !!app.offer && !app.busy && app.state !== "restart" && !app.asking
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: parent.width; height: Math.min(190, notes.implicitHeight + 40)
-                radius: 18
-                color: Qt.rgba(1, 1, 1, 0.09)
-                Flickable {
-                    anchors { fill: parent; margins: 20 }
-                    contentHeight: notes.implicitHeight
-                    clip: true
-                    Text {
-                        id: notes
-                        width: parent.width
-                        color: "white"
-                        font.family: "HarmonyOS Sans"
-                        font.pixelSize: 16
-                        lineHeight: 1.25
-                        wrapMode: Text.WordWrap
-                        text: app.offer ? String(app.offer.notes || "") : ""
+                    Label {
+                        font.pixelSize: 26; font.weight: Font.DemiBold
+                        text: app.state === "restart" ? "Ready to restart"
+                            : app.busy ? (app.state === "restoring" ? "Restoring" : "Updating HP-OS")
+                            : app.state === "error" ? "Update not installed"
+                            : app.offer ? "HP-OS " + app.offer.version : "HP-OS is up to date"
+                    }
+                    Label {
+                        color: hpLook.secondary
+                        font.pixelSize: 15
+                        lineHeight: 1.15
+                        text: app.state === "restart" || app.busy || app.state === "error" ? String(app.status.message || "")
+                            : app.offer ? "A new version is ready to install. Your files, apps and settings stay as they are."
+                            : app.checking ? "Checking for updates…"
+                            : app.status.installed ? "You’re on version " + app.status.installed + "." : "You’re on the latest version."
+                    }
+
+                    Label {
+                        visible: app.sizeLine.length > 0 && !!app.offer && !app.busy && app.state !== "restart"
+                        color: hpLook.tertiary
+                        font.pixelSize: 13; font.weight: Font.Medium
+                        text: app.sizeLine
+                    }
+
+                    // What's new
+                    Rectangle {
+                        visible: !!app.offer && !app.busy && app.state !== "restart" && !app.asking
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: parent.width; height: Math.min(190, notesColumn.implicitHeight + 36)
+                        radius: 14
+                        color: hpLook.fillQuiet
+                        Flickable {
+                            anchors { fill: parent; margins: 18 }
+                            contentHeight: notesColumn.implicitHeight
+                            clip: true
+                            Column {
+                                id: notesColumn
+                                width: parent.width
+                                spacing: 6
+                                Text {
+                                    text: "What’s new"
+                                    color: hpLook.text
+                                    font.family: hpLook.font
+                                    font.pixelSize: 14; font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    id: notes
+                                    width: parent.width
+                                    color: hpLook.secondary
+                                    font.family: hpLook.font
+                                    font.pixelSize: 14
+                                    lineHeight: 1.25
+                                    wrapMode: Text.WordWrap
+                                    text: app.offer ? String(app.offer.notes || "") : ""
+                                }
+                            }
+                        }
+                    }
+
+                    // Progress
+                    Item { width: 1; height: 4; visible: app.busy }
+                    Rectangle {
+                        visible: app.busy
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: 380; height: 6; radius: 3
+                        color: hpLook.fill
+                        Rectangle {
+                            width: parent.width * Math.max(0.03, Number(app.status.progress || 0) / 100)
+                            height: parent.height; radius: 3
+                            color: hpLook.accent
+                            Behavior on width { NumberAnimation { duration: 400; easing.type: Easing.OutCubic } }
+                        }
+                    }
+                    Label {
+                        visible: app.busy
+                        color: hpLook.tertiary
+                        font.pixelSize: 13
+                        text: (app.timeLeft.length > 0 ? app.timeLeft + ". " : "") + "You can keep working. Please keep your device powered on."
+                    }
+
+                    // An administrator's password
+                    PasswordField {
+                        id: password
+                        look: hpLook
+                        visible: app.asking
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        onAccepted: app.perform(app.offer ? "install" : "restore")
+                        onTextChanged: if (text.length > 0) app.notice = ""
+                    }
+                    Label {
+                        visible: !app.asking && !app.checking && !app.offer && !app.busy && app.state !== "restart"
+                            && (app.notice.length > 0 || app.checkError.length > 0)
+                        color: hpLook.caution
+                        font.pixelSize: 14; font.weight: Font.Medium
+                        text: app.notice.length > 0 ? app.notice
+                            : app.checkError.indexOf("reach") >= 0 ? "Couldn’t check for updates. Make sure you’re connected to the internet, then try again."
+                            : app.checkError
+                    }
+                    Label {
+                        visible: app.asking || (!app.admin && !!app.offer && !app.busy && app.state !== "restart")
+                        color: app.notice.length > 0 ? hpLook.caution : hpLook.secondary
+                        font.pixelSize: 14; font.weight: Font.Medium
+                        text: app.notice.length > 0 ? app.notice : app.asking ? " " : "Ask an administrator to install this update."
                     }
                 }
             }
 
-            // Progress
-            Rectangle {
-                visible: app.busy
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: 400; height: 6; radius: 3
-                color: Qt.rgba(1, 1, 1, 0.2)
-                Rectangle {
-                    width: parent.width * Math.max(0.03, Number(app.status.progress || 0) / 100)
-                    height: parent.height; radius: 3
-                    color: "white"
-                    Behavior on width { NumberAnimation { duration: 400; easing.type: Easing.OutCubic } }
+            // The actions, along the bottom: the way out first, the main action last, in the accent.
+            Row {
+                id: buttons
+                anchors { bottom: parent.bottom; bottomMargin: 28; horizontalCenter: parent.horizontalCenter }
+                spacing: 12
+                readonly property int shown: {
+                    let count = 0
+                    for (const item of buttons.children) if (item.visible && item.label !== undefined) count++
+                    return Math.max(1, count)
                 }
-            }
-            Label {
-                visible: app.busy
-                color: Qt.rgba(1, 1, 1, 0.7)
-                font.pixelSize: 15
-                text: (app.timeLeft.length > 0 ? app.timeLeft + ". " : "") + "You can keep working. Please keep your device powered on."
-            }
-
-            // An administrator's password
-            Rectangle {
-                visible: app.asking
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: 420; height: 54
-                radius: height / 2
-                color: Qt.rgba(1, 1, 1, password.activeFocus ? 0.2 : 0.13)
-                border.width: 1.5
-                border.color: password.activeFocus ? Qt.rgba(1, 1, 1, 0.75) : Qt.rgba(1, 1, 1, 0.22)
-                TextInput {
-                    id: password
-                    anchors { fill: parent; leftMargin: 24; rightMargin: 24 }
-                    verticalAlignment: TextInput.AlignVCenter
-                    horizontalAlignment: TextInput.AlignHCenter
-                    color: "white"
-                    font.pixelSize: 18
-                    echoMode: TextInput.Password
-                    passwordCharacter: "●"
-                    clip: true
-                    maximumLength: 256
-                    onAccepted: app.perform(app.offer ? "install" : "restore")
-                    onTextChanged: if (text.length > 0) app.notice = ""
+                readonly property real each: Math.min(250, (body.width - 56 - (buttons.shown - 1) * 12) / buttons.shown)
+                PillButton {
+                    look: hpLook
+                    width: buttons.each
+                    visible: !app.asking
+                    label: app.state === "restart" ? "Later" : "Close"
+                    onActivated: Qt.quit()
                 }
-                Text {
-                    anchors.centerIn: parent
-                    visible: password.text.length === 0
-                    text: "Administrator password"
-                    color: Qt.rgba(1, 1, 1, 0.62)
-                    font.family: "HarmonyOS Sans"
-                    font.pixelSize: 17
+                PillButton {
+                    look: hpLook
+                    width: buttons.each
+                    visible: app.asking
+                    label: "Back"
+                    onActivated: { app.asking = false; app.notice = ""; password.text = "" }
                 }
-            }
-            Label {
-                visible: !app.asking && !app.checking && !app.offer && !app.busy && app.state !== "restart"
-                    && (app.notice.length > 0 || app.checkError.length > 0)
-                color: "#ffb4ab"
-                font.pixelSize: 15; font.weight: Font.Medium
-                text: app.notice.length > 0 ? app.notice
-                    : app.checkError.indexOf("reach") >= 0 ? "Couldn’t check for updates. Make sure you’re connected to the internet, then try again."
-                    : app.checkError
-            }
-            Label {
-                visible: app.asking || (!app.admin && !!app.offer && !app.busy && app.state !== "restart")
-                color: app.notice.length > 0 ? "#ffb4ab" : Qt.rgba(1, 1, 1, 0.78)
-                font.pixelSize: 15; font.weight: Font.Medium
-                text: app.notice.length > 0 ? app.notice : app.asking ? " " : "Ask an administrator to install this update."
-            }
-
-            Item { width: 1; height: 6 }
-            Action {
-                visible: !app.busy && app.state !== "restart" && !!app.offer && app.admin
-                label: app.asking ? (app.sending ? "Checking…" : "Install now") : app.state === "error" ? "Try again" : "Update now"
-                ready: !app.asking || (password.text.length > 0 && !app.sending)
-                onActivated: {
-                    if (app.asking) app.perform("install")
-                    else { app.asking = true; password.forceActiveFocus() }
+                PillButton {
+                    look: hpLook
+                    width: buttons.each
+                    primary: true
+                    visible: !app.busy && app.state !== "restart" && !app.offer && !app.asking
+                    label: app.checking ? "Checking…" : "Check for updates"
+                    ready: !app.checking
+                    onActivated: { app.notice = ""; app.checkNow() }
                 }
-            }
-            Action {
-                visible: app.state === "restart"
-                label: "Restart now"
-                onActivated: Quickshell.execDetached(["/usr/bin/systemctl", "reboot"])
-            }
-            Action {
-                visible: !app.busy && app.state !== "restart" && !app.offer && !app.asking
-                label: app.checking ? "Checking…" : "Check for updates"
-                ready: !app.checking
-                onActivated: { app.notice = ""; app.checkNow() }
-            }
-            Quiet {
-                visible: app.asking
-                text: "Back"
-                onActivated: { app.asking = false; app.notice = ""; password.text = "" }
-            }
-            Quiet {
-                visible: !app.asking
-                text: app.state === "restart" ? "Later" : "Close"
-                onActivated: Qt.quit()
+                PillButton {
+                    look: hpLook
+                    width: buttons.each
+                    primary: true
+                    visible: app.state === "restart"
+                    label: "Restart now"
+                    onActivated: Quickshell.execDetached(["/usr/bin/systemctl", "reboot"])
+                }
+                PillButton {
+                    look: hpLook
+                    width: buttons.each
+                    primary: true
+                    visible: !app.busy && app.state !== "restart" && !!app.offer && app.admin
+                    label: app.asking ? (app.sending ? "Checking…" : "Install now") : app.state === "error" ? "Try again" : "Update now"
+                    ready: !app.asking || (password.text.length > 0 && !app.sending)
+                    onActivated: {
+                        if (app.asking) app.perform("install")
+                        else { app.asking = true; password.forceActiveFocus() }
+                    }
+                }
             }
         }
         Shortcut { sequence: "Escape"; onActivated: { if (app.asking) { app.asking = false; password.text = "" } else Qt.quit() } }

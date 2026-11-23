@@ -15,6 +15,14 @@ pkgs.runCommand "hp-os-add-user" { } ''
   mkdir -p "$app/software-update"
   cp ${./add-user/software-update.qml} "$app/software-update/shell.qml"
   cp ${./add-user/device-client.py} "$app/software-update/device-client.py"
+  # Software Update and App Installer wear the desktop's look: light or dark, the accent, HP-OS's glass.
+  for part in software-update app-installer; do
+    mkdir -p "$app/$part"
+    cp ${./add-user/WindowLook.qml} "$app/$part/WindowLook.qml"
+    cp ${./add-user/PillButton.qml} "$app/$part/PillButton.qml"
+    cp ${./add-user/PasswordField.qml} "$app/$part/PasswordField.qml"
+    cp ${./add-user/Glyph.qml} "$app/$part/Glyph.qml"
+  done
   mkdir -p "$app/first-setup"
   cp ${./add-user/first-setup.qml} "$app/first-setup/shell.qml"
   cp ${./add-user/SetupBar.qml} "$app/first-setup/SetupBar.qml"
@@ -75,21 +83,23 @@ pkgs.runCommand "hp-os-add-user" { } ''
   chmod +x "$out/bin/hp-os-welcome"
 
   # App Installer: opening a downloaded .deb file (HP-OS's launcher for that file type starts this with its path).
+  # No title bar: the window is a pane of HP-OS glass with rounded corners, and a square bar drawn over them looked
+  # broken. It closes from its own buttons (or Escape) and moves by dragging anywhere on it.
   mkdir -p "$app/app-installer"
   cp ${./add-user/app-installer.qml} "$app/app-installer/shell.qml"
   cp ${./add-user/app-install-client.py} "$app/app-installer/app-install-client.py"
   cat > "$out/bin/hp-os-app-installer" <<EOF
   #!/bin/sh
-  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic HP_OS_INSTALL_FILE="\''${1:-}"
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic QT_WAYLAND_DISABLE_WINDOWDECORATION=1 HP_OS_INSTALL_FILE="\''${1:-}"
   exec ${quickshell}/bin/quickshell -n -p "$app/app-installer/shell.qml"
   EOF
   sed -i 's/^  //' "$out/bin/hp-os-app-installer"
   chmod +x "$out/bin/hp-os-app-installer"
 
-  # Settings > General > Software Update.
+  # Settings > General > Software Update. No title bar, as App Installer.
   cat > "$out/bin/hp-os-software-update" <<EOF
   #!/bin/sh
-  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic
+  export QT_QPA_PLATFORM=wayland QT_QUICK_CONTROLS_STYLE=Basic QT_WAYLAND_DISABLE_WINDOWDECORATION=1
   exec ${quickshell}/bin/quickshell -n -p "$app/software-update/shell.qml"
   EOF
   sed -i 's/^  //' "$out/bin/hp-os-software-update"
